@@ -1,9 +1,11 @@
 // Local admin panel: what is the bot doing, who wrote what, who said what in voice?
 //
 // Events are kept in an in-memory ring buffer and, when asked for, appended to a JSONL file; the
-// panel binds to 127.0.0.1 only (it is never exposed) and validates the Host header (closed to DNS
-// rebinding). User data reaches the HTML only through textContent/setAttribute (no XSS).
+// panel binds to 127.0.0.1 by default and validates the Host header (closed to DNS rebinding). It
+// answers beyond loopback (PANEL_HOST, for a container or a reverse proxy) only behind PANEL_TOKEN.
+// User data reaches the HTML only through textContent/setAttribute (no XSS).
 
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
 import { dirname } from 'node:path';
 import { appendFile, mkdir, readFile, rename, stat, unlink } from 'node:fs/promises';
@@ -369,14 +371,86 @@ tick();
 </html>`;
 
 const LOCAL_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+// Addresses that mean "every interface": nobody types them into a browser, so they name no Host.
+const WILDCARD_HOSTS = new Set(['', '0.0.0.0', '::', '[::]']);
 
-function hostAllowed(hostHeader, port) {
-	const value = String(hostHeader ?? '').trim().toLowerCase();
-	if (!value) return false;
-	const match = value.match(/^(\[[^\]]+\]|[^:]+)(?::(\d+))?$/);
-	if (!match) return false;
-	if (!LOCAL_HOSTS.has(match[1])) return false;
-	return !match[2] || Number(match[2]) === port || port === 0;
+/** Shortest PANEL_TOKEN accepted: beyond loopback the token is the whole lock, so it has to be a real one. */
+export const MIN_TOKEN_LENGTH = 16;
+const SESSION_COOKIE = 'panel_session';
+const SESSION_MAX_AGE_S = 30 * 24 * 60 * 60;
+
+/** Does this address keep the panel on the machine itself? */
+export function isLoopbackHost(host) {
+	const name = String(host ?? '').trim().toLowerCase().replace(/^\[|\]$/gu, '');
+	return name === 'localhost' || name === '::1' || /^127(?:\.\d{1,3}){3}$/u.test(name);
+}
+
+/** "name" or "name:port" as a Host header writes it -> { name, port }; an IPv6 name keeps its brackets. */
+function splitHost(value) {
+	const match = String(value ?? '').trim().toLowerCase().match(/^(\[[^\]]+\]|[^:/\s]+)(?::(\d+))?$/u);
+	return match ? { name: match[1], port: match[2] ? Number(match[2]) : null } : null;
+}
+
+/**
+ * PANEL_ALLOWED_HOSTS -> [{ name, port }]. An entry with a port matches only that port, one without any:
+ * a published container port or a proxy in front can put a different one in the browser's address bar.
+ */
+export function parseAllowedHosts(value) {
+	const entries = Array.isArray(value) ? value : String(value ?? '').split(',');
+	const hosts = [];
+	for (const raw of entries) {
+		let text = String(raw ?? '').trim();
+		if (!text) continue;
+		if (text.includes('://')) {
+			try {
+				text = new URL(text).host;
+			} catch {
+				continue;
+			}
+		}
+		const parsed = splitHost(text);
+		if (parsed) hosts.push(parsed);
+	}
+	return hosts;
+}
+
+/**
+ * The Host header check against DNS rebinding. The loopback names and the address the panel is bound to
+ * pass on the panel's own port; PANEL_ALLOWED_HOSTS entries pass as they were written.
+ */
+function hostAllowed(hostHeader, port, { own = LOCAL_HOSTS, extra = [] } = {}) {
+	const given = splitHost(hostHeader);
+	if (!given) return false;
+	if (own.has(given.name) && (!given.port || given.port === port || port === 0)) return true;
+	return extra.some((entry) => entry.name === given.name && (entry.port === null || entry.port === given.port));
+}
+
+/** Constant-time comparison of two strings of any length (both are hashed to the same size first). */
+function sameSecret(given, expected) {
+	const a = createHash('sha256').update(String(given ?? '')).digest();
+	const b = createHash('sha256').update(String(expected)).digest();
+	return timingSafeEqual(a, b);
+}
+
+function bearerOf(request) {
+	return /^Bearer\s+(\S+)\s*$/iu.exec(String(request.headers.authorization ?? ''))?.[1] ?? null;
+}
+
+function cookieOf(request, name) {
+	for (const part of String(request.headers.cookie ?? '').split(';')) {
+		const index = part.indexOf('=');
+		if (index > 0 && part.slice(0, index).trim() === name) return part.slice(index + 1).trim();
+	}
+	return null;
+}
+
+/** Is the Origin the same site as the Host the request came in on (which has passed hostAllowed)? */
+function originMatchesHost(origin, hostHeader) {
+	try {
+		return new URL(origin).host === String(hostHeader ?? '').trim().toLowerCase();
+	} catch {
+		return false;
+	}
 }
 
 /** Prometheus text format. */
@@ -391,14 +465,21 @@ function promText(metrics = {}) {
 }
 
 /**
- * Starts the panel (127.0.0.1 only). `state()` returns the live status metrics, `metrics()` the
- * numeric measurements (for the Prometheus /metrics endpoint), `health()` the health summary.
- * @returns {{url: string, port: number, close: () => Promise<void>}}
+ * Starts the panel. `state()` returns the live status metrics, `metrics()` the numeric measurements (for
+ * the Prometheus /metrics endpoint), `health()` the health summary.
+ *
+ * On loopback with no token it is open to whoever is on this machine, as it always was. Anywhere else
+ * (`host` beyond loopback, or `allowedHosts` naming another machine) it refuses to start without a
+ * `token`; with one, every request needs `Authorization: Bearer <token>` or the cookie that visiting
+ * /login?token=<token> sets.
+ * @returns {Promise<{url: string, port: number, close: () => Promise<void>}>}
  */
 export function startPanel({
 	activity,
 	port = 8787,
 	host = '127.0.0.1',
+	token = null,
+	allowedHosts = [],
 	state = () => ({}),
 	metrics = () => ({}),
 	health = () => ({ ok: true }),
@@ -407,15 +488,66 @@ export function startPanel({
 	log = () => {},
 	nameFor = () => null,
 }) {
+	const bindHost = String(host ?? '').trim() || '127.0.0.1';
+	const secret = token ? String(token) : null;
+	const extra = parseAllowedHosts(allowedHosts);
+	if (secret && secret.length < MIN_TOKEN_LENGTH) {
+		return Promise.reject(new Error(t('panel.token_too_short', { min: MIN_TOKEN_LENGTH })));
+	}
+	// A proxy or a published port that forwards another name is exposure as much as a public bind address.
+	const exposedBy = !isLoopbackHost(bindHost)
+		? `PANEL_HOST=${bindHost}`
+		: extra.some((entry) => !isLoopbackHost(entry.name))
+			? `PANEL_ALLOWED_HOSTS=${extra.map((entry) => entry.name).join(',')}`
+			: null;
+	if (exposedBy && !secret) return Promise.reject(new Error(t('panel.refused_no_token', { where: exposedBy, min: MIN_TOKEN_LENGTH })));
+
+	// The bound address is a name the panel is reached by as well (a LAN address, say); a wildcard is not.
+	const hostName = bindHost.includes(':') && !bindHost.startsWith('[') ? `[${bindHost}]` : bindHost;
+	const own = WILDCARD_HOSTS.has(hostName.toLowerCase()) ? LOCAL_HOSTS : new Set([...LOCAL_HOSTS, hostName.toLowerCase()]);
+	// The cookie holds a value derived from the token rather than the token itself, so the browser's
+	// cookie store never has the one string that also works as a Bearer header.
+	const session = secret ? createHmac('sha256', secret).update('panel-session').digest('base64url') : null;
+	const authorized = (request) => sameSecret(bearerOf(request), secret) || sameSecret(cookieOf(request, SESSION_COOKIE), session);
+	// Reached through a proxy or another name, the page's own Origin is that name rather than one of the
+	// two loopback forms; it is accepted when it is the Host the request came in on, which has passed the
+	// allow-list. A plain loopback panel keeps exactly the two forms it always had.
+	const reachedByName = Boolean(secret) || extra.length > 0;
+
 	let actualPort = port;
 	const server = http.createServer(async (request, response) => {
 		try {
-			if (!hostAllowed(request.headers.host, actualPort)) {
+			if (!hostAllowed(request.headers.host, actualPort, { own, extra })) {
 				response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
 				response.end(t('panel.local_only'));
 				return;
 			}
-			const url = new URL(request.url ?? '/', `http://${host}:${actualPort}`);
+			// Only the path and the query are read, so the base is a placeholder.
+			const url = new URL(request.url ?? '/', 'http://panel.invalid');
+			if (secret && url.pathname === '/login') {
+				if (request.method !== 'GET' || !sameSecret(url.searchParams.get('token'), secret)) {
+					response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+					response.end(t('panel.login_failed'));
+					return;
+				}
+				// HttpOnly keeps it from page scripts, SameSite=Strict from requests another site starts; Secure
+				// when a TLS proxy in front says the browser came in over https.
+				const secure = String(request.headers['x-forwarded-proto'] ?? '').toLowerCase() === 'https' ? '; Secure' : '';
+				response.writeHead(303, {
+					location: '/',
+					'set-cookie': `${SESSION_COOKIE}=${session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_MAX_AGE_S}${secure}`,
+					'cache-control': 'no-store',
+					// The address bar held the token a moment ago; nothing should carry it on as a Referer.
+					'referrer-policy': 'no-referrer',
+				});
+				response.end();
+				return;
+			}
+			if (secret && !authorized(request)) {
+				response.writeHead(401, { 'content-type': 'text/plain; charset=utf-8', 'www-authenticate': 'Bearer', 'cache-control': 'no-store' });
+				response.end(t('panel.login_required'));
+				return;
+			}
 			const filters = () => ({
 				since: Math.max(0, Number(url.searchParams.get('since') ?? 0) || 0),
 				kinds: (url.searchParams.get('kinds') ?? '').split(',').filter(Boolean),
@@ -452,7 +584,10 @@ export function startPanel({
 				const type = String(request.headers['content-type'] ?? '');
 				const origin = request.headers.origin;
 				const sameOrigin =
-					!origin || origin === `http://${host}:${actualPort}` || origin === `http://localhost:${actualPort}`;
+					!origin ||
+					origin === `http://${hostName}:${actualPort}` ||
+					origin === `http://localhost:${actualPort}` ||
+					(reachedByName && originMatchesHost(origin, request.headers.host));
 				if (!type.startsWith('application/json') || !sameOrigin) {
 					response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
 					response.end(t('panel.local_only'));
@@ -520,11 +655,11 @@ export function startPanel({
 
 	return new Promise((resolve, reject) => {
 		server.once('error', reject);
-		server.listen(port, host, () => {
+		server.listen(port, bindHost, () => {
 			const address = server.address();
 			actualPort = address.port;
-			const url = `http://${host}:${actualPort}`;
-			log(t('panel.ready', { url }));
+			const url = `http://${hostName}:${actualPort}`;
+			log(secret ? t('panel.ready_token', { url }) : t('panel.ready', { url }));
 			resolve({
 				url,
 				port: actualPort,

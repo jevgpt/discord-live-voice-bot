@@ -2,6 +2,9 @@
 export default {
 	// --- console log lines (src/music.js)
 	log_ytdlp_download: 'yt-dlp bulunamadı; indiriliyor: {target}',
+	log_ytdlp_verified: 'yt-dlp {tag} ({asset}) indirildi ve SHA-256 değeri sürümdekiyle eşleşti: {target}',
+	log_ytdlp_replacing: '{target} konumundaki yt-dlp bu makinedeki her hesap tarafından değiştirilebiliyordu; doğrulanmış bir indirmeyle değiştiriliyor',
+	log_ytdlp_tightened: '{target} konumundaki yt-dlp bu makinedeki her hesap tarafından değiştirilebiliyordu; izinleri artık 0755. Doğrulanmış bir kopya için dosyayı sil.',
 	log_ytdlp: 'yt-dlp: {message}',
 	log_ffmpeg: 'ffmpeg: {message}',
 	log_playing: 'müzik: çalıyor -> {title}{duration}',
@@ -21,6 +24,13 @@ export default {
 	error_ffmpeg_spawn: 'ffmpeg çalıştırılamadı: {message}',
 	error_no_audio: 'ses verisi gelmedi',
 	error_decode: 'çözme hatası ({code})',
+	// --- downloading yt-dlp (src/ytdlp.js); these reach the log, not the voice channel
+	error_ytdlp_version: 'YTDLP_VERSION bir sürüm etiketi değil: {version}',
+	error_ytdlp_release: 'indirilecek yt-dlp sürümü bulunamadı ({detail})',
+	error_ytdlp_http: 'yt-dlp indirilemedi: {file} için HTTP {status}',
+	error_ytdlp_no_checksum: 'yt-dlp {tag} sürümünde {asset} için bir sağlama değeri yok',
+	error_ytdlp_checksum: 'indirilen yt-dlp ({asset}, {tag}) sürümde yayımlanan SHA-256 ile eşleşmiyor; silindi',
+	error_ytdlp_too_large: 'yt-dlp indirmesi bir yt-dlp dosyasından çok daha büyüktü; silindi',
 	// --- spoken status line
 	nothing_playing: 'Şu an müzik çalmıyor.',
 	state_playing: 'Çalıyor',

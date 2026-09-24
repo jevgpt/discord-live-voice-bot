@@ -2,6 +2,7 @@
 // The audio is pushed straight to Discord — no cloud TTS, everything stays local.
 
 import { t } from './i18n/index.js';
+import { speechHeaders } from './localserver.js';
 
 const SENTENCE_END = /^\s*(.*?[.!?…]+)(?=\s|$)/su;
 
@@ -130,9 +131,12 @@ export class LocalTts {
 		exaggeration = null,
 		cfgWeight = null,
 		timeoutMs = 60_000,
+		// Null: the token the process shares (LOCAL_TTS_TOKEN, or the one the server was launched with).
+		token = null,
 		log = () => {},
 	} = {}) {
 		this.url = String(url).replace(/\/$/, '');
+		this.token = token;
 		this.voiceRef = voiceRef;
 		this.languageId = languageId;
 		this.exaggeration = exaggeration;
@@ -147,7 +151,8 @@ export class LocalTts {
 	/** Is the server up, and which model/sample rate is it running with? */
 	async health() {
 		try {
-			const response = await fetch(`${this.url}/health`, { signal: AbortSignal.timeout(5000) });
+			const response = await fetch(`${this.url}/health`, { headers: speechHeaders({}, this.token), signal: AbortSignal.timeout(5000) });
+			if (response.status === 401 || response.status === 403) this.log(t('brain.speech_refused', { url: this.url, status: response.status }));
 			if (!response.ok) return null;
 			const info = await response.json();
 			if (Number.isFinite(info?.sr) && info.sr > 0) this.sampleRate = info.sr;
@@ -188,7 +193,7 @@ export class LocalTts {
 		const timeout = AbortSignal.timeout(this.timeoutMs);
 		const response = await fetch(`${this.url}/tts`, {
 			method: 'POST',
-			headers: { 'content-type': 'application/json' },
+			headers: speechHeaders({ 'content-type': 'application/json' }, this.token),
 			body: JSON.stringify(payload),
 			signal: signal ? AbortSignal.any([timeout, signal]) : timeout,
 		});

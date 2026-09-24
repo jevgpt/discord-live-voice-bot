@@ -2,6 +2,13 @@
 
 The bot pulls raw PCM from this server and pushes it straight into Discord (no cloud TTS).
 
+Loopback is reachable from every web page the machine's browser opens, so a request is refused when:
+  - its Host header is not the loopback address the server is bound to (DNS rebinding),
+  - it carries an Origin header (browsers send one; the bot never does),
+  - a JSON endpoint is sent anything but application/json (a form or text/plain post needs no preflight),
+  - a token is set (--token or CHATTERBOX_TOKEN) and the X-Chatterbox-Token header does not match it.
+The bot starts the server with a fresh random token each time; one started by hand takes LOCAL_TTS_TOKEN.
+
 Setup (once):
     python -m venv .venv-chatterbox
     .venv-chatterbox/Scripts/python -m pip install chatterbox-tts
@@ -16,7 +23,7 @@ Endpoints:
                       response: {"ok":true,"text":"...","language":"tr","duration":2.4}   (switched on with --stt <model>)
     POST /tts      -> {"text":"...","voice_ref":"C:/path/ref.wav","language_id":"tr","exaggeration":0.5,"cfg_weight":0.5}
                       response: raw int16 PCM (mono), x-sample-rate header
-    POST /voice    -> {"voice_ref":"C:/path/ref.wav"}  (sets the default reference voice)
+    POST /voice    -> {"voice_ref":"C:/path/ref.wav"}  (sets the default reference voice; an existing audio file)
     POST /shutdown -> shuts the server down
 
 Note: the model is downloaded from Hugging Face on the first run; every generated audio carries a Perth watermark.
@@ -26,9 +33,12 @@ import argparse
 import contextlib
 import ctypes
 import faulthandler
+import hmac
 import inspect
+import ipaddress
 import json
 import os
+import re
 import site
 import struct
 import sys
@@ -53,6 +63,65 @@ STATE = {
 
 MAX_BODY_BYTES = 256 * 1024
 MAX_STT_BYTES = 20 * 1024 * 1024  # ~10 min of 16 kHz int16
+
+TOKEN_HEADER = "X-Chatterbox-Token"
+LOOPBACK_NAMES = {"localhost", "127.0.0.1", "::1"}
+# What a reference voice can be: the model reads it as audio, so nothing else on the disk is accepted.
+AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".oga", ".opus", ".m4a", ".aac"}
+
+
+def is_loopback(host: str) -> bool:
+    name = (host or "").strip().strip("[]").lower()
+    if name == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
+
+
+def allowed_host_names(host: str):
+    """The names a Host header may carry when the server is bound to loopback; None when it is bound
+    elsewhere, where the names it is reached by cannot be known and the token is what guards it."""
+    if not is_loopback(host):
+        return None
+    return LOOPBACK_NAMES | {(host or "").strip().strip("[]").lower()}
+
+
+def split_host_header(value):
+    """'127.0.0.1:8020' -> ('127.0.0.1', 8020), '[::1]:8020' -> ('::1', 8020), 'localhost' -> ('localhost', None)."""
+    match = re.fullmatch(r"(\[[^\]]+\]|[^:\[\]/\s]+)(?::(\d{1,5}))?", (value or "").strip().lower())
+    if not match:
+        return None, None
+    return match.group(1).strip("[]"), int(match.group(2)) if match.group(2) else None
+
+
+def request_refusal(headers, allowed_hosts, port: int, token):
+    """Why a request is refused, or None when it may go on. `token` is bytes (or None: no token set)."""
+    if allowed_hosts is not None:
+        name, given_port = split_host_header(headers.get("host"))
+        if name is None or name not in allowed_hosts or (given_port is not None and given_port != port):
+            return "host not allowed"
+    if headers.get("origin") is not None:
+        return "requests from a web page are not accepted"
+    if token is not None:
+        given = (headers.get(TOKEN_HEADER) or "").encode("utf-8", "replace")
+        if not hmac.compare_digest(given, token):
+            return "missing or wrong token"
+    return None
+
+
+def checked_voice_ref(value):
+    """A reference voice from a request: None for none, else the resolved path of an existing audio file.
+    Anything else raises ValueError, so a request cannot point the model at an arbitrary file."""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ValueError("voice_ref must be a file path")
+    path = os.path.realpath(value)
+    if os.path.splitext(path)[1].lower() not in AUDIO_EXTENSIONS or not os.path.isfile(path):
+        raise ValueError(f"voice_ref must be an existing audio file ({', '.join(sorted(AUDIO_EXTENSIONS))})")
+    return path
 
 
 def _prepare_cuda_dlls():
@@ -377,7 +446,7 @@ def synthesize(model, payload: dict) -> tuple[bytes, int]:
         raise ValueError("text is empty")
     allowed = accepted_params(model)
     kwargs = {}
-    voice_ref = payload.get("voice_ref") or STATE["voice_ref"]
+    voice_ref = checked_voice_ref(payload.get("voice_ref")) or STATE["voice_ref"]
     if voice_ref:
         kwargs["audio_prompt_path"] = voice_ref
     if STATE["kind"] == "multilingual":
@@ -403,6 +472,11 @@ def synthesize(model, payload: dict) -> tuple[bytes, int]:
 class QuietServer(ThreadingHTTPServer):
     """When the client dropped the connection (the bot cancels the request on barge-in) stay quiet instead
     of printing a traceback."""
+
+    # main() sets these from the arguments; the defaults admit loopback names only and ask for no token.
+    quiet = False
+    allowed_hosts = frozenset(LOOPBACK_NAMES)
+    token = None
 
     def handle_error(self, request, client_address):
         exc = sys.exc_info()[1]
@@ -450,13 +524,34 @@ class Handler(BaseHTTPRequestHandler):
             return
         print(f"[chatterbox] {self.address_string()} {fmt % args}", flush=True)
 
-    def _json(self, status: int, payload: dict):
+    def _json(self, status: int, payload: dict, close: bool = False):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("content-type", "application/json; charset=utf-8")
         self.send_header("content-length", str(len(body)))
+        if close:
+            # The request body was not read, so this connection cannot carry another request.
+            self.send_header("connection", "close")
+            self.close_connection = True
         self.end_headers()
         self._write(body)
+
+    def _refused(self) -> bool:
+        """Answers 403 and returns True when the request fails the Host, Origin or token check."""
+        reason = request_refusal(self.headers, self.server.allowed_hosts, self.server.server_port, self.server.token)
+        if reason is None:
+            return False
+        print(f"[chatterbox] refused {self.command} {self.path.split('?')[0]} from {self.address_string()}: {reason}", flush=True)
+        self._json(403, {"ok": False, "error": reason}, close=True)
+        return True
+
+    def _content_type_is(self, expected: str) -> bool:
+        """Answers 415 and returns False unless the body is declared as `expected`."""
+        given = (self.headers.get("content-type") or "").split(";")[0].strip().lower()
+        if given == expected:
+            return True
+        self._json(415, {"ok": False, "error": f"content-type must be {expected}"}, close=True)
+        return False
 
     def _write(self, data: bytes):
         """When the client cancelled the request (barge-in) give up quietly; do not print a traceback."""
@@ -506,6 +601,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True, "text": text, "language": detected, "duration": duration})
 
     def do_GET(self):
+        if self._refused():
+            return
         if self.path.split("?")[0] != "/health":
             self._json(404, {"ok": False, "error": "not found"})
             return
@@ -524,18 +621,31 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def do_POST(self):
+        if self._refused():
+            return
         path = self.path.split("?")[0]
         if path == "/stt":
-            self._handle_stt()
+            if self._content_type_is("application/octet-stream"):
+                self._handle_stt()
+            return
+        # A page can post text/plain or a form without asking first; only a JSON body is taken here.
+        if not self._content_type_is("application/json"):
             return
         try:
             payload = self._read_json()
         except json.JSONDecodeError as err:
             self._json(400, {"ok": False, "error": f"invalid JSON: {err}"})
             return
+        if not isinstance(payload, dict):
+            self._json(400, {"ok": False, "error": "the body must be a JSON object"})
+            return
 
         if path == "/voice":
-            STATE["voice_ref"] = payload.get("voice_ref") or None
+            try:
+                STATE["voice_ref"] = checked_voice_ref(payload.get("voice_ref"))
+            except ValueError as err:
+                self._json(400, {"ok": False, "error": str(err)})
+                return
             print(f"[chatterbox] reference voice: {STATE['voice_ref']}", flush=True)
             self._json(200, {"ok": True, "voice": STATE["voice_ref"]})
             return
@@ -580,6 +690,12 @@ def main():
     parser.add_argument("--voice", default=None, help="default reference voice (path to a wav)")
     parser.add_argument("--stt", default=None, help="faster-whisper model (tiny/base/small/medium/large-v3); empty = STT off")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("CHATTERBOX_TOKEN") or None,
+        help="require this value in the X-Chatterbox-Token header (default: $CHATTERBOX_TOKEN; the environment "
+        "is the better place, a command line is visible to every account on the machine)",
+    )
     args = parser.parse_args()
 
     STATE["kind"] = args.model
@@ -590,7 +706,17 @@ def main():
     server = QuietServer((args.host, args.port), Handler)
     server.quiet = args.quiet
     server.daemon_threads = True
+    server.allowed_hosts = allowed_host_names(args.host)
+    server.token = args.token.encode("utf-8") if args.token else None
     print(f"[chatterbox] listening on: http://{args.host}:{args.port} (model loading)", flush=True)
+    if server.token is not None:
+        print(f"[chatterbox] requests must carry the {TOKEN_HEADER} header", flush=True)
+    elif server.allowed_hosts is None:
+        print(
+            f"[chatterbox] WARNING: bound to {args.host} without a token; anything that reaches this port can use "
+            "the server (set CHATTERBOX_TOKEN)",
+            flush=True,
+        )
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
     print(f"[chatterbox] loading model: {args.model} ({args.device}) — downloaded on the first run", flush=True)

@@ -5,6 +5,7 @@
 import { EventEmitter } from 'node:events';
 import { peakOf } from './audio.js';
 import { t } from './i18n/index.js';
+import { speechHeaders } from './localserver.js';
 
 const STT_RATE = 16_000;
 
@@ -181,8 +182,10 @@ export class SpeechSegmenter extends EventEmitter {
 
 /** HTTP client for the /stt (faster-whisper) endpoint on the Chatterbox server. */
 export class LocalStt {
-	constructor({ url = 'http://127.0.0.1:8020', language = 'auto', timeoutMs = 30_000, log = () => {} } = {}) {
+	constructor({ url = 'http://127.0.0.1:8020', language = 'auto', timeoutMs = 30_000, token = null, log = () => {} } = {}) {
 		this.url = String(url).replace(/\/$/, '');
+		// Null: the token the process shares (LOCAL_TTS_TOKEN, or the one the server was launched with).
+		this.token = token;
 		this.language = language;
 		this.timeoutMs = timeoutMs;
 		this.log = log;
@@ -192,7 +195,8 @@ export class LocalStt {
 	/** Is the server up and the STT model loaded? */
 	async health() {
 		try {
-			const response = await fetch(`${this.url}/health`, { signal: AbortSignal.timeout(5000) });
+			const response = await fetch(`${this.url}/health`, { headers: speechHeaders({}, this.token), signal: AbortSignal.timeout(5000) });
+			if (response.status === 401 || response.status === 403) this.log(t('brain.speech_refused', { url: this.url, status: response.status }));
 			if (!response.ok) return null;
 			const info = await response.json();
 			return { ...info, sttReady: Boolean(info?.stt) };
@@ -217,7 +221,7 @@ export class LocalStt {
 		try {
 			const response = await fetch(`${this.url}/stt${params.size ? `?${params}` : ''}`, {
 				method: 'POST',
-				headers: { 'content-type': 'application/octet-stream', 'x-sample-rate': String(STT_RATE) },
+				headers: speechHeaders({ 'content-type': 'application/octet-stream', 'x-sample-rate': String(STT_RATE) }, this.token),
 				body,
 				signal: signal ? AbortSignal.any([timeout, signal]) : timeout,
 			});

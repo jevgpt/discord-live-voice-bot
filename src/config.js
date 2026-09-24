@@ -118,13 +118,21 @@ export function loadConfig(env = process.env) {
 		useResponsesDelegation: toolsBackend === 'responses' || (toolsBackend === 'auto' && Boolean(researchModel)),
 		backendEffort: effortValue(env.LIVE_BACKEND_EFFORT, 'low'),
 		backendTier: effortValue(env.LIVE_BACKEND_TIER, null),
-		// Local admin panel (127.0.0.1 only): PANEL=0 turns it off, PANEL_PORT picks the port (0 = random).
+		// Local admin panel (127.0.0.1 by default): PANEL=0 turns it off, PANEL_PORT picks the port (0 = random).
 		panelEnabled: bool(env.PANEL, true),
 		panelPort: num(env.PANEL_PORT, 8787, { min: 0, max: 65_535 }),
+		// Where the panel listens; anything beyond loopback (a container, a reverse proxy) needs PANEL_TOKEN,
+		// and PANEL_ALLOWED_HOSTS adds the names it is reached by to the Host-header check.
+		panelHost: str(env.PANEL_HOST, '127.0.0.1'),
+		panelToken: str(env.PANEL_TOKEN),
+		panelAllowedHosts: list(env.PANEL_ALLOWED_HOSTS),
 		// Local TTS (Chatterbox)
 		localTtsEnabled: bool(env.LOCAL_TTS, false),
 		localTtsOn: bool(env.LOCAL_TTS_START, false),
 		localTtsUrl: str(env.LOCAL_TTS_URL, 'http://127.0.0.1:8020'),
+		// Shared token for the speech server (X-Chatterbox-Token). Empty: the server the bot starts gets a
+		// fresh random one at every launch, and one started by hand needs none.
+		localTtsToken: str(env.LOCAL_TTS_TOKEN),
 		localTtsVoice: str(env.LOCAL_TTS_VOICE),
 		// "auto": guess the language of the text (tr/en/de/fr/es/it/pt/ru); any other value is a fixed language code.
 		localTtsLang: str(env.LOCAL_TTS_LANG, 'tr'),

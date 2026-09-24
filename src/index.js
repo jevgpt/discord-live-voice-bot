@@ -24,7 +24,7 @@ import { maskSecret, updateEnvFile } from './envfile.js';
 import { GuildSession } from './guildsession.js';
 import { t, tList } from './i18n/index.js';
 import { liveSlotsTaken, offerLiveSlots } from './liveslots.js';
-import { LocalServerManager, detectVenvPython } from './localserver.js';
+import { LocalServerManager, detectVenvPython, setSpeechToken } from './localserver.js';
 import { LocalStt } from './localstt.js';
 import { MemoryStore } from './memory.js';
 import { ReplyLimiter, handleMessage } from './messages.js';
@@ -99,12 +99,15 @@ function safePort(url, fallback) {
 	}
 }
 
-// The Chatterbox server (TTS + whisper): the bot starts it itself when it is needed.
+// The Chatterbox server (TTS + whisper): the bot starts it itself when it is needed. Every request to
+// it carries a token: LOCAL_TTS_TOKEN for a server started by hand, or the one each launch is given.
+setSpeechToken(cfg.localTtsToken);
 const localServer = cfg.localTtsAutostart
 	? new LocalServerManager({
 			python: cfg.localTtsPython ?? detectVenvPython(path.join(here, '..')),
 			script: path.join(here, '..', 'tools', 'chatterbox_server.py'),
 			args: ['--port', String(safePort(cfg.localTtsUrl, 8020)), '--model', cfg.localTtsModel, '--stt', cfg.localSttModel],
+			token: cfg.localTtsToken,
 			cwd: path.join(here, '..'),
 			log,
 		})
@@ -615,6 +618,9 @@ client.once(Events.ClientReady, async () => {
 				panel = await startPanel({
 					activity,
 					port: cfg.panelPort,
+					host: cfg.panelHost,
+					token: cfg.panelToken,
+					allowedHosts: cfg.panelAllowedHosts,
 					log,
 					// The keys may be entered here; they are written to .env, which is where they are read from.
 					keys: () => ({ openai: maskSecret(cfg.openaiApiKey), deepseek: maskSecret(cfg.deepseekApiKey) }),

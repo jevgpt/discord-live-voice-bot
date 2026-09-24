@@ -1,8 +1,13 @@
 // The bot itself starts and stops the Chatterbox (TTS + whisper STT) server.
 // When it has to switch to the local brain and the server is not up, tools/chatterbox_server.py is
 // run with the Python inside .venv-chatterbox; its output lands in the bot log as "[chatterbox] …".
+//
+// The server listens on loopback, which every web page the owner opens can reach as well, so each
+// launch is given a random token and only requests carrying it are served. The TTS and STT clients
+// add it to every request through speechHeaders().
 
 import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -19,21 +24,45 @@ export function detectVenvPython(root) {
 	return candidates.find((candidate) => existsSync(candidate)) ?? null;
 }
 
+/** The header the speech server reads its token from (tools/chatterbox_server.py). */
+export const SPEECH_TOKEN_HEADER = 'x-chatterbox-token';
+
+// One token for the whole process: the server is one per machine, while the TTS client lives in every
+// guild session and the STT client in index.js. LOCAL_TTS_TOKEN sets it for a server started by hand;
+// a launch from here replaces it with the one that launch was given.
+let speechToken = null;
+
+/** Sets the token requests to the speech server carry (null: none). */
+export function setSpeechToken(token) {
+	speechToken = token ? String(token) : null;
+}
+
+/** `headers` plus the speech server's token, when there is one; `token` overrides the shared one. */
+export function speechHeaders(headers = {}, token = null) {
+	const value = token ?? speechToken;
+	return value ? { ...headers, [SPEECH_TOKEN_HEADER]: value } : { ...headers };
+}
+
 /** The environment the speech server is started with: paths and tuning only, never our secrets. */
-function childEnv() {
+function childEnv(token) {
 	const keep = ['PATH', 'Path', 'HOME', 'USERPROFILE', 'SystemRoot', 'windir', 'TEMP', 'TMP', 'LOCALAPPDATA', 'APPDATA', 'LANG', 'CUDA_PATH', 'HF_HOME', 'TRANSFORMERS_CACHE'];
 	const env = {};
 	for (const name of keep) {
 		if (process.env[name] !== undefined) env[name] = process.env[name];
 	}
-	return { ...env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1', OPENBLAS_NUM_THREADS: '1', OMP_NUM_THREADS: '2' };
+	// Through the environment rather than --token: a command line is visible to every account on the
+	// machine, the environment of a process only to its owner.
+	return { ...env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1', OPENBLAS_NUM_THREADS: '1', OMP_NUM_THREADS: '2', CHATTERBOX_TOKEN: token };
 }
 
 export class LocalServerManager {
-	constructor({ python, script, args = [], cwd = process.cwd(), log = () => {}, spawnImpl = spawn, maxRestarts = 3, now = Date.now }) {
+	constructor({ python, script, args = [], token = null, cwd = process.cwd(), log = () => {}, spawnImpl = spawn, maxRestarts = 3, now = Date.now }) {
 		this.python = python;
 		this.script = script;
 		this.args = args;
+		// LOCAL_TTS_TOKEN, when set, is used for every launch, so a server started by hand with the same
+		// value and one started from here are interchangeable; otherwise each launch draws its own.
+		this.token = token ? String(token) : null;
 		this.cwd = cwd;
 		this.log = log;
 		this.spawn = spawnImpl;
@@ -75,6 +104,7 @@ export class LocalServerManager {
 		}
 		this.stopping = false;
 		this.lastError = null;
+		const token = this.token ?? randomBytes(32).toString('hex');
 		let child;
 		try {
 			child = this.spawn(this.python, ['-u', this.script, ...this.args], {
@@ -84,12 +114,13 @@ export class LocalServerManager {
 				// OPENBLAS: numpy's thread buffers give "allocation failed" on a memory-tight machine; pointless on the GPU path.
 				// Only what Python needs to run. Spreading process.env would hand the Discord token and the
 				// OpenAI/DeepSeek keys to third-party model code that has no use for them.
-				env: childEnv(),
+				env: childEnv(token),
 			});
 		} catch (err) {
 			this.lastError = err.message;
 			return false;
 		}
+		setSpeechToken(token);
 		this.child = child;
 		this.startedAt = this.now();
 		this.log(

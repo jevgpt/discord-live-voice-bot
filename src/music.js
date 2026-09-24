@@ -10,12 +10,14 @@
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { existsSync, readdirSync, statSync } from 'node:fs';
-import { mkdir } from 'node:fs/promises';
+import { chmod, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Ring, STEREO_SAMPLES_PER_FRAME_48K } from './audio.js';
+import { cleanEnvValue } from './config.js';
 import { t } from './i18n/index.js';
 import { normalize } from './text.js';
+import { downloadYtDlp } from './ytdlp.js';
 
 const require = createRequire(import.meta.url);
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -97,25 +99,56 @@ const isUrl = (text) => /^https?:\/\//i.test(String(text ?? '').trim());
 /** Where a downloaded yt-dlp lives when nothing else points at one. */
 export const DEFAULT_YTDLP_DIR = path.join(here, '..', 'tools', 'bin');
 
+/** Can an account other than the owner write this file? Always false on Windows, which has no such bits. */
+async function writableByOthers(file) {
+	if (process.platform === 'win32') return false;
+	try {
+		return ((await stat(file)).mode & 0o022) !== 0;
+	} catch {
+		return false;
+	}
+}
+
 /**
  * Finds yt-dlp: the configured path, then tools/bin, then PATH. With autoDownload off it says what to
- * install instead of fetching anything; the binary comes from the GitHub releases when it is on.
- * Shared by the music player and the video reader, so both find the same one.
+ * install instead of fetching anything; when it is on, the binary comes from the GitHub release that
+ * `version` names (YTDLP_VERSION, the newest when empty) and is checked against that release's SHA-256
+ * list before it is used. Shared by the music player and the video reader, so both find the same one.
  */
-export async function ensureYtDlpPath({ preferred = null, binDir = DEFAULT_YTDLP_DIR, autoDownload = true, log = () => {}, spawnImpl = spawn } = {}) {
-	const candidates = [preferred, path.join(binDir, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp')].filter(Boolean);
+export async function ensureYtDlpPath({
+	preferred = null,
+	binDir = DEFAULT_YTDLP_DIR,
+	autoDownload = true,
+	// Read here rather than handed down: the player and the video reader are built in different places,
+	// and both must fetch the same pinned release.
+	version = cleanEnvValue(process.env.YTDLP_VERSION) || null,
+	log = () => {},
+	spawnImpl = spawn,
+	fetchImpl = globalThis.fetch,
+} = {}) {
+	const downloaded = path.join(binDir, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+	const candidates = [preferred, downloaded].filter(Boolean);
 	for (const candidate of candidates) {
-		if (existsSync(candidate)) return candidate;
+		if (!existsSync(candidate)) continue;
+		// Earlier versions downloaded into tools/bin with mode 777, so any account on the machine could have
+		// swapped that file. It is fetched again, checked, when downloading is allowed; otherwise it is at
+		// least closed to further changes and the log says how to replace it.
+		if (candidate === downloaded && (await writableByOthers(candidate))) {
+			if (autoDownload) {
+				log(t('music.log_ytdlp_replacing', { target: candidate }));
+				await downloadYtDlp(candidate, { version, log, fetchImpl });
+			} else {
+				await chmod(candidate, 0o755).catch(() => {});
+				log(t('music.log_ytdlp_tightened', { target: candidate }));
+			}
+		}
+		return candidate;
 	}
 	if (await onPath('yt-dlp', spawnImpl)) return 'yt-dlp';
 	if (!autoDownload) throw new Error(YTDLP_MISSING);
-	// Download it (from the GitHub releases), ~10 MB.
-	const target = candidates[candidates.length - 1];
-	log(t('music.log_ytdlp_download', { target }));
-	await mkdir(path.dirname(target), { recursive: true });
-	const YTDlpWrap = require('yt-dlp-wrap').default ?? require('yt-dlp-wrap');
-	await YTDlpWrap.downloadFromGithub(target);
-	return target;
+	log(t('music.log_ytdlp_download', { target: downloaded }));
+	await downloadYtDlp(downloaded, { version, log, fetchImpl });
+	return downloaded;
 }
 
 /** Is this binary runnable? `--version` is the whole test. */
@@ -165,6 +198,16 @@ export function runCommand(binary, args, { timeoutMs = 30_000, spawnImpl = spawn
 			reject(Object.assign(new Error(detail || `exit ${code}`), { reason: 'exit', code }));
 		});
 	});
+}
+
+/**
+ * yt-dlp's arguments for one call. yt-dlp reads yt-dlp.conf from its working directory, from beside its
+ * binary and from the user's configuration directory, and any of those files can add options to every
+ * run (an --exec, a proxy, another output path); the bot's calls are complete as written, so none is read.
+ * "--" ends the options, so the one positional argument is never taken for an option whatever it starts with.
+ */
+export function ytDlpArgs(options, target) {
+	return ['--ignore-config', ...options, '--', target];
 }
 
 /** A link we are willing to hand to yt-dlp. */
@@ -272,10 +315,11 @@ export class MusicPlayer {
 		const local = this.findLocal(text);
 		if (local) return local;
 
-		const ytDlp = await this.ensureYtDlp();
+		// Checked before yt-dlp is looked for, so a link that is refused anyway never starts a download.
 		if (isUrl(text) && !isAllowedMediaUrl(text)) throw new Error(UNSUPPORTED_LINK);
+		const ytDlp = await this.ensureYtDlp();
 		const target = isUrl(text) ? text : `ytsearch1:${text}`;
-		const args = ['-j', '--no-playlist', '--no-warnings', '--default-search', 'ytsearch', '--skip-download', target];
+		const args = ytDlpArgs(['-j', '--no-playlist', '--no-warnings', '--default-search', 'ytsearch', '--skip-download'], target);
 		const raw = await this._run(ytDlp, args, 30_000);
 		const line = raw.split('\n').find((candidate) => candidate.trim().startsWith('{'));
 		if (!line) throw new Error(t('music.error_no_results'));
@@ -287,6 +331,9 @@ export class MusicPlayer {
 		}
 		const url = info.webpage_url ?? info.original_url ?? info.url;
 		if (!url) throw new Error(t('music.error_no_url'));
+		// The page that gets played is the one yt-dlp answered with, not the text it was given: a search
+		// result, or wherever an allowed link redirected to. It is held to the same hosts as a spoken link.
+		if (!isAllowedMediaUrl(url)) throw new Error(UNSUPPORTED_LINK);
 		const duration = Number(info.duration) || null;
 		if (this.maxMinutes > 0 && duration && duration > this.maxMinutes * 60) {
 			throw new Error(t('music.error_too_long', { duration: formatDuration(duration), minutes: this.maxMinutes }));
@@ -390,7 +437,7 @@ export class MusicPlayer {
 		} else {
 			ytdlp = this.spawn(
 				this.ytDlp ?? 'yt-dlp',
-				['-f', 'bestaudio/best', '-o', '-', '--no-playlist', '--no-warnings', '-q', track.url],
+				ytDlpArgs(['-f', 'bestaudio/best', '-o', '-', '--no-playlist', '--no-warnings', '-q'], track.url),
 				{ stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
 			);
 			ytdlp.stderr.on('data', (chunk) => this.log(t('music.log_ytdlp', { message: String(chunk).trim().slice(0, 200) })));

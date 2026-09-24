@@ -36,6 +36,7 @@ export default {
 	// --- local speech synthesis (src/localtts.js)
 	tts_fallback_language: 'en',
 	tts_health_failed: 'local TTS health check failed: {error}',
+	speech_refused: 'the speech server at {url} refused the request ({status}): check LOCAL_TTS_TOKEN and LOCAL_TTS_URL, or stop a server left running by an earlier start of the bot',
 	tts_empty_text: 'empty text',
 	tts_error: 'local TTS error ({status})',
 	tts_error_detail: 'local TTS error ({status}): {detail}',

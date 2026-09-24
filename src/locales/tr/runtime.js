@@ -21,6 +21,8 @@ export default {
 	key_bad_deepseek: 'Bu bir DeepSeek anahtarına benzemiyor ("sk-" ile başlarlar).',
 	key_nothing: 'En az bir anahtar gir.',
 	key_write_failed: 'Anahtar .env dosyasına yazılamadı: {error}',
+	env_value_invalid: 'değer bir satır sonu, başka bir denetim karakteri ya da her tür tırnağı içeriyor; .env dosyasına güvenle yazılamaz',
+	env_key_invalid: 'ayar adı yalnızca harf, rakam ve alt çizgi içerebilir ve rakamla başlayamaz',
 	keys_updated: '[panel] anahtarlar güncellendi: {keys} ({hints})',
 	keys_saved: '.env dosyasına yazıldı. Yeni sesli oturum hemen kullanır; metin ve çizim için botu yeniden başlat.',
 	speaker_line_overlap: 'Kanalda {names} sesleri karıştı ya da söz aralarında geçiyordu, hangisinin dediğini ayıramıyorum: "{line}". Kimin dediğini sorma; sana bir şey sorulmadıysa sessiz kal.',

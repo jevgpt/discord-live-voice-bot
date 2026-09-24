@@ -52,8 +52,7 @@
     "openai": "^7.15.0",
     "opusscript": "^0.0.8",
     "prism-media": "^1.3.5",
-    "ws": "^8.21.3",
-    "yt-dlp-wrap": "^2.3.12"
+    "ws": "^8.21.3"
   },
   "optionalDependencies": {
     "@discordjs/opus": "^0.10.0"

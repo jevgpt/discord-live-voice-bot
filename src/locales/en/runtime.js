@@ -21,6 +21,8 @@ export default {
 	key_bad_deepseek: 'That does not look like a DeepSeek key (they start with "sk-").',
 	key_nothing: 'Enter at least one key.',
 	key_write_failed: 'The key could not be written to .env: {error}',
+	env_value_invalid: 'the value holds a line break, another control character or every kind of quote, so it cannot be written to .env safely',
+	env_key_invalid: 'a setting name may hold only letters, digits and underscores, and may not start with a digit',
 	keys_updated: '[panel] keys updated: {keys} ({hints})',
 	keys_saved: 'Written to .env. A new voice session uses it right away; restart the bot for text and drawing.',
 	speaker_line_overlap: 'In the channel {names} ran together or were handing over, and I cannot tell which of them said this: "{line}". Do not ask who said it; if nothing was asked of you, stay silent.',

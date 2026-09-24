@@ -2,6 +2,9 @@
 export default {
 	// --- console log lines (src/music.js)
 	log_ytdlp_download: 'yt-dlp not found; downloading: {target}',
+	log_ytdlp_verified: 'yt-dlp {tag} ({asset}) downloaded and its SHA-256 matched the release: {target}',
+	log_ytdlp_replacing: 'yt-dlp in {target} could be changed by any account on this machine; replacing it with a checked download',
+	log_ytdlp_tightened: 'yt-dlp in {target} could be changed by any account on this machine; it is 0755 now. Delete it to get a checked copy.',
 	log_ytdlp: 'yt-dlp: {message}',
 	log_ffmpeg: 'ffmpeg: {message}',
 	log_playing: 'music: playing -> {title}{duration}',
@@ -21,6 +24,13 @@ export default {
 	error_ffmpeg_spawn: 'ffmpeg could not be started: {message}',
 	error_no_audio: 'no audio data arrived',
 	error_decode: 'decoding error ({code})',
+	// --- downloading yt-dlp (src/ytdlp.js); these reach the log, not the voice channel
+	error_ytdlp_version: 'YTDLP_VERSION is not a release tag: {version}',
+	error_ytdlp_release: 'could not find the yt-dlp release to download ({detail})',
+	error_ytdlp_http: 'the yt-dlp download failed: HTTP {status} for {file}',
+	error_ytdlp_no_checksum: 'the yt-dlp release {tag} lists no checksum for {asset}',
+	error_ytdlp_checksum: 'the downloaded yt-dlp ({asset}, {tag}) does not match the SHA-256 the release lists; it was deleted',
+	error_ytdlp_too_large: 'the yt-dlp download was far larger than a yt-dlp binary; it was deleted',
 	// --- spoken status line
 	nothing_playing: 'Nothing is playing right now.',
 	state_playing: 'Playing',

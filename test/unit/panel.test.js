@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { describe, it } from 'node:test';
-import { ActivityLog, startPanel } from '../../src/panel.js';
+import { ActivityLog, isLoopbackHost, parseAllowedHosts, startPanel } from '../../src/panel.js';
 import { transcriptFromEvents } from '../../src/summary.js';
 
 describe('panel', () => {
@@ -65,6 +65,148 @@ describe('panel', () => {
 		const entry = activity.push({ kind: 'voice', text: 'x', persist: false });
 		assert.equal(entry.kind, 'voice');
 		assert.equal(activity.stats().voice, 1);
+	});
+});
+
+/** A raw request, so the Host, Origin, cookie and auth headers are exactly what the test says. */
+function send(url, { method = 'GET', headers = {}, body = null } = {}) {
+	return new Promise((resolve, reject) => {
+		const req = http.request(url, { method, headers }, (res) => {
+			let text = '';
+			res.setEncoding('utf8');
+			res.on('data', (chunk) => (text += chunk));
+			res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, text }));
+		});
+		req.on('error', reject);
+		req.end(body ?? undefined);
+	});
+}
+
+const TOKEN = 'a-panel-token-of-some-length';
+
+describe('panel access', () => {
+	it('knows which bind addresses stay on the machine and reads PANEL_ALLOWED_HOSTS', () => {
+		for (const host of ['127.0.0.1', '127.1.2.3', 'localhost', '::1', '[::1]']) assert.equal(isLoopbackHost(host), true, host);
+		for (const host of ['0.0.0.0', '::', '192.168.1.10', 'example.com', '']) assert.equal(isLoopbackHost(host), false, host);
+		assert.deepEqual(parseAllowedHosts(' Panel.Example.com, https://b.example.com:8443/x ,, c:99 , bad host'), [
+			{ name: 'panel.example.com', port: null },
+			{ name: 'b.example.com', port: 8443 },
+			{ name: 'c', port: 99 },
+		]);
+	});
+
+	it('on loopback without a token answers as it always did: no login, the same CSRF checks', async () => {
+		const applied = [];
+		const panel = await startPanel({ activity: new ActivityLog(), port: 0, log: () => {}, applyKeys: (patch) => (applied.push(patch), { ok: true }) });
+		try {
+			assert.equal((await send(`${panel.url}/`)).status, 200);
+			assert.equal((await send(`${panel.url}/login?token=${TOKEN}`)).status, 404, 'there is nothing to log in to');
+			const keys = (headers) => send(`${panel.url}/api/keys`, { method: 'POST', headers, body: '{"openai":"sk-x"}' });
+			assert.equal((await keys({ 'content-type': 'application/json', origin: `http://localhost:${panel.port}` })).status, 200);
+			assert.equal((await keys({ 'content-type': 'application/json', origin: 'http://evil.example' })).status, 403);
+			assert.equal((await keys({ 'content-type': 'text/plain' })).status, 403, 'a form or text post from another page is refused');
+			assert.equal(applied.length, 1);
+		} finally {
+			await panel.close();
+		}
+	});
+
+	it('refuses to start beyond loopback without a token, and refuses a short token anywhere', async () => {
+		const base = { activity: new ActivityLog(), port: 0, log: () => {} };
+		await assert.rejects(() => startPanel({ ...base, host: '0.0.0.0' }), /PANEL_HOST=0\.0\.0\.0.*PANEL_TOKEN is not set/u);
+		await assert.rejects(() => startPanel({ ...base, allowedHosts: ['panel.example.com'] }), /PANEL_ALLOWED_HOSTS=panel\.example\.com/u);
+		await assert.rejects(() => startPanel({ ...base, host: '0.0.0.0', token: 'short' }), /at least 16 characters/u);
+		// Another port for a loopback name (a published container port) is still this machine.
+		const local = await startPanel({ ...base, allowedHosts: ['localhost:9000'] });
+		try {
+			assert.equal((await send(`${local.url}/healthz`, { headers: { host: 'localhost:9000' } })).status, 200);
+		} finally {
+			await local.close();
+		}
+	});
+
+	it('with a token, every request needs the Bearer header or the cookie /login sets', async () => {
+		const panel = await startPanel({ activity: new ActivityLog(), port: 0, token: TOKEN, log: () => {} });
+		try {
+			const bare = await send(`${panel.url}/api/events`);
+			assert.equal(bare.status, 401);
+			assert.equal(bare.headers['www-authenticate'], 'Bearer');
+			assert.equal((await send(`${panel.url}/healthz`)).status, 401);
+			assert.equal((await send(`${panel.url}/`, { headers: { authorization: 'Bearer wrong-token-of-some-length' } })).status, 401);
+			assert.equal((await send(`${panel.url}/api/events`, { headers: { authorization: `Bearer ${TOKEN}` } })).status, 200);
+
+			const wrong = await send(`${panel.url}/login?token=nope`);
+			assert.equal(wrong.status, 403);
+			assert.equal(wrong.headers['set-cookie'], undefined);
+			assert.equal((await send(`${panel.url}/login?token=${TOKEN}`, { method: 'POST' })).status, 403, 'logging in is a visit, not a post');
+
+			const login = await send(`${panel.url}/login?token=${encodeURIComponent(TOKEN)}`);
+			assert.equal(login.status, 303);
+			assert.equal(login.headers.location, '/');
+			const [cookie] = login.headers['set-cookie'];
+			assert.match(cookie, /; HttpOnly/u);
+			assert.match(cookie, /; SameSite=Strict/u);
+			assert.match(cookie, /; Path=\//u);
+			assert.doesNotMatch(cookie, /; Secure/u, 'plain http cannot carry a Secure cookie');
+			assert.ok(!cookie.includes(TOKEN), 'the cookie is derived from the token, not the token itself');
+			const session = cookie.split(';')[0];
+			assert.equal((await send(`${panel.url}/`, { headers: { cookie: `other=1; ${session}` } })).status, 200);
+			assert.equal((await send(`${panel.url}/api/events`, { headers: { cookie: session } })).status, 200);
+			assert.equal((await send(`${panel.url}/api/events`, { headers: { cookie: `${session}x` } })).status, 401);
+			assert.equal((await send(`${panel.url}/api/events`, { headers: { cookie: `panel_session=${TOKEN}` } })).status, 401);
+
+			const proxied = await send(`${panel.url}/login?token=${TOKEN}`, { headers: { 'x-forwarded-proto': 'https' } });
+			assert.match(proxied.headers['set-cookie'][0], /; Secure/u, 'behind a TLS proxy the cookie is https-only');
+
+			const rebinding = await send(`${panel.url}/api/events`, { headers: { host: 'evil.example.com', authorization: `Bearer ${TOKEN}` } });
+			assert.equal(rebinding.status, 403, 'the Host check still comes first');
+		} finally {
+			await panel.close();
+		}
+	});
+
+	it('with a token, a name in PANEL_ALLOWED_HOSTS is served and its own Origin may save keys', async () => {
+		const applied = [];
+		const panel = await startPanel({
+			activity: new ActivityLog(),
+			port: 0,
+			token: TOKEN,
+			allowedHosts: ['panel.example.com', 'proxy.example.com:8443'],
+			applyKeys: (patch) => (applied.push(patch), { ok: true }),
+			log: () => {},
+		});
+		const auth = { authorization: `Bearer ${TOKEN}` };
+		try {
+			const at = (host) => send(`${panel.url}/healthz`, { headers: { ...auth, host } });
+			assert.equal((await at('panel.example.com')).status, 200);
+			assert.equal((await at('panel.example.com:9443')).status, 200, 'an entry without a port takes any');
+			assert.equal((await at('proxy.example.com:8443')).status, 200);
+			assert.equal((await at('proxy.example.com:9000')).status, 403, 'an entry with a port takes only that one');
+			assert.equal((await at('proxy.example.com')).status, 403);
+			assert.equal((await at('other.example.com')).status, 403);
+
+			const keys = (headers) =>
+				send(`${panel.url}/api/keys`, { method: 'POST', headers: { ...auth, host: 'panel.example.com', ...headers }, body: '{}' });
+			assert.equal((await keys({ 'content-type': 'application/json', origin: 'https://panel.example.com' })).status, 200);
+			assert.equal((await keys({ 'content-type': 'application/json', origin: 'https://evil.example' })).status, 403);
+			assert.equal((await keys({ 'content-type': 'application/json', origin: 'null' })).status, 403);
+			assert.equal((await keys({ 'content-type': 'text/plain', origin: 'https://panel.example.com' })).status, 403);
+			assert.equal(applied.length, 1);
+		} finally {
+			await panel.close();
+		}
+	});
+
+	it('binds beyond loopback once there is a token, and still answers the loopback health check', async () => {
+		const panel = await startPanel({ activity: new ActivityLog(), port: 0, host: '0.0.0.0', token: TOKEN, log: () => {} });
+		try {
+			assert.match(panel.url, /^http:\/\/0\.0\.0\.0:\d+$/u);
+			const health = await send(`http://127.0.0.1:${panel.port}/healthz`, { headers: { authorization: `Bearer ${TOKEN}` } });
+			assert.equal(health.status, 200);
+			assert.equal((await send(`http://127.0.0.1:${panel.port}/healthz`)).status, 401);
+		} finally {
+			await panel.close();
+		}
 	});
 });
 
