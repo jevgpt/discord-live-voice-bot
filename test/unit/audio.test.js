@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { Writable } from 'node:stream';
+import { PassThrough, Writable } from 'node:stream';
 import { PlaybackQueue, Ring, SAMPLES_PER_FRAME_24K, SpeakerMixer, STEREO_SAMPLES_PER_FRAME_48K, int16From, mixInto, peakOf, softClip } from '../../src/audio.js';
 import { AudioBridge } from '../../src/bridge.js';
 import { Ducker } from '../../src/music.js';
@@ -252,6 +252,119 @@ describe('AudioBridge', () => {
 		bridge.tick();
 		assert.equal(fresh.written.length, 1, 'the block belonged to the stream that is gone');
 		bridge.stop();
+	});
+
+	// A review finding: start() armed a timer and also ran the first wake, which armed its own, so two
+	// chains ran from then on. The second never ticked, but every wake of it was counted: 101 wakes for
+	// 51 ticks in a second, and the health report's lateness averaged over both.
+	it('runs one timer chain: one wake per tick, and nothing left armed after stop', (t) => {
+		t.mock.timers.enable({ apis: ['setTimeout', 'setImmediate', 'Date'], now: 0 });
+		// Every timer the loop arms, kept until it fires or is cleared.
+		const armed = new Set();
+		const { setTimeout: arm, clearTimeout: disarm } = globalThis;
+		globalThis.setTimeout = (fn, ms) => {
+			const handle = arm(() => {
+				armed.delete(handle);
+				fn();
+			}, ms);
+			armed.add(handle);
+			return handle;
+		};
+		globalThis.clearTimeout = (handle) => {
+			armed.delete(handle);
+			disarm(handle);
+		};
+		try {
+			const out = { write: () => true, once: () => {} };
+			const bridge = new AudioBridge({ mixer: new SpeakerMixer(), playback: new PlaybackQueue(), output: out, getLive: () => null, clock: () => Date.now() });
+			bridge.start();
+			for (let i = 0; i < 50; i++) t.mock.timers.tick(20);
+			assert.equal(bridge.stats.ticks, 51, 'the first tick at once, then one every 20 ms');
+			assert.equal(bridge.stats.wakes, 51, 'and the loop woke once for each of them');
+			assert.equal(armed.size, 1, 'with one timer armed at a time');
+			bridge.stop();
+			assert.equal(bridge.running, false);
+			assert.equal(armed.size, 0, 'and none once stopped');
+			t.mock.timers.tick(1000);
+			assert.equal(bridge.stats.ticks, 51, 'nothing ticks after stop');
+
+			bridge.start();
+			for (let i = 0; i < 10; i++) t.mock.timers.tick(20);
+			assert.equal(bridge.stats.wakes - 51, bridge.stats.ticks - 51, 'a restart is one chain too');
+			bridge.stop();
+			assert.equal(armed.size, 0);
+		} finally {
+			globalThis.setTimeout = arm;
+			globalThis.clearTimeout = disarm;
+		}
+	});
+
+	it('cancels a late wake s catch-up on stop', async (t) => {
+		// Only the clock and the timer are mocked: the catch-up goes through the real setImmediate.
+		t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 0 });
+		const out = { write: () => true, once: () => {} };
+		const bridge = new AudioBridge({ mixer: new SpeakerMixer(), playback: new PlaybackQueue(), output: out, getLive: () => null, clock: () => Date.now() });
+		bridge.start();
+		t.mock.timers.tick(100); // the wake due at 20 ms runs 80 ms late and hands its catch-up to setImmediate
+		assert.ok(bridge.immediate, 'the catch-up is waiting behind the poll phase');
+		bridge.stop();
+		assert.equal(bridge.immediate, null);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(bridge.stats.ticks, 1, 'and it never ran');
+	});
+
+	// A review finding, and the bot's voice was gone for the rest of the session: a destroyed stream takes
+	// every write without an 'error' or a 'drain', so the latch held for good and every frame was dropped.
+	it('asks for a new output on every tick the old one is dead, and writes to the new one', () => {
+		const dead = new PassThrough();
+		dead.on('error', () => {});
+		dead.destroy();
+		const fresh = sink();
+		let asked = 0;
+		let renew = false;
+		const bridge = new AudioBridge({
+			mixer: new SpeakerMixer(),
+			playback: new PlaybackQueue(),
+			output: dead,
+			getLive: () => null,
+			onOutputDead: () => {
+				asked++;
+				if (renew) bridge.setOutput(fresh.out);
+			},
+		});
+		bridge.tick();
+		bridge.tick();
+		assert.equal(asked, 2, 'asked again on every tick, since the owner may have had to put it off');
+		assert.equal(bridge.backpressure, false, 'a dead stream is not a blocked one: nothing latched');
+		assert.equal(bridge.dropped, 2, 'the frames in between are dropped');
+		renew = true;
+		bridge.tick();
+		assert.equal(asked, 3);
+		assert.equal(fresh.written.length, 1, 'renewed inside the tick, and the frame went to the new stream');
+		bridge.tick();
+		assert.equal(asked, 3, 'a live output is not asked about');
+		assert.equal(fresh.written.length, 2);
+	});
+
+	it('does not let a replaced stream s drain clear the new stream s block', async () => {
+		const blocked = () =>
+			new Writable({
+				highWaterMark: 1,
+				write(_chunk, _enc, cb) {
+					setTimeout(cb, 20);
+				},
+			});
+		const old = blocked();
+		const bridge = new AudioBridge({ mixer: new SpeakerMixer(), playback: new PlaybackQueue(), output: old, getLive: () => null });
+		bridge.tick(); // old is full
+		const next = blocked();
+		bridge.setOutput(next);
+		bridge.tick(); // next is full
+		assert.equal(bridge.backpressure, true);
+		await new Promise((resolve) => old.once('drain', resolve));
+		assert.equal(bridge.backpressure, true, 'the old stream draining says nothing about the new one');
+		await new Promise((resolve) => next.once('drain', resolve));
+		assert.equal(bridge.backpressure, false);
 	});
 
 	it('does not burst through ticks after a long pause', () => {
@@ -562,6 +675,34 @@ describe('per-speaker loudness', () => {
 		const out = peakOf(last.pcm, 480);
 		assert.ok(out > 8000 && out < 12000, `20000 in, half out: ${out}`);
 		assert.equal(m.levels()[0].gainDb, -6);
+	});
+
+	// A review finding: after a handover the newcomer's backlog keeps draining once they stop sending, and
+	// those ticks have no frame of theirs, which the gain read as "unity". The tail of a shouted sentence
+	// came out 6 dB louder than the rest of it.
+	it('keeps the speaker s gain on the backlog that drains after they stop', () => {
+		const m = new SpeakerMixer({ agc: true, floorControl: true });
+		const peaks = [];
+		for (let i = 0; i < 50; i++) {
+			if (i < 20) m.push('a', new Int16Array(480).fill(3000));
+			if (i >= 12 && i < 30) m.push('b', sine(20000)); // b talks over a, gets the floor, then stops at 30
+			const frame = m.tick();
+			if (frame.active[0] !== 'b') continue;
+			for (let k = 0; k < frame.frames; k++) peaks.push({ tick: i, peak: peakOf(frame.pcm.subarray(k * 480, (k + 1) * 480)) });
+		}
+		const drained = peaks.filter((entry) => entry.tick >= 30);
+		assert.ok(drained.length > 0, 'part of the backlog was still owed when b stopped');
+		assert.equal(m.levels().find((level) => level.id === 'b').gainDb, -6, 'b is loud and has been turned down');
+		for (const { tick, peak } of drained) assert.ok(peak < 11_000, `tick ${tick}: the tail goes out at b s gain, not at unity: ${peak}`);
+	});
+
+	it('forgets a speaker s frame buffer when they leave', () => {
+		const m = new SpeakerMixer();
+		m.push('a', sine(500));
+		m.tick();
+		assert.ok(m.frameBufs.has('a'));
+		m.removeUser('a');
+		assert.equal(m.frameBufs.has('a'), false);
 	});
 
 	it('leaves the sound alone when it is off, and squashes rather than clips above the knee', () => {

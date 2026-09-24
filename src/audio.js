@@ -302,6 +302,7 @@ export class SpeakerMixer {
 		this.rings.delete(id);
 		this.voices.delete(id);
 		this.concealers.delete(id);
+		this.frameBufs.delete(id); // 960 bytes a speaker, kept for good by everyone who ever spoke
 	}
 
 	/** How this speaker's decoder fills a frame that never arrived; null or a throw means it cannot. */
@@ -324,9 +325,14 @@ export class SpeakerMixer {
 	/**
 	 * The gain this speaker's frame goes out with. The level estimate moves only on frames above the
 	 * speech bar, so silence and breath do not drag it down and pump the gain up.
+	 *
+	 * A tick with no frame of theirs still has a gain: the backlog of a handover drains after they stop
+	 * sending (see _emitFloor), and those frames are the tail of the same sentence. Unity there put the
+	 * last words of a shouted sentence back up by 6 dB, and a quiet one's down by up to 18.
 	 */
 	_gain(f) {
-		if (!this.agc || f.n <= 0) return 1;
+		if (!this.agc) return 1;
+		if (f.n <= 0) return f.voice.gain;
 		const voice = f.voice;
 		if (f.peak >= this.speechPeak) {
 			const rms = rmsOf(f.buf, f.n);

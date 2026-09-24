@@ -41,6 +41,7 @@ export class AudioBridge {
 		debug = false,
 		log = () => {},
 		onFrame = null,
+		onOutputDead = null,
 		clock = () => performance.now(),
 	}) {
 		this.clock = clock; // monotonic: a system clock step neither parks the loop nor bursts it
@@ -53,6 +54,7 @@ export class AudioBridge {
 		this.debug = debug;
 		this.log = log;
 		this.onFrame = onFrame;
+		this.onOutputDead = onOutputDead; // asked on every tick the output is dead; the owner builds a new one
 
 		this.frameBuf = new Int16Array(SAMPLES_PER_FRAME_24K);
 		this.voiceOut = new Int16Array(STEREO_SAMPLES_PER_FRAME_48K);
@@ -64,6 +66,7 @@ export class AudioBridge {
 		this.dropRun = 0; // frames dropped in the stall going on right now
 		this.nextAt = 0;
 		this.timer = null;
+		this.immediate = null; // a late wake's catch-up, waiting behind the poll phase (see LATE_WAKE_MS)
 		this.lastActive = '';
 		// How the 20 ms loop is keeping time: frames the model took, the wall clock those spanned (gaps
 		// of a second or more, a reconnect, left out), the latest a tick ever ran, and how often the loop
@@ -136,6 +139,16 @@ export class AudioBridge {
 		this.dropRun = 0;
 	}
 
+	/**
+	 * Is the output finished? A destroyed stream takes every write without a word: write() returns false,
+	 * and neither 'error' nor 'drain' ever follows. The player tears its input down when it goes idle
+	 * (100 ms without a packet); that raises one 'error' (a premature close) and then nothing ever again,
+	 * so a renewal that had to wait was, until this check, never asked for a second time.
+	 */
+	get outputDead() {
+		return this.output?.destroyed === true || this.output?.writable === false;
+	}
+
 	/** Runs exactly one 20 ms step. Returns what happened (used by tests). */
 	tick() {
 		const { pcm, active, present, priority, others, frames = 1 } = this.mixer.tick();
@@ -183,17 +196,25 @@ export class AudioBridge {
 
 		const frame = voice || musicPlayed ? Buffer.from(this.voiceOut.buffer, this.voiceOut.byteOffset, this.voiceOut.byteLength) : null;
 
+		// A dead output is replaced, not waited on: written to, it latched the backpressure below for good,
+		// since the 'drain' that clears it never comes, and the bot was silent until the next reconnect.
+		// Asked on every tick it stays dead, because the owner may have to put the renewal off for a while.
+		if (this.outputDead) this.onOutputDead?.();
+
 		// If the consumer stalled (Discord reconnecting, player idle) drop frames instead of
 		// buffering stale audio forever; 'drain' resumes the flow.
-		if (this.backpressure) {
+		if (this.backpressure || this.outputDead) {
 			this.dropped++;
 			this.dropRun++;
 		} else {
 			// PassThrough keeps a view onto the buffer it is given: hand it a copy of the shared buffer.
-			const ok = this.output.write(frame ? Buffer.from(frame) : SILENCE);
+			const output = this.output;
+			const ok = output.write(frame ? Buffer.from(frame) : SILENCE);
 			if (!ok) {
 				this.backpressure = true;
-				this.output.once('drain', () => {
+				output.once('drain', () => {
+					// A stream that has since been replaced says nothing about the one written to now.
+					if (this.output !== output) return;
 					this.backpressure = false;
 					// Reported per stall, with how much speech it cost. A running total said "501 frames
 					// dropped" hours into a session and read as a ten second outage that had never happened.
@@ -212,6 +233,7 @@ export class AudioBridge {
 		const gen = ++this.gen;
 		this.nextAt = this.clock();
 		const run = () => {
+			this.immediate = null;
 			if (gen !== this.gen) return;
 			const now = this.clock();
 			let ran = 0;
@@ -237,19 +259,24 @@ export class AudioBridge {
 				this.leadDue = true; // the far end's slack is spent; a fresh lead
 			} else if (late >= LATE_WAKE_MS) {
 				// The packets that arrived during the stall are behind this timer: let them in, then catch up.
-				setImmediate(run);
+				this.immediate = setImmediate(run);
 				return;
 			}
 			run();
 		};
-		this.timer = setTimeout(loop, 0);
+		// One chain: every wake arms exactly the next one. This used to arm a timer here as well as run the
+		// first wake at once, and the first wake armed its own: two chains from then on, the second waking
+		// for nothing (the nextAt check kept it from ticking) but counted all the same, so the health
+		// report's wakes and average lateness described a loop waking twice as often as it ticked.
 		loop();
 	}
 
 	stop() {
 		this.gen++;
 		if (this.timer) clearTimeout(this.timer);
+		if (this.immediate) clearImmediate(this.immediate);
 		this.timer = null;
+		this.immediate = null;
 		this.primed = false;
 		this.backpressure = false;
 	}

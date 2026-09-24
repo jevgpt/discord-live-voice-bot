@@ -394,7 +394,12 @@ export class MusicPlayer {
 				{ stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
 			);
 			ytdlp.stderr.on('data', (chunk) => this.log(t('music.log_ytdlp', { message: String(chunk).trim().slice(0, 200) })));
-			ytdlp.once('error', (err) => this._fail(track, t('music.log_ytdlp', { message: err.message })));
+			ytdlp.once('error', (err) => {
+				// A yt-dlp of a track that has since been skipped or stopped can still report; failing on its
+				// word would skip whatever is playing now.
+				if (this.procs?.ytdlp !== ytdlp) return;
+				this._fail(track, t('music.log_ytdlp', { message: err.message }));
+			});
 			ffArgs.push('-i', 'pipe:0');
 		}
 		ffArgs.push('-vn', '-f', 's16le', '-ar', String(RATE), '-ac', String(CHANNELS), 'pipe:1');
@@ -433,7 +438,8 @@ export class MusicPlayer {
 	_fail(track, message) {
 		this.log(t('music.log_track_failed', { title: track.title, message }));
 		this.onError?.(track, message);
-		this.procs = null;
+		// startNext() kills the processes it finds in this.procs. Clearing it first left them running: when
+		// ffmpeg failed to start, yt-dlp went on downloading into a pipe nobody would ever read.
 		this.startNext();
 	}
 
@@ -466,7 +472,10 @@ export class MusicPlayer {
 				this.log(t('music.log_finished', { title: finished.title }));
 				this.history.push(finished);
 				if (this.history.length > 20) this.history.shift();
-				this.procs = null;
+				// Reported above, so startNext() must not report it again: it reports whatever is still current
+				// when the queue is empty (the end of a skip or a failure), and the last track of a queue was
+				// said to have finished twice. this.procs is left for it to find and kill, as in _fail.
+				this.current = null;
 				this.startNext();
 			}
 			if (n > 0) dst.fill(0, n, count);
