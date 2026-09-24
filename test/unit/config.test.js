@@ -128,6 +128,16 @@ describe('config.js: fixed choices', () => {
 		assert.equal(wrong.attribution, 'hmm', 'a value it cannot read keeps the default');
 		assert.match(warningFor(wrong, 'ATTRIBUTION'), /hmm, vote/);
 	});
+
+	it('VAD: the per-person detector unless the old peak bar is asked for', () => {
+		assert.equal(loadConfig(baseEnv).vad, 'adaptive');
+		const peak = loadConfig({ ...baseEnv, VAD: 'Peak' });
+		assert.equal(peak.vad, 'peak');
+		assert.deepEqual(peak.warnings, []);
+		const wrong = loadConfig({ ...baseEnv, VAD: 'energy' });
+		assert.equal(wrong.vad, 'adaptive');
+		assert.match(warningFor(wrong, 'VAD'), /adaptive, peak/);
+	});
 });
 
 describe('config.js: numbers', () => {

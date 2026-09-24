@@ -90,4 +90,19 @@ describe('the audio line of the report', () => {
 		const young = health.report({ audio: { ...audio, sentRatio: 0.9, sent: 100 } });
 		assert.equal(young.length, 3, 'the rate means nothing before 30 s of audio');
 	});
+
+	// VAD=adaptive: what the detector sees of each microphone is on the same line, so that a live session
+	// says whose floor is a fan (-40) and whose voice only just clears their bar.
+	it('shows each person s noise floor and speech bar under the adaptive detector', () => {
+		const health = new SessionHealth();
+		const levels = [
+			{ id: 'a', name: 'Ada', levelDb: -31, gainDb: 11, floorDb: -58, thresholdDb: -52 },
+			{ id: 'b', name: 'Bo', levelDb: null, gainDb: 0, floorDb: -41, thresholdDb: -35 },
+			{ id: 'c', name: 'Cem', levelDb: -24, gainDb: -4, floorDb: null, thresholdDb: null },
+		];
+		const line = health.report({ audio: { holes: 0, sent: 10, levels } })[2];
+		assert.match(line, /Ada -31 dB \(\+11 dB; floor -58 dB, speech from -52 dB\)/);
+		assert.match(line, /Bo \? dB \(\+0 dB; floor -41 dB, speech from -35 dB\)/, 'no AGC level measured yet: a question mark, not a number');
+		assert.match(line, /Cem -24 dB \(-4 dB\)(,|$)/, 'the peak bar has no floor to show');
+	});
 });

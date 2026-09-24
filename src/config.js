@@ -388,6 +388,9 @@ function readConfig(env) {
 		// default because the benchmark (npm run bench) names more lines right and puts the owner's name on
 		// far fewer of somebody else's fragments with it, and on none more in any of its rooms.
 		attribution: oneOf(env.ATTRIBUTION, ['hmm', 'vote'], 'hmm'),
+		// Who is speaking: "adaptive" judges each person against their own microphone's noise floor, "peak"
+		// is the one absolute bar every microphone used to share (see VAD_TUNING in audio.js).
+		vad: oneOf(env.VAD, ['adaptive', 'peak'], 'adaptive'),
 		// Give the model silent context about who is speaking (name, owner or not, memory notes); off means it cannot tell people apart.
 		announceSpeaker: bool(env.ANNOUNCE_SPEAKER, true),
 		transcripts: bool(env.TRANSCRIPTS, true),

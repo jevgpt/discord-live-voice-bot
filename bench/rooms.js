@@ -190,7 +190,7 @@ function packetsFor(script, speakers, rand, { jitter = 0.04, maxDelay = 2, loss 
 function mixRoom(script, speakers, ownerId, config, rand) {
 	if (speakers.length > MAX_VOICES) throw new Error(`a room has room for ${MAX_VOICES} voices, not ${speakers.length}`);
 	const { serials, byTick } = packetsFor(script, speakers, rand, config.packets);
-	const mixer = new SpeakerMixer({ floorControl: config.floorControl, agc: config.agc, primeFrames: config.primeFrames });
+	const mixer = new SpeakerMixer({ floorControl: config.floorControl, agc: config.agc, primeFrames: config.primeFrames, vad: config.vad });
 	if (config.ownerPriority && ownerId) mixer.setPriority(ownerId);
 	// The decoder's concealment: the last packet again, fading, for the few frames the mixer asks for. The
 	// tag fades with it and still reads back, as the same word: that is what the decoder's guess is.
@@ -405,6 +405,9 @@ const DEFAULTS = {
 	ownerPriority: true,
 	agc: true,
 	primeFrames: 2,
+	// The voice detector the live session uses by default (VAD in .env): the rooms are scored on the audio
+	// path as it runs, not as it ran before the detector changed.
+	vad: 'adaptive',
 	packets: {},
 	transcript: {},
 };

@@ -183,7 +183,9 @@ const FLOOR_JITTER_FRAMES = 5;
 // speech bar: a voice below that is still summed into the frame the model transcribes, so treating it
 // as absent let somebody speak quietly and have their words land under another person's name. Not the
 // audio bar either, which is a fan or a keyboard. This is the level the barge-in check already uses
-// for "there is real sound here".
+// for "there is real sound here". It stays this bar under the adaptive detector (VAD_TUNING): presence
+// is the attacker's question, and a bar that follows a person's own noise floor is one they can raise
+// with a noise of their own and then murmur under.
 const PRESENCE_PEAK = 200;
 // Floor control: one voice at a time. The model hears a SUM and cannot pull it apart, so two people at
 // once is the one thing every downstream step is worst at -- the transcript comes back garbled, the line
@@ -233,6 +235,180 @@ const AGC_UP = 1.02;
 const AGC_DOWN = 0.8;
 const LONG_AGO = -1e9;
 
+// ---------------------------------------------------------------- who is speaking, per microphone
+//
+// SPEECH_PEAK above is one bar for every microphone, and a microphone is not a room. Measured on the
+// synthetic rooms in bench/vad.mjs (npm run bench:vad): a quiet speaker at -42 dBFS was heard on 71% of
+// their speech frames and one at -48 dBFS on 45%, while a desk fan at -40 dBFS cleared it on every frame
+// it made -- a fan's owner was a speaker for as long as the fan ran, and under floor control the fan held
+// the floor 98% of the time against somebody who was actually talking. VAD=adaptive judges each person
+// against their own microphone instead: the energy of a frame in dB, against the noise floor tracked on
+// that person's frames alone. VAD=peak is the bar above, exactly as it was.
+export const VAD_TUNING = Object.freeze({
+	// The energy is measured through two first-order high-passes (-3 dB at 170 Hz, -16 dB at 50 Hz).
+	// What a fan, an air conditioner and the mains put into a microphone lives mostly below the voice,
+	// and it is also what makes their level wander from frame to frame: through the high-pass the frame
+	// energy of the fan above spreads 0.9 dB instead of 2.2, and a brown rumble 1.1 dB instead of 4.2. A
+	// floor that wanders less needs less of a margin above it, and the margin is what a quiet voice has to
+	// clear. The voice loses little: its energy is in the formants, and at 270 Hz the loss is 1.2 dB.
+	highPass: 0.97,
+	// The floor is the quietest frame of the last 1.6 s of this person's audio, kept as four blocks of
+	// 400 ms so that it costs four comparisons a frame. A voice dips back to the room between words and in
+	// the closure of every p, t and k, many times in 1.6 s; a fan never dips below itself. So a lower frame
+	// takes the floor down at once, and a louder room takes it up within 1.6 s.
+	blockFrames: 20,
+	blocks: 4,
+	// A frame starts a talk-spurt 6 dB above the floor (with SPEECH_ONSET_FRAMES of them in a row, as
+	// before) and keeps one going 5 dB above it: the tail of a word decays through the bar it rose through,
+	// and the lower bar keeps the hold running from the end of the tail rather than from the last stressed
+	// syllable. The hold after that is SPEECH_HOLD_FRAMES, unchanged (see _speaking for what now lets it run
+	// its length in a quiet room). Swept on the rooms of the bench: 7 dB to start cost a quiet speaker over a fan 0.8 frames of onset and 1.6
+	// points of recall; 4 dB to keep going let a brown rumble hold turns open (16% false speech against 4%).
+	onsetDb: 6,
+	keepDb: 5,
+	// And never below -55 dBFS to start, -60 to keep going, whatever the floor: a microphone after noise
+	// suppression can sit at -90, where a floor-relative bar alone would call a breath a sentence. -55 is
+	// a voice the AGC can still bring to -37 dBFS; a -48 dBFS speaker is heard on 86% of their frames.
+	minOnsetDb: -55,
+	minKeepDb: -60,
+	// Below this a frame is digital silence: nothing was transmitted (the decoded silence frames Discord
+	// ends a talk-spurt with), so it says nothing about the room and does not enter the floor.
+	silenceDb: -80,
+	// Before a person has sent anything, their room is assumed quiet. Starting the floor at the first
+	// frame instead would judge the first word of the session against itself, and Discord sends nothing
+	// until somebody speaks, so the first frame usually is a word.
+	initialFloorDb: -70,
+	// The sanity ceiling: a sound that has held within 3 dB for 300 ms, well above the floor, is not a
+	// voice -- in the bench's speech even the steadiest tenth of 300 ms stretches spans 29 dB -- and the
+	// floor is lifted to it at once instead of after 1.6 s. A fan switched on in a quiet room is a speaker
+	// for 0.5 s (300 ms, and the hold) instead of 1.8 s; the same for a hum or a held chord. A held "mmmm"
+	// is the one voice it catches, and only its tail.
+	steadyFrames: 15,
+	steadyDb: 3,
+	// A key click puts its energy into a few milliseconds of the frame, a voice spreads it over the whole
+	// of it: peak against RMS (after the high-pass), a click frame is 15-19 dB (10th to 90th percentile), a
+	// speech frame 6-12, and 3% of speech frames are above 15, mostly the burst of a p or a t. A frame above
+	// 15 dB neither starts nor holds a turn. Without this, adaptive mode was worse than the peak bar at
+	// typing, 42% of a typist's frames against 18%, because every click is far above a quiet room's floor;
+	// with it, 0.1%. Letting such a frame hold a turn it did not start saved a few word boundaries, and
+	// called somebody who types between sentences a speaker on 30% of the frames they were not talking.
+	crestDb: 15,
+});
+const DBFS = 10 * Math.log10(32768 * 32768);
+
+/**
+ * One person's microphone as the adaptive detector sees it: each frame's peak, its energy in dBFS after
+ * the high-pass and its crest, and the noise floor of the last 1.6 s. A few multiply-adds per sample, in
+ * the pass that finds the peak anyway, and a few dozen comparisons per frame. Measured with ten people
+ * sending every frame, a tick costs 64 µs against 37 µs with the peak bar: a third of a percent of the
+ * 20 ms it has.
+ */
+export class NoiseFloor {
+	constructor(tuning = VAD_TUNING) {
+		this.tuning = tuning;
+		this.blocks = new Float64Array(tuning.blocks).fill(tuning.initialFloorDb);
+		this.block = 0;
+		this.blockMin = Infinity;
+		this.blockFill = 0;
+		this.recent = new Float64Array(tuning.steadyFrames);
+		this.recentAt = 0;
+		this.recentFill = 0;
+		this.floor = tuning.initialFloorDb;
+		this.tracked = 0; // frames taken into the floor
+		// The two high-pass sections carry their last input and output across frames.
+		this.x1 = 0;
+		this.y1 = 0;
+		this.z1 = 0;
+		this.w1 = 0;
+		this.db = -Infinity;
+		this.peak = 0;
+		this.voiced = false;
+		this.crestRatio = 10 ** (tuning.crestDb / 10); // crestDb as a ratio of powers, so a frame needs no log for it
+	}
+
+	/** Measures a frame: its peak (absolute int16, as peakOf), energy in dBFS and whether it can be a voice. */
+	measure(samples, count) {
+		const r = this.tuning.highPass;
+		let x1 = this.x1;
+		let y1 = this.y1;
+		let z1 = this.z1;
+		let w1 = this.w1;
+		let peak = 0;
+		let top = 0;
+		let acc = 0;
+		for (let i = 0; i < count; i++) {
+			const x = samples[i];
+			const abs = x < 0 ? -x : x;
+			if (abs > peak) peak = abs;
+			const y = x - x1 + r * y1;
+			x1 = x;
+			y1 = y;
+			const w = y - z1 + r * w1;
+			z1 = y;
+			w1 = w;
+			acc += w * w;
+			const a = w < 0 ? -w : w;
+			if (a > top) top = a;
+		}
+		this.x1 = x1;
+		this.y1 = y1;
+		this.z1 = z1;
+		this.w1 = w1;
+		this.peak = peak;
+		this.db = acc > 0 && count > 0 ? 10 * Math.log10(acc / count) - DBFS : -Infinity;
+		// The crest, peak² against the mean square (see crestDb).
+		this.voiced = acc > 0 && top * top * count <= acc * this.crestRatio;
+		return this.db;
+	}
+
+	/** The bar a frame has to clear to start a talk-spurt. */
+	get onset() {
+		return Math.max(this.floor + this.tuning.onsetDb, this.tuning.minOnsetDb);
+	}
+
+	/** The lower bar that keeps one going. */
+	get keep() {
+		return Math.max(this.floor + this.tuning.keepDb, this.tuning.minKeepDb);
+	}
+
+	/** Takes a frame, already judged against the floor as it stood, into the floor. */
+	track(db) {
+		const tuning = this.tuning;
+		if (!(db >= tuning.silenceDb)) return;
+		this.tracked++;
+		if (db < this.blockMin) this.blockMin = db;
+		if (++this.blockFill >= tuning.blockFrames) {
+			this.blocks[this.block] = this.blockMin;
+			this.block = (this.block + 1) % this.blocks.length;
+			this.blockMin = Infinity;
+			this.blockFill = 0;
+		}
+		let floor = this.blockMin;
+		for (let i = 0; i < this.blocks.length; i++) if (this.blocks[i] < floor) floor = this.blocks[i];
+		const recent = this.recent;
+		recent[this.recentAt] = db;
+		this.recentAt = (this.recentAt + 1) % recent.length;
+		if (this.recentFill < recent.length) this.recentFill++;
+		if (this.recentFill === recent.length) {
+			let lo = Infinity;
+			let hi = -Infinity;
+			for (let i = 0; i < recent.length; i++) {
+				const v = recent[i];
+				if (v < lo) lo = v;
+				if (v > hi) hi = v;
+			}
+			// Steady and well above the floor: the room got louder (see steadyFrames). Whatever the window
+			// remembered from before it is no longer the room; a quieter frame later brings the floor back.
+			if (hi - lo <= tuning.steadyDb && lo > floor + tuning.keepDb) {
+				this.blocks.fill(lo);
+				if (this.blockMin < lo) this.blockMin = lo;
+				floor = lo;
+			}
+		}
+		this.floor = floor;
+	}
+}
+
 /**
  * Per-speaker buffers summed into one 20 ms frame per tick.
  * Keeps each speaker's audio separate until the very last step so that
@@ -241,7 +417,8 @@ const LONG_AGO = -1e9;
  * Each speaker also gets a small voice-activity state machine. The model is sent ONE mixed stream, so
  * the `active` list returned here is the only record of who said what: it is what later decides whose
  * sentence a transcript line was. It therefore has to answer "who is speaking", not "whose microphone
- * is open".
+ * is open". What it is fed per frame is the peak bar (VAD=peak) or, with VAD=adaptive, the frame against
+ * that person's own NoiseFloor; the onset, the hold and everything downstream of them are the same.
  */
 export class SpeakerMixer {
 	constructor({
@@ -261,7 +438,14 @@ export class SpeakerMixer {
 		agc = false,
 		concealFrames = CONCEAL_FRAMES,
 		primeFrames = 1,
+		// Who is speaking: 'adaptive' (per person, against their own noise floor) or 'peak' (SPEECH_PEAK for
+		// everybody). Live it is VAD in the config; the constructor keeps the peak bar, which is what the
+		// tests' flat frames of 3000 were written against. `vadTuning` overrides VAD_TUNING, for the bench.
+		vad = 'peak',
+		vadTuning = null,
 	} = {}) {
+		this.adaptive = vad === 'adaptive';
+		this.vadTuning = vadTuning ? Object.freeze({ ...VAD_TUNING, ...vadTuning }) : VAD_TUNING;
 		this.primeFrames = Math.max(1, primeFrames | 0);
 		this.floorControl = floorControl;
 		this.floorMaxFrames = floorMaxFrames;
@@ -287,7 +471,7 @@ export class SpeakerMixer {
 		this.floorHoldFrames = floorHoldFrames;
 		this.jitterFrames = jitterFrames;
 		this.rings = new Map();
-		this.voices = new Map(); // id -> { loud, speechAt, audioAt, energy }
+		this.voices = new Map(); // id -> { loud, speechAt, audioAt, energy, vad }
 		this.frames = 0;
 		this.priorityId = null;
 		this.tmp = new Int16Array(frameSamples);
@@ -323,8 +507,10 @@ export class SpeakerMixer {
 	}
 
 	/**
-	 * The gain this speaker's frame goes out with. The level estimate moves only on frames above the
-	 * speech bar, so silence and breath do not drag it down and pump the gain up.
+	 * The gain this speaker's frame goes out with. The level estimate moves only on frames that are speech
+	 * in their own right (see _note), so silence and breath do not drag it down and pump the gain up. Under
+	 * the peak bar a fan counted as speech here too: its -40 dBFS became the "voice" the gain was set for,
+	 * and it went out 18 dB louder. The adaptive detector gives the estimate nothing but talk-spurts.
 	 *
 	 * A tick with no frame of theirs still has a gain: the backlog of a handover drains after they stop
 	 * sending (see _emitFloor), and those frames are the tail of the same sentence. Unity there put the
@@ -334,7 +520,7 @@ export class SpeakerMixer {
 		if (!this.agc) return 1;
 		if (f.n <= 0) return f.voice.gain;
 		const voice = f.voice;
-		if (f.peak >= this.speechPeak) {
+		if (f.strong) {
 			const rms = rmsOf(f.buf, f.n);
 			voice.level = voice.level > 0 ? voice.level + (rms - voice.level) * AGC_LEVEL_ALPHA : rms;
 		}
@@ -357,8 +543,17 @@ export class SpeakerMixer {
 	levels() {
 		const list = [];
 		for (const [id, voice] of this.voices) {
-			if (voice.level <= 0) continue;
-			list.push({ id, levelDb: Math.round(20 * Math.log10(voice.level / 32768)), gainDb: Math.round(20 * Math.log10(voice.gain)) });
+			// The detector's view as well, in adaptive mode: the floor this person is judged against and the
+			// bar a frame of theirs has to clear to start a turn.
+			const vad = voice.vad?.tracked > 0 ? voice.vad : null;
+			if (voice.level <= 0 && !vad) continue;
+			list.push({
+				id,
+				levelDb: voice.level > 0 ? Math.round(20 * Math.log10(voice.level / 32768)) : null,
+				gainDb: Math.round(20 * Math.log10(voice.gain)),
+				floorDb: vad ? Math.round(vad.floor) : null,
+				thresholdDb: vad ? Math.round(vad.onset) : null,
+			});
 		}
 		return list;
 	}
@@ -366,7 +561,7 @@ export class SpeakerMixer {
 	_voice(id) {
 		let voice = this.voices.get(id);
 		if (!voice) {
-			voice = { loud: 0, speechAt: LONG_AGO, audioAt: LONG_AGO, energy: 0, runStart: LONG_AGO, wasSpeaking: false, recent: [], pending: [], concealed: 0, level: 0, gain: 1, primed: false, primeSince: LONG_AGO };
+			voice = { loud: 0, speechAt: LONG_AGO, audioAt: LONG_AGO, energy: 0, runStart: LONG_AGO, wasSpeaking: false, recent: [], pending: [], concealed: 0, level: 0, gain: 1, primed: false, primeSince: LONG_AGO, vad: this.adaptive ? new NoiseFloor(this.vadTuning) : null, sendingAt: LONG_AGO };
 			this.voices.set(id, voice);
 		}
 		return voice;
@@ -374,21 +569,35 @@ export class SpeakerMixer {
 
 	/**
 	 * One frame of this speaker's audio, loud or not. Every known speaker is noted on every tick, so
-	 * that a hold runs out on its own when somebody simply stops sending packets.
+	 * that a hold runs out on its own when somebody simply stops sending packets. `db` is the frame's
+	 * energy as their NoiseFloor measured it (adaptive mode only). Returns whether the frame is speech in
+	 * its own right, which is what moves the AGC's estimate: a pause inside a turn is not.
 	 */
-	_note(id, peak) {
-		const voice = this._voice(id);
+	_note(voice, peak, db) {
 		// A smoothed level, so that "the loudest person" is the one holding the floor and not whoever
 		// produced the sharpest transient inside these 20 ms.
 		voice.energy = voice.energy * 0.7 + peak * 0.3;
-		if (peak >= this.speechPeak) {
-			voice.loud++;
-			if (voice.loud >= this.onsetFrames) voice.speechAt = this.frames;
-		} else {
-			voice.loud = 0;
+		const vad = voice.vad;
+		if (!vad) {
+			if (peak >= this.speechPeak) {
+				voice.loud++;
+				if (voice.loud >= this.onsetFrames) voice.speechAt = this.frames;
+			} else {
+				voice.loud = 0;
+			}
+			if (peak > this.activityPeak) voice.audioAt = this.frames;
+			return peak >= this.speechPeak;
 		}
+		// Judged against the floor as it stood before this frame, then taken into it.
+		if (vad.voiced && db >= vad.onset) voice.loud++;
+		else voice.loud = 0;
+		const strong = voice.loud >= this.onsetFrames;
+		if (strong || (vad.voiced && db >= vad.keep && this.frames - voice.speechAt <= this.holdFrames)) voice.speechAt = this.frames;
+		vad.track(db);
 		if (peak > this.activityPeak) voice.audioAt = this.frames;
-		return voice;
+		// For their turn, "still sending" is any frame that is not digital silence (see _speaking).
+		if (db >= vad.tuning.silenceDb) voice.sendingAt = this.frames;
+		return strong;
 	}
 
 	/**
@@ -399,9 +608,19 @@ export class SpeakerMixer {
 	 * on the strength of the first condition alone is what wrote a stale second name onto the first
 	 * fragment of the next person's turn. While the level merely dips, through a quiet syllable, the
 	 * packets keep coming and the turn is still theirs.
+	 *
+	 * Under the peak bar "still arriving" is a peak over 50, and in a quiet room the pause between two
+	 * words is under 50: the turn ended 100 ms into it, before the 200 ms hold could cover it. Over six
+	 * minutes of the bench's speech that broke a -30 dBFS speaker's utterances 150 times and a -42 dBFS
+	 * speaker's 171. The adaptive detector counts any frame that is not digital silence (sendingAt), which
+	 * Discord's own end-of-speech frames are, and the same speech broke 18 and 25 times. The owner's
+	 * priority hold below keeps the old test: its 500 ms held in full kept a guest who answered the owner
+	 * at once waiting 440 ms, and lost the first 80 ms of the answer past the pre-roll. As it is, the guest
+	 * has the floor 100-140 ms into their answer (the owner's 200 ms hold, where it was 20-40), and the
+	 * pre-roll sends what they said meanwhile.
 	 */
 	_speaking(voice) {
-		return this.frames - voice.speechAt <= this.holdFrames && this.frames - voice.audioAt <= this.jitterFrames;
+		return this.frames - voice.speechAt <= this.holdFrames && this.frames - (voice.vad ? voice.sendingAt : voice.audioAt) <= this.jitterFrames;
 	}
 
 	/** Does the priority speaker still own the channel: spoke recently AND is still sending packets. */
@@ -497,42 +716,50 @@ export class SpeakerMixer {
 		const frames = [];
 		for (const [id, ring] of this.rings) {
 			const buf = this._buf(id);
-			const known = this._voice(id);
+			const voice = this._voice(id);
 			const depth = ring.length / this.frameSamples;
 			if (depth > this.stats.maxDepth) this.stats.maxDepth = depth;
 			if (depth >= DEEP_FRAMES) this.stats.deep++;
 			// A talk-spurt is read from its second frame (see PRIME_FRAMES), or after PRIME_TICKS if a second
 			// never comes. From then on the ring is read as it is: a frame of margin is in it.
-			if (!known.primed && ring.length > 0) {
-				if (known.primeSince === LONG_AGO) known.primeSince = this.frames;
-				if (this.primeFrames <= 1 || ring.length >= this.primeFrames * this.frameSamples || this.frames - known.primeSince >= PRIME_TICKS) {
-					known.primed = true;
-					known.primeSince = LONG_AGO;
+			if (!voice.primed && ring.length > 0) {
+				if (voice.primeSince === LONG_AGO) voice.primeSince = this.frames;
+				if (this.primeFrames <= 1 || ring.length >= this.primeFrames * this.frameSamples || this.frames - voice.primeSince >= PRIME_TICKS) {
+					voice.primed = true;
+					voice.primeSince = LONG_AGO;
 				}
 			}
-			let n = known.primed && ring.length > 0 ? ring.read(buf, this.frameSamples) : 0;
+			let n = voice.primed && ring.length > 0 ? ring.read(buf, this.frameSamples) : 0;
 			if (n > 0) {
-				known.concealed = 0;
+				voice.concealed = 0;
 			} else if (ring.length === 0) {
 				// Ran dry. At a spurt's end that is the end; the next spurt is read from its second frame again.
-				if (known.primed && !known.wasSpeaking) known.primed = false;
-				if ((known.wasSpeaking || known.loud > 0) && this.frames - known.audioAt <= this.jitterFrames) {
+				if (voice.primed && !voice.wasSpeaking) voice.primed = false;
+				if ((voice.wasSpeaking || voice.loud > 0) && this.frames - voice.audioAt <= this.jitterFrames) {
 					// Mid-word and nothing arrived: a packet late or lost. The decoder's guess goes out in its
 					// place, a few frames at most; after that the silence is real.
 					this.stats.holes++;
-					if (known.concealed < this.concealFrames) {
+					if (voice.concealed < this.concealFrames) {
 						const fill = this._conceal(id);
 						if (fill) {
 							n = Math.min(fill.length, this.frameSamples);
 							buf.set(fill.subarray(0, n));
-							known.concealed++;
+							voice.concealed++;
 							this.stats.concealed++;
 						}
 					}
 				}
 			}
-			const peak = n > 0 ? peakOf(buf, n) : 0;
-			const voice = this._note(id, peak);
+			// The adaptive detector measures the peak in the same pass as the energy.
+			let peak = 0;
+			let db = -Infinity;
+			if (n > 0 && voice.vad) {
+				db = voice.vad.measure(buf, n);
+				peak = voice.vad.peak;
+			} else if (n > 0) {
+				peak = peakOf(buf, n);
+			}
+			const strong = this._note(voice, peak, db);
 			const speaking = this._speaking(voice);
 			if (speaking && !voice.wasSpeaking) voice.runStart = this.frames; // the queue for the floor is by this
 			voice.wasSpeaking = speaking;
@@ -543,7 +770,7 @@ export class SpeakerMixer {
 			} else if (!speaking) {
 				voice.recent.length = 0; // gone quiet: what they said minutes ago is no onset of anything
 			}
-			frames.push({ id, buf, n, peak, voice, speaking });
+			frames.push({ id, buf, n, peak, strong, voice, speaking });
 		}
 		const speakingBut = (holder) => frames.filter((f) => f.speaking && f.id !== holder).map((f) => f.id);
 

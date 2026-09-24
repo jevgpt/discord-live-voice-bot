@@ -155,8 +155,11 @@ export class GuildSession {
 		// ---------------------------------------------------------------- audio path
 		// One voice at a time (see SpeakerMixer): the model hears a sum and cannot pull it apart, so while
 		// somebody holds the floor only their audio goes out. FLOOR_CONTROL=0 sends the sum as before.
-		this.mixer = new SpeakerMixer({ floorControl: cfg.floorControl, agc: cfg.agc, primeFrames: cfg.primeFrames });
+		// Who is speaking is judged per person against their own noise floor (VAD=adaptive), or by the one
+		// peak bar every microphone used to share (VAD=peak).
+		this.mixer = new SpeakerMixer({ floorControl: cfg.floorControl, agc: cfg.agc, primeFrames: cfg.primeFrames, vad: cfg.vad });
 		if (cfg.floorControl) this.log(t('runtime.floor_control_on'));
+		this.log(t(this.mixer.adaptive ? 'runtime.vad_adaptive' : 'runtime.vad_peak'));
 		if (cfg.ownerPriority && cfg.ownerId) this.mixer.setPriority(cfg.ownerId);
 		this.playback = new PlaybackQueue();
 		this.idle = new IdleGovernor({ idleMs: cfg.idleCloseMs });
