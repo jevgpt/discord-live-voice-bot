@@ -23,6 +23,7 @@ import { loadConfig } from './config.js';
 import { maskSecret, updateEnvFile } from './envfile.js';
 import { GuildSession } from './guildsession.js';
 import { t, tList } from './i18n/index.js';
+import { liveSlotsTaken, offerLiveSlots } from './liveslots.js';
 import { LocalServerManager, detectVenvPython } from './localserver.js';
 import { LocalStt } from './localstt.js';
 import { MemoryStore } from './memory.js';
@@ -156,19 +157,29 @@ async function applyKeys(patch = {}) {
 // (conversation, model session, audio path, music, speaker attribution) lives inside its own session,
 // so the registry is the only place that knows there is more than one.
 const sessions = new Map();
+// Sessions dropped from the registry whose realtime socket is still closing: they are no longer
+// anybody's server, but until the socket is gone they still hold a slot.
+const retiring = new Set();
 
 /** The session of one guild, or null when the bot is not set up for that server. */
 function sessionFor(guildId) {
 	return (guildId ? sessions.get(String(guildId)) : null) ?? null;
 }
 
-/** How many guilds hold a realtime connection right now — what MAX_LIVE_SESSIONS counts. */
+/** How many guilds hold a realtime connection right now (open, connecting or closing) — what MAX_LIVE_SESSIONS counts. */
 function liveSessionCount(except = null) {
-	let count = 0;
-	for (const session of sessions.values()) {
-		if (session !== except && session.live) count++;
+	return liveSlotsTaken([...sessions.values(), ...retiring], except);
+}
+
+/**
+ * A realtime socket has closed somewhere. A server held back by the cap never hears of it on its own —
+ * it is not paused, so speech does not reopen it — which is why the registry hands the slot on here.
+ */
+function offerFreedSlots() {
+	if (shuttingDown) return;
+	for (const session of offerLiveSlots([...sessions.values(), ...retiring], cfg.maxLiveSessions)) {
+		log(t('runtime.live_slot_taken', { guild: session.guild?.name ?? session.guild?.id ?? '?' }));
 	}
-	return count;
 }
 
 /**
@@ -202,6 +213,7 @@ async function ensureSession(guildId, channelId = null) {
 		presenceEnabled: usePresence,
 		// The cost cap lives in the registry because only it can see the other guilds.
 		canOpenLive: (asking) => liveSessionCount(asking) < cfg.maxLiveSessions,
+		onLiveSlotFreed: () => offerFreedSlots(),
 		onPermanentLeave: (left) => dropSession(left),
 		joinChannel: (channel) => joinChannel(channel),
 	});
@@ -233,7 +245,14 @@ function dropSession(session) {
 	sessions.delete(guildId);
 	log(t('runtime.session_dropped', { guild: session.guild?.name ?? guildId }));
 	session.stop();
-	void session.dispose().catch(() => {});
+	retiring.add(session);
+	void session
+		.dispose()
+		.catch(() => {})
+		.finally(() => {
+			retiring.delete(session);
+			offerFreedSlots();
+		});
 }
 
 /** Snapshot of every session; `first` (usually the guild being asked about) is put in front. */

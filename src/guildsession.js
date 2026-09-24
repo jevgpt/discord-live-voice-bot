@@ -27,6 +27,7 @@ import { SpeechSegmenter } from './localstt.js';
 import { LocalTts, firstClause, splitSentences } from './localtts.js';
 import { MemberIndex } from './matcher.js';
 import { Ducker, MusicPlayer } from './music.js';
+import { SessionUsage } from './quota.js';
 import { normalize, parseBool, stripDictationTail, stripSpokenPrefix } from './text.js';
 import { callTool, toolDefinitions, toolOutput } from './tools.js';
 import { VoiceSession } from './voice.js';
@@ -142,6 +143,8 @@ const HEALTH_MIN_FRAGMENTS = 20;
 // How many failures on one open session, inside this window, mean the session is no longer usable.
 const LIVE_ERROR_LIMIT = 3;
 const LIVE_ERROR_WINDOW_MS = 60_000; // a silent frame gap of up to 300 ms (packet jitter, a breath) does not reset the counter
+// How long a realtime session has to stay up before the reconnect back-off starts again from one second.
+const LIVE_STABLE_MS = 30_000;
 
 // Names the bot answers to on top of the active character's name, and the filler words dropped when
 // deciding whether the name was called on its own or together with a request.
@@ -195,10 +198,19 @@ export class GuildSession {
 		summarize,
 		presenceEnabled = false,
 		canOpenLive = null,
+		onLiveSlotFreed = null,
+		createLive = null,
 		onPermanentLeave = null,
 		joinChannel = null,
 	}) {
-		this.cfg = cfg;
+		// One cfg object is shared by every server. The settings the owner can change at runtime (brain,
+		// transcripts, announce_speaker, owner_priority, idle_close_minutes, the default voice) belong to
+		// the server they were changed in, so this guild reads cfg through a view of its own: a read finds
+		// this guild's override first and the shared value otherwise, and a write lands here only. Being a
+		// prototype view, it must be read field by field -- a spread ({ ...this.cfg }) would drop every
+		// value it has not overridden. What is process-wide on purpose is written to sharedCfg instead.
+		this.sharedCfg = cfg;
+		this.cfg = Object.create(cfg);
 		this.client = client;
 		this.guild = guild;
 		// The voice channel of THIS guild; cfg.channelId belongs to the primary target only.
@@ -224,13 +236,20 @@ export class GuildSession {
 		this.record = (event) => record(tagGuild(event));
 		// May this guild open a realtime session right now (MAX_LIVE_SESSIONS)? The registry answers.
 		this.canOpenLive = canOpenLive ?? (() => true);
+		// Told to the registry when one of this guild's realtime sockets is gone, so a guild held back by
+		// the cap can have the slot.
+		this.onLiveSlotFreed = onLiveSlotFreed;
+		// How a realtime session is made; the tests hand in a stand-in that never opens a socket.
+		this.createLive = createLive ?? ((options) => new LiveSession(options));
 		// Told to the registry when the guild is left for good, so the session can be dropped.
 		this.onPermanentLeave = onPermanentLeave;
 		// The join the tools use. Through the registry it can also reach a server that has no session yet
 		// (one is built on the spot); without a registry it is this guild's own join.
 		this.joinChannel = joinChannel;
-		// Why this guild is NOT holding a realtime session, when that is a decision rather than a failure.
+		// Why this guild is NOT holding a realtime session, when that is a decision rather than a failure,
+		// and since when: the slot that frees first goes to the guild that has waited longest.
 		this.liveBlockedReason = null;
+		this.liveBlockedSince = 0;
 		this.provider = provider;
 		this.openai = openai;
 		this.localStt = localStt;
@@ -333,7 +352,12 @@ export class GuildSession {
 
 		// ---------------------------------------------------------------- GPT-Live session and reconnect state
 		this.live = null;
+		// Sessions this guild has let go of whose sockets are not closed yet; they still count against
+		// MAX_LIVE_SESSIONS (see retireLive).
+		this.closingLive = new Set();
 		this.liveReconnectTimer = null;
+		// Armed when a session is ready; the failure count is forgiven only once a session has stayed up.
+		this.liveStableTimer = null;
 		this.liveFailures = 0;
 		this.lastFatalCode = null; // tell the owner about the same permanent error only once
 		this.lastLiveError = null; // the reason for the 'closed' that follows an 'error' event
@@ -429,11 +453,7 @@ export class GuildSession {
 			onSpeaking: (userId) => {
 				this.lastSpeakerId = userId;
 				this.idle.touch();
-				if (this.paused && this.brain !== 'local') {
-					if (this.quotaBlocked && this.quota.status().exceeded) return;
-					this.log(t('runtime.speech_detected'));
-					this.resumeLive();
-				}
+				if ((this.paused || this.liveBlockedReason) && this.brain !== 'local') this.resumeOnSpeech();
 				// The speaker announcement now follows the audio that is sent (trackSentSpeaker); only the memory hint here.
 				void this.hintMemory(userId);
 			},
@@ -562,6 +582,7 @@ export class GuildSession {
 			reminders: session.reminders,
 			savedTracks: session.savedTracks,
 			setDefaultVoice: (voiceName) => {
+				// this.cfg is this guild's own view (see the constructor): the other servers keep their voice.
 				cfg.liveVoice = voiceName;
 			},
 			applySetting: (name, value) => session.applySetting(name, value),
@@ -1080,11 +1101,13 @@ export class GuildSession {
 			if (!this.liveBlockedReason) {
 				const guild = this.guild?.name ?? this.guild?.id ?? '?';
 				this.log(t('runtime.live_cap_reached', { guild, max: this.cfg.maxLiveSessions }));
+				this.liveBlockedSince = Date.now();
 			}
 			this.liveBlockedReason = t('runtime.live_cap_reason', { max: this.cfg.maxLiveSessions });
 			return;
 		}
 		this.liveBlockedReason = null;
+		this.liveBlockedSince = 0;
 		this.quotaBlocked = false;
 		if (this.liveReconnectTimer) {
 			clearTimeout(this.liveReconnectTimer);
@@ -1092,7 +1115,7 @@ export class GuildSession {
 		}
 		const cfg = this.cfg;
 		const current = this.persona();
-		const session = new LiveSession({
+		const session = this.createLive({
 			apiKey: cfg.openaiApiKey,
 			baseURL: cfg.baseURL,
 			model: cfg.liveModel,
@@ -1113,12 +1136,42 @@ export class GuildSession {
 			},
 		});
 		this.live = session;
+		// Every handler below first asks whether this is still the guild's session. A session that was
+		// replaced (a persona rebuild), paused or given up on keeps emitting until its socket is gone: a late
+		// 'ready' from it reset the attribution under the new session, a late 'turn' marked a turn on the new
+		// session's clock, and a late 'usage' could close the new session over the quota.
+		const isCurrent = () => this.live === session;
+		// This session's running usage total; the shared quota takes only the difference (see quota.js).
+		const usage = new SessionUsage(this.quota);
+		// A session ends once. A handshake failure is seen twice -- as 'closed' and as connect()'s rejection
+		// -- and planning the retry from both doubled the back-off and the log line; whichever comes first
+		// decides, and the other finds the session already ended.
+		let ended = false;
+		const end = (why, err) => {
+			if (ended) return;
+			ended = true;
+			if (!isCurrent()) return; // replaced or paused on purpose: whoever did that decides what comes next
+			this.live = null;
+			this.clearLiveStableTimer();
+			this.reportHealth(t('runtime.health_why_closed'));
+			this.lastLiveError = null;
+			if (this.shuttingDown || this.paused) return;
+			this.scheduleLiveRetry(why, err);
+		};
 
 		session.on('ready', ({ sessionId }) => {
-			this.liveFailures = 0;
-			this.lastFatalCode = null;
+			if (!isCurrent()) return;
+			// The failure count is forgiven only once the session has stayed up for a while: a server that
+			// accepts and then drops the session at once would otherwise be retried every second forever.
+			this.clearLiveStableTimer();
+			this.liveStableTimer = setTimeout(() => {
+				this.liveStableTimer = null;
+				if (!isCurrent() || !session.ready) return;
+				this.liveFailures = 0;
+				this.lastFatalCode = null;
+			}, LIVE_STABLE_MS);
+			this.liveStableTimer.unref?.();
 			this.idle.touch();
-			this.quota.sessionStarted();
 			this.exitLocalBrain(t('runtime.reason_live_back'));
 			// Half-said lines belong to the timeline that is ending: finish them while the old track can
 			// still say who spoke them, then drop the buffers, so that no position from the old timeline is
@@ -1155,9 +1208,11 @@ export class GuildSession {
 			this.memoryHinted.clear();
 			this.announceRoster();
 		});
-		session.on('audio', (buffer) => this.onAssistantAudio(buffer));
+		session.on('audio', (buffer) => {
+			if (isCurrent()) this.onAssistantAudio(buffer);
+		});
 		session.on('transcript', (event) => {
-			if (this.live !== session) return; // a trailing delta from a socket that has already been replaced
+			if (!isCurrent()) return; // a trailing delta from a socket that has already been replaced
 			this.onTranscript(event);
 		});
 		session.on('tool', (event) => this.onToolEvent(event, 'backend'));
@@ -1171,14 +1226,22 @@ export class GuildSession {
 			this.log(t('runtime.log_latency_backend', { seconds: (ms / 1000).toFixed(1) }));
 		});
 		session.on('turn', ({ delegationId = null } = {}) => {
+			if (!isCurrent()) return;
 			// The model started replying: from here on, people cutting in do not affect this turn's owner gate.
 			this.rememberTurn(delegationId, this.attribution.markTurn());
 		});
 		session.on('delegation', (delegation) => {
-			void this.handleDelegation(delegation);
+			if (!isCurrent()) return;
+			// The answer goes back on the session that asked, never on whichever one is current by then.
+			void this.handleDelegation(delegation, session);
 		});
 		session.on('usage', ({ seconds }) => {
-			const status = this.quota.report(seconds);
+			// The seconds were really used, so they are charged whichever session reported them: against
+			// this session's own running total, which is what keeps a late report from counting twice.
+			const { status } = usage.report(seconds);
+			// Everything else -- the log line, the warning, closing on an exhausted quota -- is about the
+			// session the guild holds now, and a stale one would pause its successor.
+			if (!isCurrent()) return;
 			const minute = Math.floor(seconds / 60);
 			if (minute !== this.lastUsageMinute) {
 				this.lastUsageMinute = minute;
@@ -1202,6 +1265,9 @@ export class GuildSession {
 			}
 		});
 		session.on('error', (err) => {
+			// A session the guild has let go of is closing anyway; its errors say nothing about the new one
+			// and must not count towards the new one's limit.
+			if (!isCurrent()) return;
 			const info = describeLiveError(err);
 			this.lastLiveError = err; // if the connection closes next, the retry plan should know the reason
 			// Permanent errors are written as one line when the retry is planned; they are not printed again here.
@@ -1216,11 +1282,13 @@ export class GuildSession {
 			}
 			this.liveErrorCount++;
 			if (info.fatal || this.liveErrorCount >= LIVE_ERROR_LIMIT) {
-				if (this.live === session) {
-					this.liveErrorCount = 0;
-					this.log(t('runtime.live_unusable', { message: info.message }));
-					session.close(t('runtime.reason_live_unusable'));
-				}
+				this.liveErrorCount = 0;
+				this.log(t('runtime.live_unusable', { message: info.message }));
+				// Closing it ourselves makes its 'closed' an expected one, which used to be the end of it: no
+				// retry, no local brain, and not paused either, so speech did not bring it back. The end is
+				// therefore planned here, with the error that caused it, before the socket is let go of.
+				end(t('runtime.reason_live_unusable'), err);
+				void this.retireLive(session);
 			}
 		});
 		session.on('warning', (message) => this.log(t('runtime.live_warning', { message })));
@@ -1236,21 +1304,76 @@ export class GuildSession {
 			});
 		}
 
-		session.on('closed', ({ code, reason, expected }) => {
-			if (this.live !== session) return;
-			this.live = null;
-			this.reportHealth(t('runtime.health_why_closed'));
-			if (expected || this.shuttingDown || this.paused) return;
-			this.scheduleLiveRetry(t('runtime.retry_why_closed', { detail: `${code}${reason ? ` ${reason}` : ''}` }), this.lastLiveError);
-			this.lastLiveError = null;
+		session.on('closed', ({ code, reason }) => {
+			// Every close that reaches here while the session is still the guild's own is one nobody asked
+			// for: a pause, a rebuild or an unusable session has already let go of it (and planned what next).
+			end(t('runtime.retry_why_closed', { detail: `${code}${reason ? ` ${reason}` : ''}` }), this.lastLiveError);
+			this.releaseLiveSlot();
 		});
 
 		session.connect().catch((err) => {
-			if (this.live === session) this.live = null;
-			if (this.shuttingDown || this.paused) return;
-			this.scheduleLiveRetry(t('runtime.retry_why_connect_failed'), err);
-			session.close().catch(() => {});
+			end(t('runtime.retry_why_connect_failed'), err);
+			void this.retireLive(session);
 		});
+	}
+
+	/**
+	 * Lets go of a realtime session that is no longer this.live and closes it. Until its socket is gone it
+	 * still holds the guild's MAX_LIVE_SESSIONS slot: a close can take seconds, and a slot counted free from
+	 * the moment the session was told to close let another server open while this one was still connected.
+	 */
+	retireLive(session) {
+		if (!session || this.closingLive.has(session)) return Promise.resolve(false);
+		this.closingLive.add(session);
+		// Called synchronously (an async function runs up to its first await), so the session stops taking
+		// audio at once; a throw becomes a rejection like any other failure to close.
+		const closing = (async () => session.close())().catch(() => false);
+		return closing.finally(() => {
+			this.closingLive.delete(session);
+			this.releaseLiveSlot();
+		});
+	}
+
+	/** A socket of this guild is gone: when that leaves no slot held, the registry may hand it on. */
+	releaseLiveSlot() {
+		if (this.holdsLiveSlot()) return;
+		this.onLiveSlotFreed?.(this);
+	}
+
+	/** Whether this guild counts against MAX_LIVE_SESSIONS: a session open, connecting, or still closing. */
+	holdsLiveSlot() {
+		return Boolean(this.live) || this.closingLive.size > 0;
+	}
+
+	/**
+	 * The registry offers a slot that came free. It is taken only by a guild that is waiting for one and has
+	 * somebody in its channel to talk to; an empty channel leaves it for a busier one and asks again when
+	 * somebody speaks.
+	 * @returns {boolean} whether a session is now being opened here
+	 */
+	takeLiveSlot() {
+		if (!this.liveBlockedReason || this.live || this.paused || this.shuttingDown || this.brain === 'local') return false;
+		if (!this.voice.connected || !this.peopleInVoice()) return false;
+		this.startLive();
+		return Boolean(this.live);
+	}
+
+	/** How many people (not bots) are in the bot's voice channel right now; 0 when it is in none. */
+	peopleInVoice() {
+		const channelId = this.voice.channelId;
+		if (!channelId || !this.guild) return 0;
+		let count = 0;
+		for (const state of this.guild.voiceStates.cache.values()) {
+			if (state.channelId !== channelId) continue;
+			const member = state.member ?? this.guild.members.cache.get(state.id);
+			if (!member?.user?.bot) count++;
+		}
+		return count;
+	}
+
+	clearLiveStableTimer() {
+		if (this.liveStableTimer) clearTimeout(this.liveStableTimer);
+		this.liveStableTimer = null;
 	}
 
 	/**
@@ -1296,6 +1419,10 @@ export class GuildSession {
 
 	pauseLive(reason) {
 		this.paused = true;
+		// Paused is a state of its own: a guild that was waiting for a slot is not waiting any more, and the
+		// registry must not hand it one.
+		this.liveBlockedReason = null;
+		this.liveBlockedSince = 0;
 		if (this.liveReconnectTimer) {
 			clearTimeout(this.liveReconnectTimer);
 			this.liveReconnectTimer = null;
@@ -1303,9 +1430,23 @@ export class GuildSession {
 		if (!this.live) return;
 		const session = this.live;
 		this.live = null;
-		session.close().catch(() => {});
+		this.clearLiveStableTimer();
+		void this.retireLive(session);
 		this.activity.push({ kind: 'session', text: t('runtime.live_paused', { reason }) });
 		this.log(t('runtime.live_paused_log', { reason }));
+	}
+
+	/**
+	 * Somebody started speaking while no realtime session is open on purpose: paused (idle, quota) or held
+	 * back by MAX_LIVE_SESSIONS. A paused guild reopens; a guild over the cap was not paused, so speech used
+	 * to change nothing for it -- it asks the registry again, quietly, and opens only when a slot is free.
+	 */
+	resumeOnSpeech() {
+		if (this.live || this.shuttingDown) return;
+		if (this.quotaBlocked && this.quota.status().exceeded) return;
+		if (!this.paused && !this.canOpenLive(this)) return;
+		this.log(t('runtime.speech_detected'));
+		this.resumeLive();
 	}
 
 	resumeLive() {
@@ -1329,23 +1470,24 @@ export class GuildSession {
 		this.pendingIntro = true;
 		const session = this.live;
 		this.live = null;
-		try {
-			await session.close();
-		} catch {
-			/* ignore */
-		}
+		this.clearLiveStableTimer();
+		await this.retireLive(session);
 		if (!this.paused && !this.shuttingDown) this.startLive();
 	}
 
-	/** Runs when the model asks for help: local Discord work or web research, with the result going back. */
-	async handleDelegation(delegation) {
+	/**
+	 * Runs when the model asks for help: local Discord work or web research, with the result going back.
+	 * `session` is the one that asked: a delegation id means nothing to any other session, and sending it to
+	 * a successor that opened while the task ran came back as an error counted against that successor.
+	 */
+	async handleDelegation(delegation, session = this.live) {
 		const question = this.taskDeps.getUserText();
 		this.log(t('runtime.delegation_requested', { id: delegation.id, question: question.slice(0, 140) }));
 		this.latency.delegationStart();
 		try {
 			const answer = await this.runTask();
 			const ms = this.latency.delegationDone();
-			if (answer.mode !== 'none' && answer.text) this.live?.replyDelegation(delegation.id, answer.text, { mode: answer.mode });
+			if (answer.mode !== 'none' && answer.text) session?.replyDelegation(delegation.id, answer.text, { mode: answer.mode });
 			this.log(
 				t('runtime.delegation_answered', {
 					id: delegation.id,
@@ -1355,7 +1497,7 @@ export class GuildSession {
 		} catch (err) {
 			this.latency.delegationDone();
 			this.log(t('runtime.delegation_error', { error: err.message }));
-			this.live?.replyDelegation(delegation.id, t('runtime.delegation_failed_spoken'), { mode: 'commentary' });
+			session?.replyDelegation(delegation.id, t('runtime.delegation_failed_spoken'), { mode: 'commentary' });
 		}
 	}
 
@@ -2329,7 +2471,8 @@ export class GuildSession {
 		if (!summary) return;
 		this.memoryHinted.add(userId);
 		const name = await this.memberName(userId);
-		this.live.appendContext('thinking', t('runtime.memory_notes', { name, summary }));
+		// The name may have come from Discord; the session can have closed while it did.
+		this.live?.appendContext('thinking', t('runtime.memory_notes', { name, summary }));
 	}
 
 	// ---------------------------------------------------------------- voice channel
@@ -2359,7 +2502,7 @@ export class GuildSession {
 					if (!channel) return;
 					this.log(`${label} (${channel.name}).`);
 					try {
-						await this.joinVoice(channel);
+						await this.joinVoice(channel, { rejoin: true });
 					} catch (err) {
 						this.log(t('runtime.rejoin_failed', { error: err.message }));
 					}
@@ -2368,9 +2511,15 @@ export class GuildSession {
 		}
 	}
 
-	async joinVoice(channel) {
-		this.clearRejoinTimers();
+	/**
+	 * `rejoin` marks one of the planned attempts to come back. A join somebody asked for replaces that plan
+	 * at once; a planned attempt leaves the later ones standing until a join has worked, because clearing
+	 * them first made the first attempt the only one -- and when it failed the bot never came back.
+	 */
+	async joinVoice(channel, { rejoin = false } = {}) {
+		if (!rejoin) this.clearRejoinTimers();
 		await this.voice.join(this.guild, channel);
+		this.clearRejoinTimers();
 		this.lastVoiceChannelId = channel.id;
 		this.memoryHinted.clear();
 		if (this.cfg.brainMode === 'local') void this.enterLocalBrain('BRAIN_MODE=local');
@@ -2433,6 +2582,11 @@ export class GuildSession {
 	/**
 	 * The settings the owner is allowed to change (in memory; a restart brings the .env values back).
 	 * Returns: the new value, null (unknown setting) or { ok:false, spoken } (could not be applied).
+	 *
+	 * They apply to this server only: `cfg` is this guild's own view of the configuration (see the
+	 * constructor), so writing to it leaves the other servers as they were. `record` is the exception, on
+	 * purpose: RECORD_TRANSCRIPTS decides what the one activity log shared by every server writes to disk,
+	 * and a log cannot keep one server's transcripts private while writing another's.
 	 */
 	async applySetting(name, value) {
 		const cfg = this.cfg;
@@ -2459,11 +2613,18 @@ export class GuildSession {
 			case 'idle_close_minutes':
 				cfg.idleCloseMs = Math.max(0, Number(value) || 0) * 60_000;
 				this.idle.idleMs = cfg.idleCloseMs;
+				// The wait is counted from the change, not from whenever somebody last spoke.
+				this.idle.touch();
+				// Turned on from 0 at runtime there was no timer to act on it: start() only made one when the
+				// value was set at boot.
+				this.armIdleTimer();
 				return Math.round(cfg.idleCloseMs / 60_000);
-			case 'record':
-				cfg.recordTranscripts = asBool(value, cfg.recordTranscripts);
-				this.activity.push({ kind: 'session', text: cfg.recordTranscripts ? t('runtime.record_on') : t('runtime.record_off') });
-				return cfg.recordTranscripts;
+			case 'record': {
+				const shared = this.sharedCfg;
+				shared.recordTranscripts = asBool(value, shared.recordTranscripts);
+				this.activity.push({ kind: 'session', text: shared.recordTranscripts ? t('runtime.record_on') : t('runtime.record_off') });
+				return shared.recordTranscripts;
+			}
 			case 'local_tts': {
 				if (this.brain === 'local') return { ok: false, spoken: t('runtime.local_brain_busy') };
 				const enabled = asBool(value, !this.localMode);
@@ -2537,13 +2698,27 @@ export class GuildSession {
 		);
 		if (typeof this.memberRefreshTimer.unref === 'function') this.memberRefreshTimer.unref();
 
-		if (cfg.idleCloseMs > 0) {
-			this.idleTimer = setInterval(() => {
-				if (this.paused || !this.idle.shouldPause(Boolean(this.live))) return;
-				this.log(t('runtime.idle_close'));
-				this.pauseLive(t('runtime.reason_idle'));
-			}, 30_000);
+		this.armIdleTimer();
+	}
+
+	/**
+	 * The idle watch: while idle_close_minutes is above zero, a session nobody has spoken to for that long is
+	 * closed. Called at start and whenever the setting changes, so turning it on at runtime takes effect and
+	 * turning it off stops the watch.
+	 */
+	armIdleTimer() {
+		if (!(this.cfg.idleCloseMs > 0) || this.shuttingDown) {
+			if (this.idleTimer) clearInterval(this.idleTimer);
+			this.idleTimer = null;
+			return;
 		}
+		if (this.idleTimer) return;
+		this.idleTimer = setInterval(() => {
+			if (this.paused || !this.idle.shouldPause(Boolean(this.live))) return;
+			this.log(t('runtime.idle_close'));
+			this.pauseLive(t('runtime.reason_idle'));
+		}, 30_000);
+		this.idleTimer.unref?.();
 	}
 
 	/** The per-guild dependencies handed to callTool / executeAction / the task runner. */
@@ -2561,8 +2736,8 @@ export class GuildSession {
 			voiceChannelName: this.voice.channelId ? (this.guild?.channels.cache.get(this.voice.channelId)?.name ?? null) : null,
 			brain: this.brain,
 			liveReady: Boolean(this.live?.ready),
-			// Holding a connection (open OR still connecting) is what counts against MAX_LIVE_SESSIONS.
-			liveOpen: Boolean(this.live),
+			// Holding a connection (open, still connecting or still closing) is what counts against MAX_LIVE_SESSIONS.
+			liveOpen: this.holdsLiveSlot(),
 			// Filled in when the session is deliberately silent (over the cap) rather than failing.
 			liveBlocked: this.liveBlockedReason,
 			localMode: this.localMode,
@@ -2589,12 +2764,17 @@ export class GuildSession {
 		this.transcriptBuffers.clear();
 		if (this.liveReconnectTimer) clearTimeout(this.liveReconnectTimer);
 		this.liveReconnectTimer = null;
+		this.clearLiveStableTimer();
 		if (this.idleTimer) clearInterval(this.idleTimer);
 		this.idleTimer = null;
 		if (this.memberRefreshTimer) clearInterval(this.memberRefreshTimer);
 		this.memberRefreshTimer = null;
 		if (this.sttPollTimer) clearInterval(this.sttPollTimer);
 		this.sttPollTimer = null;
+		// The reply gate's timers: a judgment still to be asked for and the bot's audio still being held.
+		if (this.earlyJudgeTimer) clearTimeout(this.earlyJudgeTimer);
+		this.earlyJudgeTimer = null;
+		this.dropReplyHold();
 		this.stopLocalBrainRetry();
 		this.clearRejoinTimers();
 		this.interruptLocalSpeech();
@@ -2613,10 +2793,9 @@ export class GuildSession {
 		} catch {
 			/* ignore */
 		}
-		try {
-			if (this.live) await this.live.close();
-		} catch {
-			/* ignore */
-		}
+		// Through retireLive, like every other close, so the slot stays counted until the socket is gone.
+		const session = this.live;
+		this.live = null;
+		if (session) await this.retireLive(session);
 	}
 }

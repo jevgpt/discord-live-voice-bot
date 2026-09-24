@@ -187,6 +187,7 @@ export default {
 	// MAX_LIVE_SESSIONS: this server may not open a realtime session yet, so it stays silent.
 	live_cap_reached: 'GPT-Live is not opened for "{guild}": {max} servers already hold a session (MAX_LIVE_SESSIONS).',
 	live_cap_reason: 'waiting for a slot ({max} servers at most)',
+	live_slot_taken: 'A GPT-Live slot came free; opening the session for "{guild}".',
 	session_dropped: 'The session of "{guild}" was closed and dropped (left for good).',
 	// A join asked for a session in a server outside GUILD_ID/VOICE_TARGETS without the owner's word.
 	session_start_refused: 'No session was built for "{guild}": it is not a configured server, and the owner did not ask for it.',

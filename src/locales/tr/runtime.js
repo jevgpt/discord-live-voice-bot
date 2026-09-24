@@ -187,6 +187,7 @@ export default {
 	// MAX_LIVE_SESSIONS: this server may not open a realtime session yet, so it stays silent.
 	live_cap_reached: '"{guild}" için GPT-Live açılmadı: {max} sunucu zaten oturum tutuyor (MAX_LIVE_SESSIONS).',
 	live_cap_reason: 'sıra bekliyor (en fazla {max} sunucu)',
+	live_slot_taken: 'Bir GPT-Live yeri boşaldı; "{guild}" için oturum açılıyor.',
 	session_dropped: '"{guild}" oturumu kapatıldı ve bırakıldı (kalıcı ayrılma).',
 	// A join asked for a session in a server outside GUILD_ID/VOICE_TARGETS without the owner's word.
 	session_start_refused: '"{guild}" için oturum kurulmadı: ayarlı bir sunucu değil ve bunu sahip istemedi.',

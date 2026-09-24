@@ -14,6 +14,8 @@ import { t } from './i18n/index.js';
 
 const START_TIMEOUT_MS = 20_000;
 const CLOSE_TIMEOUT_MS = 15_000;
+// WebSocket readyState of an open socket (the same number in ws and in the browser API).
+const SOCKET_OPEN = 1;
 
 // Append events (instructions/thinking/commentary) are plain text and limited to ~500 tokens per event.
 // Turkish runs at ~3.5 characters per token, so 1500 characters is a safe ceiling; longer text is rejected by the server.
@@ -133,6 +135,10 @@ export class LiveSession extends EventEmitter {
 		this.ready = false;
 		this.sessionId = null;
 		this._closing = false;
+		// The server's session.closed: the conversation is over even while the socket is still open.
+		this._sessionClosed = false;
+		// The socket itself is gone: nothing is left to wait for.
+		this.ended = false;
 		this._ctxSeq = 0;
 	}
 
@@ -220,6 +226,9 @@ export class LiveSession extends EventEmitter {
 
 		const event = await started;
 		this.sessionId = event?.session?.id ?? null;
+		// close() was called while the handshake was finishing: the session is on its way out and must
+		// not be announced as ready, or the caller would start using a socket it has just let go of.
+		if (this._closing || this.ended) return this.sessionId;
 		this.ready = true;
 		this.emit('ready', { sessionId: this.sessionId });
 		// Tool calls may have arrived while the connection was being set up; handle them now.
@@ -241,7 +250,19 @@ export class LiveSession extends EventEmitter {
 			this.emit('usage', { seconds: event?.usage?.seconds ?? 0 });
 		});
 		ws.on('session.closed', (event) => {
+			this.ready = false;
+			this._sessionClosed = true;
 			this.emit('sessionClosed', event);
+			// The server ended the session on its own. Nothing more can be said on this socket, and a socket
+			// left open here would keep the caller believing it still had a session; closing it from this side
+			// turns the end into the one 'closed' event the caller already plans its reconnect around.
+			if (!this._closing) {
+				try {
+					ws.close({ code: 1000, reason: 'session closed by server' });
+				} catch {
+					/* already gone */
+				}
+			}
 		});
 		ws.on('session.delegation.created', (event) => {
 			const delegation = event?.delegation;
@@ -256,6 +277,7 @@ export class LiveSession extends EventEmitter {
 		});
 		ws.on('close', (code, reason) => {
 			this.ready = false;
+			this.ended = true;
 			this.emit('closed', { code, reason, expected: this._closing });
 		});
 		if (this.debug) {
@@ -317,7 +339,12 @@ export class LiveSession extends EventEmitter {
 	}
 
 	_canSend() {
-		return Boolean(this.ws && this.ready && !this._closing);
+		if (!this.ws || !this.ready || this._closing) return false;
+		// A socket the server has started to close takes a moment to report 'close', and every 20 ms audio
+		// frame written into it meanwhile came back as an error of its own -- three of those were enough
+		// to condemn the session. Only an open socket is written to.
+		const socket = this.ws.socket;
+		return !socket || socket.readyState === SOCKET_OPEN;
 	}
 
 	_send(payload) {
@@ -418,26 +445,31 @@ export class LiveSession extends EventEmitter {
 		this._closing = true;
 		this.ready = false;
 
-		// Socket already gone (open === 1): nothing to finalize, don't wait for session.closed.
-		if (ws.socket?.readyState !== 1) {
+		// Socket not open, or the server has already ended the session: there is nothing to finalize and no
+		// session.closed still to come, so the socket is closed at once.
+		if (ws.socket?.readyState !== SOCKET_OPEN || this.ended || this._sessionClosed) {
 			try {
 				ws.close({ code: 1000, reason: 'client shutdown' });
 			} catch {
 				/* ignore */
 			}
-			return false;
+			return this._sessionClosed;
 		}
 
+		// Done at the acknowledgement, or when the socket dies without one: a dead socket never sends
+		// session.closed, and waiting out the full timeout for it kept the session counted as open.
 		const closed = new Promise((resolve) => {
-			const timer = setTimeout(() => {
-				ws.off('session.closed', onClosed);
-				resolve(false);
-			}, CLOSE_TIMEOUT_MS);
-			const onClosed = () => {
+			const finish = (acknowledged) => {
 				clearTimeout(timer);
-				resolve(true);
+				ws.off('session.closed', onClosed);
+				ws.off('close', onSocketClosed);
+				resolve(acknowledged);
 			};
+			const onClosed = () => finish(true);
+			const onSocketClosed = () => finish(false);
+			const timer = setTimeout(() => finish(false), CLOSE_TIMEOUT_MS);
 			ws.once('session.closed', onClosed);
+			ws.once('close', onSocketClosed);
 		});
 
 		try {
