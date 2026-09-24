@@ -202,9 +202,43 @@ function str(value, fallback = null) {
 }
 
 /**
+ * The panel's switch, port, bind address and token, read exactly as loadConfig reads them. The
+ * container's health check (src/healthcheck.js) reads them through here as well: with a rule of its own
+ * for "off" it did not know PANEL=disabled, kapalı or a quoted "0", asked a panel that had never
+ * started, and called a working bot unhealthy.
+ */
+export function panelSettings(env = process.env) {
+	return {
+		// Local admin panel (127.0.0.1 by default): PANEL=0 turns it off, PANEL_PORT picks the port (0 = random).
+		panelEnabled: bool(env.PANEL, true),
+		panelPort: num(env.PANEL_PORT, 8787, { min: 0, max: 65_535 }),
+		// Where the panel listens; anything beyond loopback (a container, a reverse proxy) needs PANEL_TOKEN,
+		// and PANEL_ALLOWED_HOSTS adds the names it is reached by to the Host-header check.
+		panelHost: str(env.PANEL_HOST, '127.0.0.1'),
+		panelToken: str(env.PANEL_TOKEN),
+	};
+}
+
+/**
+ * LOCAL_TTS_LANG and LOCAL_STT_LANG used to mean Turkish when unset. Now the local voice speaks the bot's
+ * language and whisper detects the language of each line, so a Turkish setup that never wrote them down
+ * would start speaking English without a word. It is told once, at start, how to keep what it had: when
+ * one of them is unset, BOT_LANGUAGE is unset too (a language chosen there is a decision already made),
+ * and the local voice or ears can be used at all.
+ */
+function languageDefaultsNote(env, config) {
+	if (cleanEnvValue(env.BOT_LANGUAGE)) return null;
+	const localSpeech = config.localTtsEnabled || config.localTtsOn || config.brainMode !== 'live';
+	const unset = ['LOCAL_TTS_LANG', 'LOCAL_STT_LANG'].filter((key) => !cleanEnvValue(env[key]));
+	if (!localSpeech || !unset.length) return null;
+	return t('config.note_language_defaults', { fix: unset.map((key) => `${key}=tr`).join(' ') });
+}
+
+/**
  * Reads the configuration from `source` (process.env by default). Throws only when a required variable
  * is missing; every other problem is collected into `config.warnings`, a non-enumerable array of
  * sentences in the active language, so the returned object keeps exactly the fields it always had.
+ * `config.notes`, non-enumerable as well, holds what an existing .env should know about a changed default.
  */
 export function loadConfig(source = process.env) {
 	const reads = [];
@@ -219,6 +253,10 @@ export function loadConfig(source = process.env) {
 	try {
 		const config = readConfig(env);
 		Object.defineProperty(config, 'warnings', { value: parsing.warnings, enumerable: false });
+		// Not a value misread but a default that changed under an existing .env; printed at start beside the
+		// warnings, and kept apart from them, so that a clean .env still has no warnings to show.
+		const note = languageDefaultsNote(env, config);
+		Object.defineProperty(config, 'notes', { value: note ? [note] : [], enumerable: false });
 		return config;
 	} finally {
 		parsing = null;
@@ -265,13 +303,8 @@ function readConfig(env) {
 		useResponsesDelegation: toolsBackend === 'responses' || (toolsBackend === 'auto' && Boolean(researchModel)),
 		backendEffort: effortValue(env.LIVE_BACKEND_EFFORT, 'low'),
 		backendTier: effortValue(env.LIVE_BACKEND_TIER, null),
-		// Local admin panel (127.0.0.1 by default): PANEL=0 turns it off, PANEL_PORT picks the port (0 = random).
-		panelEnabled: bool(env.PANEL, true),
-		panelPort: num(env.PANEL_PORT, 8787, { min: 0, max: 65_535 }),
-		// Where the panel listens; anything beyond loopback (a container, a reverse proxy) needs PANEL_TOKEN,
-		// and PANEL_ALLOWED_HOSTS adds the names it is reached by to the Host-header check.
-		panelHost: str(env.PANEL_HOST, '127.0.0.1'),
-		panelToken: str(env.PANEL_TOKEN),
+		// The local admin panel (see panelSettings above).
+		...panelSettings(env),
 		panelAllowedHosts: list(env.PANEL_ALLOWED_HOSTS),
 		// Local TTS (Chatterbox)
 		localTtsEnabled: bool(env.LOCAL_TTS, false),

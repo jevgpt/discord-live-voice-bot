@@ -21,6 +21,10 @@ export default {
 	warn_target_pair: '{key}: "{entry}" bir sunucuId:kanalId çifti değil, atlanıyor.',
 	warn_target_repeat: '{key}: {guild} sunucusu zaten {channel} kanalıyla listede; "{entry}" atlanıyor.',
 	warn_language: 'BOT_LANGUAGE={value} desteklenen dillerden biri değil ({supported}); {fallback} kullanılıyor.',
+	// Printed once at start while BOT_LANGUAGE and at least one of the two keys are unset. {fix} is the
+	// line to add, e.g. "LOCAL_TTS_LANG=tr LOCAL_STT_LANG=tr".
+	note_language_defaults:
+		"LOCAL_TTS_LANG ve LOCAL_STT_LANG boş bırakıldığında artık Türkçe demek değil: yerel ses botun dilinde konuşuyor (BOT_LANGUAGE ayarlı olmadığı için İngilizce), whisper da her cümlenin dilini kendisi algılıyor. Türkçe kalsın istiyorsan .env dosyasına {fix} ekle; BOT_LANGUAGE'ı ayarlarsan bu not bir daha çıkmaz.",
 	// Fallback persona, joined with spaces. Sets the language the assistant speaks.
 	default_instructions: [
 		'Sen bir Discord ses kanalında yaşayan, Türkçe konuşan bir sesli asistansın.',

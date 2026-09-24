@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import { PassThrough } from 'node:stream';
+import { fileURLToPath } from 'node:url';
 import { LocalServerManager, SPEECH_TOKEN_HEADER, detectVenvPython, setSpeechToken, speechHeaders } from '../../src/localserver.js';
 import { LocalStt } from '../../src/localstt.js';
 import { LocalTts } from '../../src/localtts.js';
@@ -136,6 +138,68 @@ describe('speech server token', () => {
 		}
 	});
 
+	it('keeps the launch token for the next start, readable by the owner only, and drops it with its server', async () => {
+		const fake = fakeSpawn();
+		const tokenFile = path.join(mkdtempSync(path.join(os.tmpdir(), 'srv-')), 'chatterbox.token');
+		const manager = new LocalServerManager({ ...venv(), tokenFile, log: () => {}, spawnImpl: fake.spawn });
+		try {
+			assert.equal(speechHeaders()[SPEECH_TOKEN_HEADER], undefined, 'no file, nothing to carry yet');
+			manager.ensureRunning();
+			const token = fake.calls[0].opts.env.CHATTERBOX_TOKEN;
+			assert.equal(readFileSync(tokenFile, 'utf8'), token);
+			if (process.platform !== 'win32') assert.equal(statSync(tokenFile).mode & 0o777, 0o600);
+			fake.calls[0].child.stdout.write('[chatterbox] listening on: http://127.0.0.1:8020 (model loading)\n');
+			await new Promise((resolve) => setImmediate(resolve));
+			manager.stop();
+			assert.equal(existsSync(tokenFile), false, 'a server of ours held the port and is gone: so is its token');
+		} finally {
+			setSpeechToken(null);
+		}
+	});
+
+	it('a start that finds a token left by a killed bot talks to the server it left, and launches with the same token', async () => {
+		const fake = fakeSpawn();
+		const tokenFile = path.join(mkdtempSync(path.join(os.tmpdir(), 'srv-')), 'chatterbox.token');
+		const left = 'ab'.repeat(32);
+		writeFileSync(tokenFile, `${left}\n`);
+		try {
+			const manager = new LocalServerManager({ ...venv(), tokenFile, log: () => {}, spawnImpl: fake.spawn, maxRestarts: 10 });
+			assert.equal(speechHeaders()[SPEECH_TOKEN_HEADER], left, 'the requests reach the server left running');
+			// Its launches cannot bind the port while that server holds it; they must not take the token away.
+			manager.ensureRunning();
+			fake.calls[0].child.emit('exit', 1, null);
+			manager.ensureRunning();
+			assert.deepEqual(
+				fake.calls.map((call) => call.opts.env.CHATTERBOX_TOKEN),
+				[left, left],
+			);
+			assert.equal(speechHeaders()[SPEECH_TOKEN_HEADER], left);
+			manager.stop();
+			assert.equal(readFileSync(tokenFile, 'utf8'), left, 'no server of ours held the port: the one left behind may still answer with it');
+
+			// Once a launch of ours has the port, the old token has done its job and the next launch draws its own.
+			manager.ensureRunning();
+			const current = fake.calls[2];
+			current.child.stdout.write('[chatterbox] listening on: http://127.0.0.1:8020 (model loading)\n');
+			await new Promise((resolve) => setImmediate(resolve));
+			current.child.emit('exit', 1, null);
+			manager.ensureRunning();
+			assert.notEqual(fake.calls[3].opts.env.CHATTERBOX_TOKEN, left);
+			assert.equal(readFileSync(tokenFile, 'utf8'), fake.calls[3].opts.env.CHATTERBOX_TOKEN);
+
+			// Something that is not a launch token is not read as one, and LOCAL_TTS_TOKEN needs no file at all.
+			writeFileSync(tokenFile, 'not a token');
+			setSpeechToken(null);
+			new LocalServerManager({ ...venv(), tokenFile, spawnImpl: fake.spawn });
+			assert.equal(speechHeaders()[SPEECH_TOKEN_HEADER], undefined);
+			const configured = new LocalServerManager({ ...venv(), token: 'configured-token', tokenFile, log: () => {}, spawnImpl: fake.spawn });
+			configured.ensureRunning();
+			assert.equal(readFileSync(tokenFile, 'utf8'), 'not a token', 'the configured token is never written out');
+		} finally {
+			setSpeechToken(null);
+		}
+	});
+
 	it('adds nothing while there is no token, and a client token overrides the shared one', () => {
 		setSpeechToken(null);
 		assert.deepEqual(speechHeaders({ 'content-type': 'application/json' }), { 'content-type': 'application/json' });
@@ -175,6 +239,69 @@ describe('speech server token', () => {
 			assert.equal(await stt.health(), null);
 			assert.equal(logs.length, 2);
 			assert.ok(logs.every((line) => line.includes('refused the request (403)') && line.includes('LOCAL_TTS_TOKEN')), logs.join(' | '));
+		});
+	});
+});
+
+// The server's request checks, run by the Python that is on the machine. The file imports numpy and the
+// model libraries at the top, so only the pure functions are lifted out of it and run on their own.
+const HOST_CHECK = `
+import ast, json, sys
+tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
+wanted = {"is_loopback", "allowed_host_names", "split_host_header", "request_refusal"}
+body = [n for n in tree.body if isinstance(n, ast.Assign) and any(getattr(t, "id", None) in ("TOKEN_HEADER", "LOOPBACK_NAMES") for t in n.targets)]
+body += [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
+scope = {}
+exec("import hmac, ipaddress, re", scope)
+exec(compile(ast.Module(body=body, type_ignores=[]), "chatterbox_server", "exec"), scope)
+class Headers(dict):
+    def get(self, key, default=None):
+        return dict.get(self, key.lower(), default)
+allowed = scope["allowed_host_names"](sys.argv[2])
+verdicts = {}
+for host in sys.argv[3:]:
+    headers = Headers({"x-chatterbox-token": "secret"})
+    if host != "-":
+        headers["host"] = host
+    verdicts[host] = scope["request_refusal"](headers, allowed, b"secret")
+print(json.dumps(verdicts))
+`;
+
+/** A Python 3 to run the check with, or null (a machine without one skips the test). */
+function python() {
+	for (const candidate of ['python3', 'python']) {
+		const probe = spawnSync(candidate, ['-c', 'import sys; print(sys.version_info[0])'], { encoding: 'utf8' });
+		if (!probe.error && probe.status === 0 && probe.stdout.trim() === '3') return candidate;
+	}
+	return null;
+}
+
+describe('tools/chatterbox_server.py: the Host check', () => {
+	it('compares the name, not the port: a forwarded port is served, a rebinding name is not', (t) => {
+		const interpreter = python();
+		if (!interpreter) return t.skip('no Python 3 on this machine');
+		const script = fileURLToPath(new URL('../../tools/chatterbox_server.py', import.meta.url));
+		const check = (bound, hosts) => {
+			const run = spawnSync(interpreter, ['-c', HOST_CHECK, script, bound, ...hosts], { encoding: 'utf8' });
+			assert.equal(run.status, 0, run.stderr);
+			return JSON.parse(run.stdout);
+		};
+		const hosts = ['127.0.0.1:8020', '127.0.0.1:9000', 'localhost:9000', 'localhost', '[::1]:9000', 'evil.example:8020', 'evil.example', '-'];
+		assert.deepEqual(check('127.0.0.1', hosts), {
+			'127.0.0.1:8020': null,
+			'127.0.0.1:9000': null, // ssh -L 9000:127.0.0.1:8020
+			'localhost:9000': null,
+			localhost: null,
+			'[::1]:9000': null,
+			'evil.example:8020': 'host not allowed',
+			'evil.example': 'host not allowed',
+			'-': 'host not allowed',
+		});
+		assert.deepEqual(check('::1', ['[::1]:8020', '[::1]', '127.0.0.1:1234', '[::2]:8020']), {
+			'[::1]:8020': null,
+			'[::1]': null,
+			'127.0.0.1:1234': null,
+			'[::2]:8020': 'host not allowed',
 		});
 	});
 });

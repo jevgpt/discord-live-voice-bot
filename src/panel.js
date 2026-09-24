@@ -432,6 +432,24 @@ function sameSecret(given, expected) {
 	return timingSafeEqual(a, b);
 }
 
+/**
+ * One value of a query string, percent-decoded and nothing else. searchParams decodes a form, where '+'
+ * is a space, and a base64 token pasted into /login?token=... lost every '+' it had; percent escapes
+ * still work, so an encoded token logs in as well. Null when the name is missing or the escape is broken.
+ */
+function rawQueryValue(search, name) {
+	for (const part of String(search ?? '').replace(/^\?/u, '').split('&')) {
+		const index = part.indexOf('=');
+		if ((index < 0 ? part : part.slice(0, index)) !== name) continue;
+		try {
+			return decodeURIComponent(index < 0 ? '' : part.slice(index + 1));
+		} catch {
+			return null;
+		}
+	}
+	return null;
+}
+
 function bearerOf(request) {
 	return /^Bearer\s+(\S+)\s*$/iu.exec(String(request.headers.authorization ?? ''))?.[1] ?? null;
 }
@@ -525,7 +543,7 @@ export function startPanel({
 			// Only the path and the query are read, so the base is a placeholder.
 			const url = new URL(request.url ?? '/', 'http://panel.invalid');
 			if (secret && url.pathname === '/login') {
-				if (request.method !== 'GET' || !sameSecret(url.searchParams.get('token'), secret)) {
+				if (request.method !== 'GET' || !sameSecret(rawQueryValue(url.search, 'token'), secret)) {
 					response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
 					response.end(t('panel.login_failed'));
 					return;

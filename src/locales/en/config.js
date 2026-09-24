@@ -21,6 +21,10 @@ export default {
 	warn_target_pair: '{key}: "{entry}" is not a guildId:channelId pair and is skipped.',
 	warn_target_repeat: '{key}: server {guild} is already listed with channel {channel}; "{entry}" is skipped.',
 	warn_language: 'BOT_LANGUAGE={value} is not a supported language ({supported}); {fallback} is used.',
+	// Printed once at start while BOT_LANGUAGE and at least one of the two keys are unset. {fix} is the
+	// line to add, e.g. "LOCAL_TTS_LANG=tr LOCAL_STT_LANG=tr".
+	note_language_defaults:
+		"LOCAL_TTS_LANG and LOCAL_STT_LANG no longer mean Turkish when unset: the local voice speaks the bot's language (English, as BOT_LANGUAGE is not set) and whisper detects the language of each line. To keep Turkish, add {fix} to .env; setting BOT_LANGUAGE silences this note.",
 	// Fallback persona, joined with spaces. Sets the language the assistant speaks.
 	default_instructions: [
 		'You are a voice assistant that lives in a Discord voice channel and speaks English.',

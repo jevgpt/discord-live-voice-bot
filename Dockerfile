@@ -43,10 +43,12 @@ VOLUME ["/app/data"]
 # (-p 127.0.0.1:8787:8787) and visit http://127.0.0.1:8787/login?token=<PANEL_TOKEN> once. Behind a
 # reverse proxy, add the name it forwards to PANEL_ALLOWED_HOSTS.
 #
-# The health check asks the panel's /healthz (with the token when one is set). PANEL=0 disables it:
-# with no panel there is nothing to ask, so the check passes instead of marking a working bot unhealthy.
+# The health check asks the panel's /healthz (with the token when one is set), reading PANEL,
+# PANEL_PORT, PANEL_HOST and PANEL_TOKEN the way the bot does (src/healthcheck.js). With the panel off
+# (PANEL=0, or any other off word the bot accepts) there is nothing to ask, so the check passes instead
+# of marking a working bot unhealthy; the same goes for PANEL_PORT=0, a port nobody can know.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-	CMD ["node", "-e", "const e = process.env; if (/^(0|false|no|off)$/i.test(e.PANEL ?? '')) process.exit(0); fetch('http://127.0.0.1:' + (e.PANEL_PORT || 8787) + '/healthz', { headers: e.PANEL_TOKEN ? { authorization: 'Bearer ' + e.PANEL_TOKEN } : {}, signal: AbortSignal.timeout(8000) }).then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1));"]
+	CMD ["node", "src/healthcheck.js"]
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["node", "src/index.js"]

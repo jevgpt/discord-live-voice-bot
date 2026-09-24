@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import http from 'node:http';
 import { describe, it } from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { loadConfig } from '../../src/config.js';
+import { checkHealth, healthTarget } from '../../src/healthcheck.js';
 import { ActivityLog, isLoopbackHost, parseAllowedHosts, startPanel } from '../../src/panel.js';
 import { transcriptFromEvents } from '../../src/summary.js';
 
@@ -83,6 +88,8 @@ function send(url, { method = 'GET', headers = {}, body = null } = {}) {
 }
 
 const TOKEN = 'a-panel-token-of-some-length';
+// The four variables loadConfig insists on, for comparing its reading of PANEL with the health check's.
+const CONFIG_ENV = { DISCORD_TOKEN: 't', GUILD_ID: '111111111111111111', CHANNEL_ID: '222222222222222222', OPENAI_API_KEY: 'k' };
 
 describe('panel access', () => {
 	it('knows which bind addresses stay on the machine and reads PANEL_ALLOWED_HOSTS', () => {
@@ -207,6 +214,73 @@ describe('panel access', () => {
 		} finally {
 			await panel.close();
 		}
+	});
+
+	it('/login takes a token with + and / in it as pasted, and percent-encoded as well', async () => {
+		// base64 has both; read as a form, every '+' became a space and the login failed.
+		const token = 'k2V+9mQ/xZ3a+Lp0Rw8sTq==';
+		const panel = await startPanel({ activity: new ActivityLog(), port: 0, token, log: () => {} });
+		try {
+			assert.equal((await send(`${panel.url}/login?token=${token}`)).status, 303, 'pasted as it is');
+			assert.equal((await send(`${panel.url}/login?token=${encodeURIComponent(token)}`)).status, 303, 'percent-encoded');
+			assert.equal((await send(`${panel.url}/login?next=%2F&token=${encodeURIComponent(token)}`)).status, 303, 'wherever it stands in the query');
+			assert.equal((await send(`${panel.url}/login?token=${token.replaceAll('+', '%20')}`)).status, 403, 'a space is not a +');
+			assert.equal((await send(`${panel.url}/login?token=%E0%A4%A`)).status, 403, 'a broken escape is a wrong token, not an error');
+			assert.equal((await send(`${panel.url}/login`)).status, 403);
+		} finally {
+			await panel.close();
+		}
+	});
+});
+
+describe('the container health check (src/healthcheck.js)', () => {
+	it('reads PANEL the way the bot does: every off word, quoted or not, means there is no panel to ask', () => {
+		for (const off of ['0', '"0"', "'0'", 'off', 'disabled', 'kapalı', 'KAPALI', 'kapali', 'hayır', 'false', ' no ']) {
+			assert.equal(loadConfig({ ...CONFIG_ENV, PANEL: off }).panelEnabled, false, `the bot: PANEL=${off}`);
+			assert.equal(healthTarget({ PANEL: off }), null, `the check: PANEL=${off}`);
+		}
+		assert.equal(healthTarget({ PANEL_PORT: '0' }), null, 'a random port is one nothing outside the bot can know');
+		assert.equal(healthTarget({ PANEL: 'of' })?.url, 'http://127.0.0.1:8787/healthz', 'a word that is neither keeps the default, as in the bot');
+	});
+
+	it('asks where the panel listens, with its token', () => {
+		assert.deepEqual(healthTarget({}), { url: 'http://127.0.0.1:8787/healthz', headers: {} });
+		for (const wildcard of ['0.0.0.0', '::', '[::]']) {
+			assert.equal(healthTarget({ PANEL_HOST: wildcard, PANEL_PORT: '9000' }).url, 'http://127.0.0.1:9000/healthz', wildcard);
+		}
+		assert.equal(healthTarget({ PANEL_HOST: '::1' }).url, 'http://[::1]:8787/healthz');
+		assert.equal(healthTarget({ PANEL_HOST: '192.168.1.10' }).url, 'http://192.168.1.10:8787/healthz');
+		const quoted = healthTarget({ PANEL_TOKEN: `"${TOKEN}"` });
+		assert.deepEqual(quoted.headers, { authorization: `Bearer ${TOKEN}` }, 'the quotes an --env-file keeps are not part of it');
+	});
+
+	it('passes a panel that says it is well, and fails one that refuses, is down or says it is not', async () => {
+		let healthy = true;
+		const panel = await startPanel({ activity: new ActivityLog(), port: 0, host: '0.0.0.0', token: TOKEN, log: () => {}, health: () => ({ ok: healthy }) });
+		try {
+			const env = { PANEL_HOST: '0.0.0.0', PANEL_PORT: String(panel.port), PANEL_TOKEN: `"${TOKEN}"` };
+			assert.equal(await checkHealth(env), 0);
+			assert.equal(await checkHealth({ ...env, PANEL_TOKEN: 'wrong-token-of-some-length' }), 1);
+			healthy = false;
+			assert.equal(await checkHealth(env), 1, '/healthz answering 503');
+		} finally {
+			await panel.close();
+		}
+		let asked = 0;
+		const fetchImpl = async () => (asked++, new Response('{}'));
+		assert.equal(await checkHealth({ PANEL: 'disabled', PANEL_PORT: '9' }, { fetchImpl }), 0);
+		assert.equal(asked, 0, 'no panel, nothing asked');
+		assert.equal(await checkHealth({ PANEL_PORT: '9' }, { fetchImpl: async () => Promise.reject(new Error('ECONNREFUSED')) }), 1);
+	});
+
+	it('is what the image runs, and exits with its verdict when run as a script', () => {
+		const dockerfile = readFileSync(new URL('../../Dockerfile', import.meta.url), 'utf8');
+		assert.match(dockerfile, /HEALTHCHECK[^\n]*\\\n\s*CMD \["node", "src\/healthcheck\.js"\]/u);
+		const script = fileURLToPath(new URL('../../src/healthcheck.js', import.meta.url));
+		const run = (env) => spawnSync(process.execPath, [script], { env: { PATH: process.env.PATH, ...env }, timeout: 20_000 }).status;
+		assert.equal(run({ PANEL: '"0"' }), 0);
+		assert.equal(run({ PANEL: 'kapalı' }), 0);
+		assert.equal(run({ PANEL_PORT: '1' }), 1, 'nothing listens there');
 	});
 });
 

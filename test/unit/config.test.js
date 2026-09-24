@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { loadConfig } from '../../src/config.js';
+import { loadConfig, panelSettings } from '../../src/config.js';
 import { hasLocale, locale, resolveLocale, setLocale, SUPPORTED_LOCALES } from '../../src/i18n/index.js';
 import { LocalStt } from '../../src/localstt.js';
 
@@ -192,6 +192,38 @@ describe('config.js: language', () => {
 		assert.equal(en.language, 'en');
 		assert.equal(en.localTtsLang, 'en');
 		assert.equal(loadConfig({ ...baseEnv, BOT_LANGUAGE: 'tr', LOCAL_TTS_LANG: 'auto' }).localTtsLang, 'auto');
+	});
+	it('tells a setup that never set the local languages how to keep the Turkish they used to default to', () => {
+		const cfg = loadConfig(baseEnv);
+		assert.equal(cfg.notes.length, 1);
+		assert.match(cfg.notes[0], /no longer mean Turkish/u);
+		assert.match(cfg.notes[0], /add LOCAL_TTS_LANG=tr LOCAL_STT_LANG=tr to \.env/u);
+		assert.doesNotMatch(cfg.notes[0], /\n/u, 'one line');
+		assert.deepEqual(cfg.warnings, [], 'a changed default is a note, not a value read wrong');
+		assert.equal(Object.keys(cfg).includes('notes'), false, 'not enumerable');
+
+		assert.match(loadConfig({ ...baseEnv, LOCAL_TTS_LANG: 'tr' }).notes[0], /add LOCAL_STT_LANG=tr to/u, 'only what is still unset');
+		assert.match(loadConfig({ ...baseEnv, LOCAL_STT_LANG: '"auto"' }).notes[0], /add LOCAL_TTS_LANG=tr to/u);
+		for (const env of [
+			{ BOT_LANGUAGE: 'en' }, // a language chosen on purpose
+			{ BOT_LANGUAGE: 'tr' },
+			{ LOCAL_TTS_LANG: 'tr', LOCAL_STT_LANG: 'auto' },
+			{ BRAIN_MODE: 'live' }, // no local voice and no local ears: the two keys mean nothing
+		]) {
+			assert.deepEqual(loadConfig({ ...baseEnv, ...env }).notes, [], JSON.stringify(env));
+		}
+		assert.equal(loadConfig({ ...baseEnv, BRAIN_MODE: 'live', LOCAL_TTS: '1' }).notes.length, 1, 'the local voice alone is enough');
+	});
+	it('reads the panel settings once, for the bot and for the container health check alike', () => {
+		const env = { ...baseEnv, PANEL: '"kapalı"', PANEL_PORT: "'9000'", PANEL_HOST: '0.0.0.0', PANEL_TOKEN: '"a-panel-token-of-some-length"' };
+		const cfg = loadConfig(env);
+		assert.deepEqual(panelSettings(env), {
+			panelEnabled: cfg.panelEnabled,
+			panelPort: cfg.panelPort,
+			panelHost: cfg.panelHost,
+			panelToken: cfg.panelToken,
+		});
+		assert.deepEqual(panelSettings(env), { panelEnabled: false, panelPort: 9000, panelHost: '0.0.0.0', panelToken: 'a-panel-token-of-some-length' });
 	});
 	it('reports a language that is not bundled, and runs in English', () => {
 		const cfg = loadConfig({ ...baseEnv, BOT_LANGUAGE: 'de' });

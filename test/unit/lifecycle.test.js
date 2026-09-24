@@ -138,7 +138,7 @@ function build({ env = {}, cfg = null, guildId = 'alpha', quota = null, canOpenL
 			return live;
 		},
 	});
-	return { session, lives, lines, dms, guild, cfg: config };
+	return { session, lives, lines, dms, guild, cfg: config, activity };
 }
 
 /** The bot sits in its channel, and Jane is in there with it. */
@@ -352,6 +352,99 @@ describe('MAX_LIVE_SESSIONS', () => {
 		b.session.stop();
 	});
 
+	it('a persona rebuild keeps the guild s slot: the guild waiting for one does not take it meanwhile', async () => {
+		const { a, b, canOpenLive } = fleet(1);
+		seat(a.session, a.guild);
+		seat(b.session, b.guild);
+		a.session.startLive();
+		a.lives[0].open('a1');
+		b.session.startLive();
+		assert.ok(b.session.liveBlockedReason);
+
+		const rebuilding = a.session.refreshPersona('character changed');
+		assert.equal(a.session.holdsLiveSlot(), true, 'between the two sessions the slot is still the rebuilding guild s');
+		a.lives[0].finishClose();
+		await rebuilding;
+		await settle();
+		assert.equal(a.lives.length, 2, 'the new session opened');
+		assert.equal(a.session.live, a.lives[1]);
+		assert.equal(a.session.liveBlockedReason, null, 'the guild that changed its voice is not the one left silent');
+		assert.equal(b.lives.length, 0, 'the old socket closing did not hand the slot over');
+		assert.ok(b.session.liveBlockedReason);
+		assert.equal(canOpenLive(b.session), false);
+		a.session.stop();
+		b.session.stop();
+	});
+
+	it('a rebuild that cannot open again gives the slot up', async () => {
+		const { a, b } = fleet(1);
+		seat(a.session, a.guild);
+		seat(b.session, b.guild);
+		a.session.startLive();
+		a.lives[0].open('a1');
+		b.session.startLive();
+		const rebuilding = a.session.refreshPersona('character changed');
+		a.session.paused = true; // paused (idle, quota) while the old socket was closing
+		a.lives[0].finishClose();
+		await rebuilding;
+		await settle();
+		assert.equal(a.session.holdsLiveSlot(), false);
+		assert.ok(b.session.live, 'the slot went to the guild that was waiting');
+		a.session.stop();
+		b.session.stop();
+	});
+
+	it('a guild left for good holds its slot until its socket is closed, not until it is forgotten', async () => {
+		const { a, b, registry } = fleet(1);
+		// The registry rules of src/index.js: a dropped session is kept in `retiring` until its sockets are
+		// gone, and the freed slot is offered then.
+		const retiring = new Set();
+		const offerFreedSlots = () => {
+			for (const session of retiring) if (!session.holdsLiveSlot()) retiring.delete(session);
+			offerLiveSlots([...registry, ...retiring], a.cfg.maxLiveSessions);
+		};
+		const canOpen = (asking) => liveSlotsTaken([...registry, ...retiring], asking) < a.cfg.maxLiveSessions;
+		for (const { session } of [a, b]) {
+			session.canOpenLive = canOpen;
+			session.onLiveSlotFreed = offerFreedSlots;
+		}
+		let disposed = false;
+		a.session.onPermanentLeave = (session) => {
+			registry.splice(registry.indexOf(session), 1);
+			session.stop();
+			retiring.add(session);
+			void session
+				.dispose()
+				.catch(() => {})
+				.finally(() => {
+					disposed = true;
+					offerFreedSlots();
+				});
+		};
+		seat(a.session, a.guild);
+		seat(b.session, b.guild);
+		a.session.voice.destroy = async () => {};
+		a.session.startLive();
+		a.lives[0].open('a1');
+		b.session.startLive();
+
+		await a.session.leaveVoice({ permanent: true });
+		await wait(10);
+		assert.equal(a.lives[0].closeCalls, 1);
+		assert.equal(disposed, false, 'dispose() waits for the socket the leave let go of');
+		assert.ok(retiring.has(a.session));
+		assert.equal(b.session.live, null, 'one socket still closing, cap 1: nothing else opens');
+		assert.equal(canOpen(b.session), false);
+
+		a.lives[0].finishClose();
+		await settle();
+		await settle();
+		assert.equal(disposed, true);
+		assert.equal(retiring.size, 0, 'forgotten once the socket is gone');
+		assert.ok(b.session.live, 'and then the slot is handed on');
+		b.session.stop();
+	});
+
 	it('offers a freed slot to the guild that has waited longest, and only as many as there are', () => {
 		const taken = [];
 		const guild = (name, since, { people = true, live = false } = {}) => ({
@@ -414,6 +507,57 @@ describe('rejoining the voice channel', () => {
 		assert.equal(voice.connected, true);
 		assert.equal(count(lines, /could not get back/), 1);
 		assert.equal(session.rejoinTimers.size, 0, 'once it worked the remaining attempts are dropped');
+		session.stop();
+	});
+
+	it('attempts that come due while a slow join is under way do not pile onto it: one join, one notice', async () => {
+		const built = build({ env: { BRAIN_MODE: 'live', JOIN_NOTICE: '1', TEXT_CHANNEL_ID: '444444444444444444' } });
+		const { session, guild, lives, activity } = built;
+		const sent = [];
+		guild.channels.cache.set('444444444444444444', { id: '444444444444444444', send: async (message) => sent.push(message.content) });
+		// Like VoiceSession.join: a second call to the same channel waits on the join under way.
+		let connected = false;
+		let joins = 0;
+		let underWay = null;
+		const gate = deferred();
+		session.voice = {
+			get connected() {
+				return connected;
+			},
+			get channelId() {
+				return connected ? guild.voice.id : null;
+			},
+			async join() {
+				if (underWay) return underWay;
+				joins++;
+				underWay = gate.promise.then(() => {
+					connected = true;
+					underWay = null;
+				});
+				return underWay;
+			},
+			async destroy() {},
+			dropUser() {},
+		};
+		session.lastVoiceChannelId = guild.voice.id;
+		session.scheduleRejoin(guild.voice.id, [5, 20, 40], 'back');
+		await wait(60); // all three came due while the first join was still waiting on Discord
+		gate.resolve();
+		await wait(20);
+		assert.equal(joins, 1);
+		assert.equal(sent.length, 1, 'one JOIN_NOTICE');
+		assert.equal(activity.list({ kinds: ['session'] }).events.filter((event) => /joined the voice channel/u.test(event.text)).length, 1, 'one joined entry');
+		assert.equal(lives.length, 1, 'the realtime session is opened once');
+
+		// And the same holds for a join somebody asks for while one is under way to that channel.
+		connected = false;
+		const again = deferred();
+		session.voice.join = async () => again.promise.then(() => (connected = true));
+		const first = session.joinVoice(guild.voice);
+		const second = session.joinVoice(guild.voice);
+		again.resolve();
+		await Promise.all([first, second]);
+		assert.equal(sent.length, 2, 'the second caller waited for the first join and posted nothing of its own');
 		session.stop();
 	});
 

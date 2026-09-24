@@ -53,6 +53,8 @@ try {
 // A value that was not read as written (a typo in an on/off word, an ID that cannot be one, a number
 // moved into its range) is said once, here, before anything acts on it.
 for (const warning of cfg.warnings ?? []) console.warn(t('boot.config_warning', { warning }));
+// And a default that changed under an existing .env, with how to keep the old behaviour.
+for (const note of cfg.notes ?? []) console.warn(t('boot.config_warning', { warning: note }));
 
 const stamp = () => new Date().toISOString().slice(11, 19);
 const log = (...args) => console.log(`[${stamp()}]`, ...args);
@@ -111,6 +113,8 @@ const localServer = cfg.localTtsAutostart
 			script: path.join(here, '..', 'tools', 'chatterbox_server.py'),
 			args: ['--port', String(safePort(cfg.localTtsUrl, 8020)), '--model', cfg.localTtsModel, '--stt', cfg.localSttModel],
 			token: cfg.localTtsToken,
+			// The token of the last launch, for the next start: a server outlives a bot that is killed outright.
+			tokenFile: path.join(dataDir, 'chatterbox.token'),
 			cwd: path.join(here, '..'),
 			log,
 		})
@@ -182,6 +186,10 @@ function liveSessionCount(except = null) {
  * it is not paused, so speech does not reopen it — which is why the registry hands the slot on here.
  */
 function offerFreedSlots() {
+	// A dropped session is forgotten once its sockets are gone, and not before (see dropSession).
+	for (const session of retiring) {
+		if (!session.holdsLiveSlot()) retiring.delete(session);
+	}
 	if (shuttingDown) return;
 	for (const session of offerLiveSlots([...sessions.values(), ...retiring], cfg.maxLiveSessions)) {
 		log(t('runtime.live_slot_taken', { guild: session.guild?.name ?? session.guild?.id ?? '?' }));
@@ -252,13 +260,13 @@ function dropSession(session) {
 	log(t('runtime.session_dropped', { guild: session.guild?.name ?? guildId }));
 	session.stop();
 	retiring.add(session);
+	// dispose() is over when every socket of the session is closed, and offerFreedSlots() then forgets the
+	// session. It is not simply deleted here: should a socket outlive dispose() after all, the session keeps
+	// its slot until that socket's own close reports in (onLiveSlotFreed) and the slot is really free.
 	void session
 		.dispose()
 		.catch(() => {})
-		.finally(() => {
-			retiring.delete(session);
-			offerFreedSlots();
-		});
+		.finally(() => offerFreedSlots());
 }
 
 /** Snapshot of every session; `first` (usually the guild being asked about) is put in front. */

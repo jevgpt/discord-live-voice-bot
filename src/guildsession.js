@@ -353,9 +353,12 @@ export class GuildSession {
 
 		// ---------------------------------------------------------------- GPT-Live session and reconnect state
 		this.live = null;
-		// Sessions this guild has let go of whose sockets are not closed yet; they still count against
-		// MAX_LIVE_SESSIONS (see retireLive).
-		this.closingLive = new Set();
+		// Sessions this guild has let go of whose sockets are not closed yet, each with its close; they
+		// still count against MAX_LIVE_SESSIONS (see retireLive), and dispose() waits for every one of them.
+		this.closingLive = new Map();
+		// A persona rebuild in progress (refreshPersona): between closing the old session and opening the new
+		// one the guild holds no socket, but the slot is still its own (see holdsLiveSlot).
+		this.rebuildingLive = 0;
 		this.liveReconnectTimer = null;
 		// Armed when a session is ready; the failure count is forgiven only once a session has stayed up.
 		this.liveStableTimer = null;
@@ -371,6 +374,8 @@ export class GuildSession {
 		this.idleTimer = null;
 		this.memberRefreshTimer = null;
 		this.rejoinTimers = new Set();
+		// The join under way ({ channelId, promise }), so that one join has one set of consequences (joinVoice).
+		this.voiceJoin = null;
 
 		// ---------------------------------------------------------------- turns, speakers, transcripts
 		this.turnsByDelegation = new Map();
@@ -1344,15 +1349,21 @@ export class GuildSession {
 	 * the moment the session was told to close let another server open while this one was still connected.
 	 */
 	retireLive(session) {
-		if (!session || this.closingLive.has(session)) return Promise.resolve(false);
-		this.closingLive.add(session);
+		if (!session) return Promise.resolve(false);
+		// Let go of twice (an unusable session, then the guild disposed): the second caller waits for the
+		// same close rather than being told at once that it is over.
+		const pending = this.closingLive.get(session);
+		if (pending) return pending;
 		// Called synchronously (an async function runs up to its first await), so the session stops taking
 		// audio at once; a throw becomes a rejection like any other failure to close.
-		const closing = (async () => session.close())().catch(() => false);
-		return closing.finally(() => {
-			this.closingLive.delete(session);
-			this.releaseLiveSlot();
-		});
+		const closing = (async () => session.close())()
+			.catch(() => false)
+			.finally(() => {
+				this.closingLive.delete(session);
+				this.releaseLiveSlot();
+			});
+		this.closingLive.set(session, closing);
+		return closing;
 	}
 
 	/** A socket of this guild is gone: when that leaves no slot held, the registry may hand it on. */
@@ -1361,9 +1372,12 @@ export class GuildSession {
 		this.onLiveSlotFreed?.(this);
 	}
 
-	/** Whether this guild counts against MAX_LIVE_SESSIONS: a session open, connecting, or still closing. */
+	/**
+	 * Whether this guild counts against MAX_LIVE_SESSIONS: a session open, connecting, or still closing, or
+	 * one being rebuilt with a new persona.
+	 */
 	holdsLiveSlot() {
-		return Boolean(this.live) || this.closingLive.size > 0;
+		return Boolean(this.live) || this.closingLive.size > 0 || this.rebuildingLive > 0;
 	}
 
 	/**
@@ -1492,8 +1506,18 @@ export class GuildSession {
 		const session = this.live;
 		this.live = null;
 		this.clearLiveStableTimer();
-		await this.retireLive(session);
-		if (!this.paused && !this.shuttingDown) this.startLive();
+		// The slot stays this guild's through the rebuild. The old socket closing is not the guild giving
+		// its slot up, but it looked like it: the close handed the slot to a guild held back by the cap
+		// before the new session could open, and the guild that only changed its voice went silent.
+		this.rebuildingLive++;
+		try {
+			await this.retireLive(session);
+			if (!this.paused && !this.shuttingDown) this.startLive();
+		} finally {
+			this.rebuildingLive--;
+		}
+		// Paused or stopped meanwhile, or the new session could not open: now the slot is free.
+		this.releaseLiveSlot();
 	}
 
 	/**
@@ -2521,6 +2545,10 @@ export class GuildSession {
 			this.scheduleTimer(() => {
 				void (async () => {
 					if (this.shuttingDown || this.voice.connected || this.lastVoiceChannelId !== targetId) return;
+					// A join still under way is this attempt: a join can take longer than the gap to the next
+					// timer, and every timer that fired meanwhile used to pile onto it. If it fails, the later
+					// timers are still standing.
+					if (this.voiceJoin) return;
 					const channel = this.guild?.channels.cache.get(targetId);
 					if (!channel) return;
 					this.log(`${label} (${channel.name}).`);
@@ -2541,6 +2569,22 @@ export class GuildSession {
 	 */
 	async joinVoice(channel, { rejoin = false } = {}) {
 		if (!rejoin) this.clearRejoinTimers();
+		// One join, one set of consequences. voice.join() lets a second caller wait on a join to the same
+		// channel that is already under way, and each caller then went on to resume the session, log the
+		// join and post JOIN_NOTICE: one join, three notices. A caller that finds such a join waits for it
+		// and leaves the rest to the one that started it.
+		if (this.voiceJoin?.channelId === channel.id) return this.voiceJoin.promise;
+		const join = { channelId: channel.id, promise: this.enterVoice(channel) };
+		this.voiceJoin = join;
+		try {
+			await join.promise;
+		} finally {
+			if (this.voiceJoin === join) this.voiceJoin = null;
+		}
+	}
+
+	/** The join itself and what follows it: resuming the brain, the activity entry and JOIN_NOTICE. */
+	async enterVoice(channel) {
 		await this.voice.join(this.guild, channel);
 		this.clearRejoinTimers();
 		this.lastVoiceChannelId = channel.id;
@@ -2819,6 +2863,10 @@ export class GuildSession {
 		// Through retireLive, like every other close, so the slot stays counted until the socket is gone.
 		const session = this.live;
 		this.live = null;
-		if (session) await this.retireLive(session);
+		if (session) void this.retireLive(session);
+		// Every socket still closing, not only the one held last. A permanent leave has already let go of
+		// its session (pauseLive), so waiting for this.live alone was over at once: the registry forgot
+		// the guild and handed its slot on while the old socket was still open.
+		await Promise.allSettled(this.closingLive.values());
 	}
 }

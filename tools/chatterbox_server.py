@@ -3,7 +3,8 @@
 The bot pulls raw PCM from this server and pushes it straight into Discord (no cloud TTS).
 
 Loopback is reachable from every web page the machine's browser opens, so a request is refused when:
-  - its Host header is not the loopback address the server is bound to (DNS rebinding),
+  - its Host header does not name the loopback address the server is bound to (DNS rebinding; the port
+    is not compared, so a forwarded port such as ssh -L 9000:127.0.0.1:8020 still works),
   - it carries an Origin header (browsers send one; the bot never does),
   - a JSON endpoint is sent anything but application/json (a form or text/plain post needs no preflight),
   - a token is set (--token or CHATTERBOX_TOKEN) and the X-Chatterbox-Token header does not match it.
@@ -96,11 +97,16 @@ def split_host_header(value):
     return match.group(1).strip("[]"), int(match.group(2)) if match.group(2) else None
 
 
-def request_refusal(headers, allowed_hosts, port: int, token):
-    """Why a request is refused, or None when it may go on. `token` is bytes (or None: no token set)."""
+def request_refusal(headers, allowed_hosts, token):
+    """Why a request is refused, or None when it may go on. `token` is bytes (or None: no token set).
+
+    Only the name in the Host header is compared, never its port. A rebinding page cannot make the
+    browser send a loopback name, so the name alone defeats it; the port, on the other hand, is whatever
+    the client connected to, and through a forwarded port (ssh -L 9000:127.0.0.1:8020) that is not ours.
+    """
     if allowed_hosts is not None:
-        name, given_port = split_host_header(headers.get("host"))
-        if name is None or name not in allowed_hosts or (given_port is not None and given_port != port):
+        name, _port = split_host_header(headers.get("host"))
+        if name is None or name not in allowed_hosts:
             return "host not allowed"
     if headers.get("origin") is not None:
         return "requests from a web page are not accepted"
@@ -538,7 +544,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _refused(self) -> bool:
         """Answers 403 and returns True when the request fails the Host, Origin or token check."""
-        reason = request_refusal(self.headers, self.server.allowed_hosts, self.server.server_port, self.server.token)
+        reason = request_refusal(self.headers, self.server.allowed_hosts, self.server.token)
         if reason is None:
             return False
         print(f"[chatterbox] refused {self.command} {self.path.split('?')[0]} from {self.address_string()}: {reason}", flush=True)
