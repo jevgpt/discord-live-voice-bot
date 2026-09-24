@@ -549,7 +549,7 @@ export const tools = [
 			'Cancels a scheduled event. An event that has already started cannot be cancelled, only ended, and this does ' +
 			'that instead. Owner only; two-step (asks first, acts with confirm:true). Cancelling cannot be undone.',
 		parameters: P.obj({ event: P.str('Name (or id) of the event'), confirm: P.confirm() }, ['event']),
-		gate: { keywords: WORDS.event },
+		gate: { keywords: WORDS.cancel },
 		async handler(args, deps, { name }) {
 			const found = await findEvent(deps, args.event);
 			if (found.refusal) return found.refusal;

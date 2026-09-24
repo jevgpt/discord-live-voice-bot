@@ -369,7 +369,9 @@ describe('SpeakerAttribution: keyword matching', () => {
 		for (let i = 0; i < 30; i++) a.onFrame({ priority: true, active: ['o'] });
 		a.noteTranscript('taking the long way', { startMs: 0, endMs: 600 });
 		assert.equal(a.commandSpeaker(['=take']), null, '"taking" must not satisfy an exact "take"');
-		assert.equal(a.commandSpeaker(['take']), null, 'a three letter prefix still needs the stem at the start');
+		// A plain English entry is the whole word in its listed forms, and "taking" is one of the forms of
+		// "take"; that is exactly why the everyday verbs are written as "=take".
+		assert.equal(a.commandSpeaker(['take'])?.word, 'take', 'a plain entry takes -ing');
 
 		const b = new SpeakerAttribution({ ownerId: 'o' });
 		for (let i = 0; i < 30; i++) b.onFrame({ priority: true, active: ['o'] });

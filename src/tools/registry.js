@@ -11,11 +11,17 @@
  */
 export function defineTool({ name, description, parameters = { type: 'object', properties: {} }, gate = null, handler }) {
 	if (!name || typeof handler !== 'function') throw new Error(`incomplete tool definition: ${name}`);
+	// Any owner-only tool can be made to wait for the owner's spoken yes (after other people's words were
+	// read in the same turn; see untrustedGate in helpers.js), and the call that follows the answer carries
+	// confirm:true. A schema without that field leaves the model no declared way to send it, and the
+	// question would simply be asked again for ever, so every gated tool declares it.
+	const schema =
+		gate && !parameters.properties?.confirm ? { ...parameters, properties: { ...parameters.properties, confirm: P.confirm() } } : parameters;
 	return {
 		name,
 		gate,
 		handler,
-		definition: { type: 'function', name, description, parameters },
+		definition: { type: 'function', name, description, parameters: schema },
 	};
 }
 

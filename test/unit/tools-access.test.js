@@ -10,6 +10,7 @@ import { ActivityLog } from '../../src/panel.js';
 import { callTool, resetDmLimiter } from '../../src/tools.js';
 import { canReadChannel, speakerOfTurn } from '../../src/tools/access.js';
 import { riskyPermissionsOf } from '../../src/tools/roles.js';
+import { ownerVoice } from '../owner-voice.js';
 
 // The checks an open tool makes about the person asking, before it acts in the bot's name. Three people:
 // the owner ("o"), an administrator ("a", listed in ADMIN_USER_IDS) and a guest ("g"). #general is open to
@@ -437,17 +438,20 @@ describe('edit_message and delete_messages: the bot s own posts are the owner s'
 
 	it('asks before deleting several of other people s messages, and deletes on the confirmation', async () => {
 		const { deps, sent } = makeDeps({ speaker: 'o', gate: true });
+		const voice = ownerVoice(deps);
 		const asked = await callTool('delete_messages', { channel: 'general', count: 3 }, deps);
 		assert.equal(asked.needs_confirmation, true, asked.spoken);
 		assert.match(asked.spoken, /last 3 messages in #general/);
 		assert.deepEqual(sent, [], 'nothing is deleted before the answer');
 
 		// A different request is not confirmed by the answer to this one.
+		voice.says('yes');
 		const other = await callTool('delete_messages', { channel: 'general', count: 2, confirm: true }, deps);
 		assert.equal(other.needs_confirmation, true);
 		assert.deepEqual(sent, []);
 
 		await callTool('delete_messages', { channel: 'general', count: 3 }, deps);
+		voice.says('yes, delete them');
 		const done = await callTool('delete_messages', { channel: 'general', count: 3, confirm: true }, deps);
 		assert.equal(done.ok, true, done.spoken);
 		assert.deepEqual(sent.map((entry) => entry.deleted).sort(), ['m1', 'm2', 'm3']);
@@ -520,10 +524,12 @@ describe('grant_role: no keys to the server by voice', () => {
 		assert.deepEqual(exact.sent, [{ roleAdded: 'chillz', to: 'g' }]);
 
 		const fuzzy = makeDeps({ speaker: 'o', gate: true });
+		const voice = ownerVoice(fuzzy.deps);
 		const asked = await callTool('grant_role', { member: 'Gus', role: 'chill' }, fuzzy.deps);
 		assert.equal(asked.needs_confirmation, true, asked.spoken);
 		assert.match(asked.spoken, /chillz/);
 		assert.deepEqual(fuzzy.sent, []);
+		voice.says('yes');
 		const done = await callTool('grant_role', { member: 'Gus', role: 'chill', confirm: true }, fuzzy.deps);
 		assert.equal(done.ok, true, done.spoken);
 		assert.deepEqual(fuzzy.sent, [{ roleAdded: 'chillz', to: 'g' }]);

@@ -220,7 +220,7 @@ export const tools = [
 		name: 'delete_role',
 		description: 'Deletes a role. Owner only; two-step (asks first, deletes with confirm:true).',
 		parameters: P.obj({ role: P.str('Role name'), reason: P.str('Reason (optional)'), confirm: P.confirm() }, ['role']),
-		gate: { keywords: WORDS.role },
+		gate: { keywords: WORDS.delete },
 		async handler(args, deps, { name }) {
 			const role = resolveRole(deps, String(args.role ?? ''));
 			if (!role) return { ok: false, spoken: t('tools.roles.role_not_found', { name: args.role }) };

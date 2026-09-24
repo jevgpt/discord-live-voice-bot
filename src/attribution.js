@@ -57,12 +57,16 @@ const UTTERANCE_GAP_MS = 1500; // fragments from the same person within this gap
 const MAX_UTTERANCES = 60;
 
 /**
- * Gate keyword entries. An entry of three letters or more matches as a PREFIX by default ("ban" also
- * matches "banned" / "banla"). An entry written as "=word" is a STEM: it matches the bare word and the
- * inflections its own language allows, and nothing else. Short everyday stems ("go", "gec", "al")
- * would swallow half of ordinary speech as a prefix and make "the owner said the command word"
- * meaningless, but a bare-word-only test is just as wrong in a suffixing language, where the command
- * word is almost never heard bare: "cek" arrives as "ceksene", "cekelim", "cekebilir misin".
+ * Gate keyword entries. An entry written as "=word" is a STEM: it matches the bare word and the
+ * inflections its own language allows, and nothing else. A plain entry is read the way its language
+ * builds words. Turkish glues whole moods onto a verb, so there a plain entry of three letters or more
+ * matches as a PREFIX ("ban" also matches "banla", "banlasana"). English does not, and a prefix there
+ * was matching whatever happened to start with the same letters: "banana", "band" and "bank" all
+ * opened the ban tools. So in English a plain entry matches the whole word and the forms the locale
+ * lists for it ("ban", "bans", "banned", "banning"). Short everyday stems ("go", "gec", "al") would
+ * swallow half of ordinary speech as a prefix, but a bare-word-only test is just as wrong in a
+ * suffixing language, where the command word is almost never heard bare: "cek" arrives as "ceksene",
+ * "cekelim", "cekebilir misin".
  */
 function parseKeywords(keywords) {
 	const parsed = [];
@@ -92,6 +96,53 @@ function patternFor(key, cache) {
 const inflectionFor = () => patternFor('keywords.inflection', inflections);
 const negationFor = () => patternFor('keywords.negation', negations);
 
+// Words that begin with a keyword and are a different word: "banyo" is not "ban", "odak" is not "oda".
+// A prefix match cannot tell them apart, so the locale names them. Cached per language.
+const lookalikeLists = new Map();
+function lookalikesFor() {
+	const code = locale();
+	if (!lookalikeLists.has(code)) {
+		const list = tRaw('keywords.lookalikes');
+		lookalikeLists.set(code, Array.isArray(list) ? list.map((word) => normalize(word)).filter(Boolean) : []);
+	}
+	return lookalikeLists.get(code);
+}
+
+function isLookalike(token, needle) {
+	return lookalikesFor().some((word) => word.length > needle.length && word.startsWith(needle) && token.startsWith(word));
+}
+
+// The forms a plain entry takes in a language that does not glue suffixes on (see parseKeywords). The
+// locale lists the tails; which of them applies depends on how the word ends, which is spelling rather
+// than vocabulary. null for a language whose plain entries are prefixes. Cached per language and word.
+const wordFormCache = new Map();
+function wordFormsFor(needle) {
+	const code = locale();
+	let cache = wordFormCache.get(code);
+	if (!cache) {
+		cache = { spec: tRaw('keywords.word_forms') ?? null, forms: new Map() };
+		wordFormCache.set(code, cache);
+	}
+	const spec = cache.spec;
+	if (!spec || typeof spec !== 'object') return null;
+	let forms = cache.forms.get(needle);
+	if (forms) return forms;
+	forms = new Set([needle]);
+	const add = (base, tails) => {
+		for (const tail of tails ?? []) forms.add(`${base}${tail}`);
+	};
+	if (needle.endsWith('e')) {
+		add(needle, spec.after_e); // delete -> deletes, deleted
+		add(needle.slice(0, -1), spec.drop_e); // delete -> deleting
+	} else {
+		add(needle, spec.suffixes); // kick -> kicks, kicked, kicking
+		// One short vowel before one final consonant doubles it: ban -> banned, pin -> pinning.
+		if (spec.double_after && new RegExp(spec.double_after, 'u').test(needle)) add(`${needle}${needle.at(-1)}`, spec.doubled);
+	}
+	cache.forms.set(needle, forms);
+	return forms;
+}
+
 /**
  * How much this utterance counts as "somebody said something". Normally its token count, but a
  * sentence whose letters normalize() cannot represent still counts as one thing said: it is real
@@ -104,6 +155,11 @@ function utteranceWeight(utt) {
 }
 
 function matchesNeedle(token, needle, stem) {
+	if (isLookalike(token, needle)) return false;
+	if (!stem) {
+		const forms = wordFormsFor(needle);
+		if (forms) return forms.has(token);
+	}
 	if (!token.startsWith(needle)) return false;
 	const tail = token.slice(needle.length);
 	// "Do not delete" must never read as "delete". In Turkish the negative is built by gluing -ma/-me
@@ -118,6 +174,38 @@ function matchesNeedle(token, needle, stem) {
 	if (!tail) return true;
 	const allowed = inflectionFor();
 	return Boolean(allowed && allowed.test(tail));
+}
+
+function containsPhrase(tokens, phrase) {
+	for (let start = 0; start + phrase.length <= tokens.length; start++) {
+		if (phrase.every((word, k) => tokens[start + k] === word)) return true;
+	}
+	return false;
+}
+
+/**
+ * Does this stretch of speech say yes, say no, or neither? The two-step confirmation reads the owner's
+ * answer with it. The word lists are the locale's (keywords.confirm_yes / confirm_no) and are matched the
+ * way the gate matches its own words, so "yesterday" is not a yes and "banned" is not a no. A yes word
+ * carrying the Turkish negative ("yapma", "onaylamiyorum") is a no, which is the whole reason a prefix
+ * match could not be trusted here. Entries of more than one word ("go ahead") match as a phrase.
+ * @returns {{ yes: boolean, no: boolean }}
+ */
+export function readAnswer(text) {
+	const tokens = normalize(text).split(' ').filter(Boolean);
+	if (!tokens.length) return { yes: false, no: false };
+	const said = (entries) =>
+		entries.some(({ needle, stem }) =>
+			needle.includes(' ') ? containsPhrase(tokens, needle.split(' ')) : tokens.some((token) => matchesNeedle(token, needle, stem)),
+		);
+	const yesWords = parseKeywords(tRaw('keywords.confirm_yes'));
+	const negative = negationFor();
+	const negatedYes =
+		Boolean(negative) &&
+		tokens.some((token) =>
+			yesWords.some(({ needle }) => token.length > needle.length && token.startsWith(needle) && negative.test(token.slice(needle.length))),
+		);
+	return { yes: said(yesWords), no: negatedYes || said(parseKeywords(tRaw('keywords.confirm_no'))) };
 }
 
 export class SpeakerAttribution {
@@ -164,6 +252,9 @@ export class SpeakerAttribution {
 		this.utterances = [];
 		// The moment the model's answer/delegation turn started: { at, audioMs }
 		this.turn = null;
+		// Which audio timeline the positions belong to: a new Live session starts its own at 0, and a
+		// position from before that cannot be compared with one after it (see mark()).
+		this.epoch = 0;
 	}
 
 	/** Compatibility: the owner's words inside the window. */
@@ -435,6 +526,7 @@ export class SpeakerAttribution {
 		this.driftSamples = [];
 		this.driftModel = null;
 		this.audioMs = 0;
+		this.epoch++;
 		this.track = [];
 		for (const entry of this.words) entry.pos = null;
 		for (const utt of this.utterances) {
@@ -809,6 +901,48 @@ export class SpeakerAttribution {
 		let text = '';
 		for (let i = 0; i < parts.length; i++) text += (i && !parts[i].glued ? ' ' : '') + parts[i].text;
 		return { text: text.trim().slice(-300), at: latestAt, seq, sure: true };
+	}
+
+	/**
+	 * A point in the conversation to measure "after" from: how far our audio had got, the clock, and the
+	 * fragment counter. The two-step confirmation takes one when it asks its question, so that only what
+	 * is said AFTER the question can answer it.
+	 */
+	mark() {
+		return { at: this.now(), audioMs: this.audioMs, seq: this.noteSeq, epoch: this.epoch };
+	}
+
+	/**
+	 * What the owner has said since `mark`, up to the turn: the answer to a question the bot put.
+	 *
+	 * Only the owner's own words count, by the gate's own test (the owner alone in the audio under them),
+	 * so somebody else's "yes" is not an answer and neither is a "yes" said over the owner. "Since" goes by
+	 * the audio position when the mark and the word share a timeline -- a transcript arriving late still
+	 * belongs where it was spoken, and a "yes" said before the question was even asked is not an answer
+	 * to it -- and by the fragment counter otherwise (the local path, or a Live session that restarted in
+	 * between). A clean utterance of somebody else's after the owner's last word leaves no answer at all:
+	 * the question may have been answered over the owner's head.
+	 * @returns {{ text: string, at: number, seq: number }|null}
+	 */
+	ownerSpeechSince(mark, { turn = undefined } = {}) {
+		if (!mark) return null;
+		const cut = this._resolveTurn(turn, this.now());
+		const positions = mark.epoch === this.epoch && Number.isFinite(mark.audioMs);
+		const said = [];
+		let at = 0;
+		let seq = 0;
+		for (const entry of this.words) {
+			if (!entry.owner || !this._beforeTurn(entry, cut)) continue;
+			const after = positions && entry.pos !== null ? entry.pos >= mark.audioMs : (entry.seq ?? 0) > (mark.seq ?? 0);
+			if (!after) continue;
+			said.push(entry.word);
+			at = entry.at;
+			seq = entry.seq ?? 0;
+		}
+		if (!said.length) return null;
+		const last = this.lastUtterance({ turn: cut });
+		if (last && !last.owner && last.sure !== false && last.seq > seq) return null;
+		return { text: said.join(' '), at, seq };
 	}
 
 	/**

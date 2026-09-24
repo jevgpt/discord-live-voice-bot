@@ -213,7 +213,8 @@ export const tools = [
 		name: 'delete_channel',
 		description: 'Deletes a channel. Owner only; two-step (asks first, deletes with confirm:true).',
 		parameters: P.obj({ channel: P.str('Channel name'), reason: P.str('Reason (optional)'), confirm: P.confirm() }, ['channel']),
-		gate: { keywords: WORDS.channel },
+		// The verb, not the thing: "channel" or "room" in passing must not be what opens a deletion.
+		gate: { keywords: WORDS.delete },
 		async handler(args, deps, { name }) {
 			const channel = resolveAnyChannel(deps, String(args.channel ?? ''));
 			if (!channel) return { ok: false, spoken: t('tools.channels.not_found', { name: args.channel }) };

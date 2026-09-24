@@ -6,6 +6,7 @@ import { ChannelReader } from '../../src/reader.js';
 import { RecentActions } from '../../src/commands.js';
 import { SpeakerAttribution } from '../../src/attribution.js';
 import { parsePermissions } from '../../src/tools/helpers.js';
+import { ownerVoice } from '../owner-voice.js';
 
 function makeDeps({ owner = false } = {}) {
 	const sent = [];
@@ -360,15 +361,17 @@ describe('the bot acting on its own private messages', () => {
 describe('two-step confirmation', () => {
 	// The realtime path hands every tool call a FRESH deps object so the owner gate can pin the turn.
 	// Anything the first call remembers has to survive that, or the question is asked forever.
-	const perCall = (base) => ({ ...base, currentTurn: () => null });
+	const perCall = (base) => ({ ...base });
 
 	it('completes when each call gets its own deps object', async () => {
 		const { deps, guild } = makeDeps({ owner: true });
+		const owner = ownerVoice(deps);
 		const deleted = [];
 		guild.channels.cache.get('10').delete = async () => deleted.push('chat');
 		const asked = await callTool('delete_channel', { channel: 'chat' }, perCall(deps));
 		assert.equal(asked.needs_confirmation, true, asked.spoken);
 		assert.deepEqual(deleted, [], 'nothing is deleted before the answer');
+		owner.says('yes');
 		const done = await callTool('delete_channel', { channel: 'chat', confirm: true }, perCall(deps));
 		assert.equal(done.ok, true, done.spoken);
 		assert.deepEqual(deleted, ['chat']);
@@ -376,10 +379,12 @@ describe('two-step confirmation', () => {
 
 	it('refuses a confirmation that names a different target', async () => {
 		const { deps, guild } = makeDeps({ owner: true });
+		const owner = ownerVoice(deps);
 		const deleted = [];
 		guild.channels.cache.get('10').delete = async () => deleted.push('chat');
 		guild.channels.cache.get('v1').delete = async () => deleted.push('General');
 		await callTool('delete_channel', { channel: 'chat' }, perCall(deps));
+		owner.says('yes');
 		const other = await callTool('delete_channel', { channel: 'General', confirm: true }, perCall(deps));
 		assert.equal(other.ok, false, 'the answer belongs to the other channel');
 		assert.deepEqual(deleted, []);
@@ -392,7 +397,10 @@ describe('two-step confirmation', () => {
 		beta.guild.id = 'beta';
 		const deleted = [];
 		beta.guild.channels.cache.get('10').delete = async () => deleted.push('beta-chat');
+		ownerVoice(alpha.deps);
+		const betaOwner = ownerVoice(beta.deps);
 		await callTool('delete_channel', { channel: 'chat' }, perCall(alpha.deps));
+		betaOwner.says('yes');
 		const crossed = await callTool('delete_channel', { channel: 'chat', confirm: true }, perCall(beta.deps));
 		assert.equal(crossed.ok, false, 'alpha asking must not let beta delete');
 		assert.deepEqual(deleted, []);
@@ -600,10 +608,12 @@ describe('channel and voice tools', () => {
 describe('moderation: confirmation on a fuzzy name match', () => {
 	it('kick_member asks first when the name is not an exact match, and acts on confirm', async () => {
 		const { deps, sent } = makeDeps({ owner: true });
+		const owner = ownerVoice(deps);
 		const asked = await callTool('kick_member', { member: 'Janee Doee' }, deps); // fuzzy
 		assert.equal(asked.ok, false);
 		assert.equal(asked.needs_confirmation, true, asked.spoken);
 		assert.ok(!sent.some((s) => s.kick));
+		owner.says('yes');
 		const done = await callTool('kick_member', { member: 'Janee Doee', confirm: true }, deps);
 		assert.equal(done.ok, true, done.spoken);
 		assert.ok(sent.some((s) => s.kick === '1'));
@@ -613,10 +623,12 @@ describe('moderation: confirmation on a fuzzy name match', () => {
 		// Removing somebody from the server is not undone by saying sorry, and the assistant only has a
 		// transcript of a room where people talk over each other, so it always asks first.
 		const { deps, sent } = makeDeps({ owner: true });
+		const owner = ownerVoice(deps);
 		const asked = await callTool('kick_member', { member: 'Jane' }, deps);
 		assert.equal(asked.needs_confirmation, true, asked.spoken);
 		assert.match(asked.spoken, /Jane Doe/, 'the target is said out loud');
 		assert.ok(!sent.some((s) => s.kick), 'nobody is removed before the answer');
+		owner.says('yes');
 		const done = await callTool('kick_member', { member: 'Jane', confirm: true }, deps);
 		assert.equal(done.ok, true, done.spoken);
 		assert.ok(sent.some((s) => s.kick === '1'));

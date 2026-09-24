@@ -40,26 +40,50 @@ export default {
 	// The negative in Turkish is -ma/-me glued straight onto the verb, so the negated word contains the
 	// positive one: "silme" (do not delete) starts with "sil" (delete). Matched against the tail AFTER a
 	// keyword; when it matches, the word does not count as the command. -meli/-mali (should) and
-	// -mek/-mak (the infinitive) begin the same way and are not negatives, so they are excluded.
-	negation: { pattern: '^m[ae](?![lk])', flags: 'u' },
+	// -mek/-mak (the infinitive) begin the same way and are not negatives, so they are excluded. Before
+	// -iyor the negative loses its vowel ("silmiyorum", "onaylamiyorum"), so -miyor/-muyor is one too;
+	// -mis (the reported past, "silmis") is not.
+	negation: { pattern: '^m(?:[ae](?![lk])|[iu]yor)', flags: 'u' },
 	inflection: {
 		pattern:
 			'^(?:[ea]bil|[iu]ver)?(?:(?:s[ea]n(?:[ea]|[iu]z[ea])?|s[iu]n(?:[iu]z)?|[iu]n(?:[iu]z)?|[ea]lim|[ea]yim|[ea]c[ea]k|[iu]yor|[eaiu]r|[dt][iu])(?:m|n|k|z|[iu]m|[iu]z|s[iu]n(?:[iu]z)?|l[ea]r)?)?$',
 		flags: 'u',
 	},
+	// Turkish builds its words by gluing, so a plain entry stays a prefix ("banla" -> "banlasana"); the
+	// English whole-word forms do not apply here.
+	word_forms: null,
+	// Words that begin with a keyword and are something else. A prefix match reads "banyo" as "ban" and
+	// "odak" as "oda"; worse, "bana" (to me) begins with "ban" and "konusalim" with "konu", so ordinary
+	// speech was opening the ban and thread tools. A heard word that begins with one of these does not
+	// count as the shorter keyword it starts with (a keyword that is itself this long is unaffected). The
+	// answer words below are read the same way, so "tamamen" is not "tamam" and "hayirli olsun" not "hayir".
+	lookalikes: [
+		'bana', 'banyo', 'bank', 'bant', 'band', 'banal', 'banliyo',
+		'odak',
+		'silah', 'silik', 'silgi', 'silindir', 'silo', 'silu', 'silk',
+		'konus', 'konum', 'konuk',
+		'toplanti', 'indirim', 'tasit', 'kanaliz', 'baglanti', 'logo', 'model', 'modern', 'modem', 'adil',
+		'sesli', 'seslen',
+		'cikartma', 'tamamen', 'tamamla', 'hayirli', 'aslan',
+	],
 	// Owner-gate keywords: for an admin tool to run, the owner must have said one of these words.
-	// An entry of three letters or more matches as a prefix ("ban" also matches "banned"); an entry
+	// An entry of three letters or more matches as a prefix ("ban" also matches "banla"); an entry
 	// written as "=word" is a stem and matches only itself plus the inflections above. Everyday words
-	// that would swallow half of ordinary speech as a prefix are written as stems, so "the owner said
-	// the command word" stays meaningful without losing "ceksene".
+	// that would swallow half of ordinary speech as a prefix are written as stems ("=kov": "kovsana",
+	// not "kova" or "kovala"), so "the owner said the command word" stays meaningful without losing
+	// "ceksene". "affet" (forgive me) is left out of the ban words for the same reason as the English
+	// "forgive", and "kaldir" with it: lifting a ban is said with the ban word itself ("banini kaldir",
+	// "yasagini kaldir"). Destructive tools gate on the verb (sil, iptal, at, ban), never on the thing.
 	words: {
-		ban: ['ban', 'banla', 'unban', 'yasak', 'yasakla', 'kaldir', 'affet'],
-		kick: ['kick', 'at', 'kov'],
+		ban: ['ban', 'banla', 'unban', 'yasak', 'yasakla', 'yasag'],
+		kick: ['kick', 'at', '=kov', 'cikar'],
 		timeout: ['timeout', 'sustur', 'mute'],
 		role: ['rol', 'yetki'],
 		voice: ['ses', 'sesini', 'voice', 'mikrofon', 'mute'],
 		setting: ['ayar', 'setting', 'mod', 'modu', 'modunu', '=sus', 'sessiz', 'sessizlik', '=kes', '=kapa', '=konusabilir', '=edebilir', '=konus', 'devam', 'quiet', 'yasak', '=ac', 'birak', 'kaldir'],
 		delete: ['sil', 'temizle', 'kaldir'],
+		cancel: ['iptal', 'sil', 'kaldir'],
+		prune: ['prune', 'temizle', 'ayikla', '=kov', 'at'],
 		channel: ['kanal', 'oda', 'kategori', 'kilit', 'kilitle'],
 		name: ['nick', 'nickname', 'isim', 'ismi', 'takma', 'adi', 'adin', 'kullanici'],
 		invite: ['davet', 'invite', 'link'],
@@ -92,6 +116,18 @@ export default {
 			'gorebil', 'goremes', 'gorsun', 'gormesin', 'yazabil', 'yazamas', 'yazsin', 'yazmasin', 'konusabil', 'konusamas',
 		],
 	},
+
+	// The owner's answer to a two-step confirmation ("Sam'i banlayayim mi?"). A yes counts only when the
+	// owner's words since the question hold one of these and none of the no words. A yes word with the
+	// negative glued on ("yapma", "onaylamiyorum") is read as a no (see negation above). "onayliyor" is
+	// listed on its own because the a of "onayla" drops before -iyor. "iptal" is not a no word here: it is
+	// the verb of an action being confirmed ("evet, iptal et" to "etkinligi iptal edeyim mi?"), and a bare
+	// "iptal" already does nothing, because nothing acts without a yes.
+	confirm_yes: [
+		'=evet', '=onay', 'onayla', 'onayliyor', 'tamam', '=olur', '=yap', 'aynen', 'kesinlikle', '=tabii', '=tabi',
+		'elbette', '=peki',
+	],
+	confirm_no: ['hayir', '=yok', 'vazgec', '=dur', 'bekle', 'olmaz', '=etme', 'istemiyorum', '=istemem', '=sakin', 'asla'],
 
 	// Mention resolution: names that mean the whole channel rather than one member.
 	everyone_mention_words: ['everyone', 'herkes', 'everyone.', 'tümü', 'tumu'],

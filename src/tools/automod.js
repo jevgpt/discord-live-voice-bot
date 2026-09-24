@@ -517,7 +517,7 @@ export const tools = [
 			'Deletes an auto-moderation rule for good; whatever it used to block is allowed again. Needs the Manage ' +
 			'Server permission. Owner only; two-step (asks first, deletes with confirm:true).',
 		parameters: P.obj({ rule: P.str('Name (or id) of the rule'), confirm: P.confirm() }, ['rule']),
-		gate: { keywords: WORDS.automod },
+		gate: { keywords: WORDS.delete },
 		async handler(args, deps, { name }) {
 			if (!ruleManager(deps)?.delete) return { ok: false, spoken: t('tools.automod.unavailable') };
 			const problem = permissionProblem(deps);

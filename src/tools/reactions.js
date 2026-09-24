@@ -266,7 +266,7 @@ export const tools = [
 			emoji: P.str('Clear only this emoji (optional; empty = every reaction)'),
 			confirm: P.confirm(),
 		}),
-		gate: { keywords: WORDS.reaction },
+		gate: { keywords: WORDS.delete },
 		async handler(args, deps, { name }) {
 			const emoji = resolveReactionEmoji(deps, args.emoji);
 			if (emoji?.missing) return { ok: false, spoken: t('tools.reactions.emoji_not_found', { name: emoji.missing }) };

@@ -3,6 +3,7 @@ import { describe, it } from 'node:test';
 import { ChannelType } from 'discord.js';
 import { callTool, toolMeta } from '../../src/tools.js';
 import { t } from '../../src/i18n/index.js';
+import { ownerVoice } from '../owner-voice.js';
 
 // The tools that change the server; each one has to be closed to everybody but the owner.
 const GATED = ['create_webhook', 'rename_webhook', 'delete_webhook', 'send_webhook_url'];
@@ -224,9 +225,11 @@ describe('rename_webhook', () => {
 describe('delete_webhook', () => {
 	it('asks first and only deletes on the second call', async () => {
 		const { deps, actions } = makeDeps({ owner: true });
+		const owner = ownerVoice(deps);
 		const asked = await callTool('delete_webhook', { webhook: 'News Hook' }, deps);
 		assert.equal(asked.needs_confirmation, true, asked.spoken);
 		assert.ok(!actions.some((entry) => entry.deleted), 'nothing is deleted before the answer');
+		owner.says('yes');
 		const done = await callTool('delete_webhook', { webhook: 'News Hook', confirm: true }, deps);
 		assert.equal(done.ok, true, done.spoken);
 		assert.deepEqual(actions.filter((entry) => entry.deleted), [{ deleted: 'w1' }]);
@@ -235,7 +238,9 @@ describe('delete_webhook', () => {
 
 	it('refuses a confirmation that names a different webhook', async () => {
 		const { deps, actions } = makeDeps({ owner: true });
+		const owner = ownerVoice(deps);
 		await callTool('delete_webhook', { webhook: 'News Hook' }, deps);
+		owner.says('yes');
 		const other = await callTool('delete_webhook', { webhook: 'Alerts', confirm: true }, deps);
 		assert.equal(other.ok, false, 'the answer belongs to the other webhook');
 		assert.ok(!actions.some((entry) => entry.deleted));

@@ -21,8 +21,26 @@ import { tools as serverTools } from './server.js';
 import { tools as videoTools } from './video.js';
 import { tools as identityTools } from './identity.js';
 import { tools as imageTools } from './images.js';
-import { ownerGate } from './helpers.js';
+import { needsCallContext, noteUntrustedRead, ownerGate, settleSpokenAnswer } from './helpers.js';
 import { t } from '../i18n/index.js';
+
+// Tools whose output is other people's words: what was written in a channel (read_messages goes through
+// the channel reader, list_pins shows the pinned messages), what a video says, the notes people left,
+// and summaries of what was said. Any of it can be phrased as an order, and the model reads it in the
+// middle of a request. Their output goes back as quoted material under a notice that says so (see
+// toolOutput), and once one of them has run in a turn, every owner-only tool in the rest of that turn
+// asks the owner out loud first (see untrustedGate in helpers.js). Kept in one list rather than on each
+// definition so the whole set can be read in one place; a name here that no module defines stops the
+// start-up below, so a renamed tool cannot silently lose the flag.
+const UNTRUSTED_OUTPUT = new Set([
+	'read_messages',
+	'list_pins',
+	'recall_notes',
+	'watch_video',
+	'video_transcript',
+	'summarize_video',
+	'summarize_conversation',
+]);
 
 const REGISTRY = new Map();
 for (const list of [
@@ -52,18 +70,22 @@ for (const list of [
 		REGISTRY.set(tool.name, tool);
 	}
 }
+for (const name of UNTRUSTED_OUTPUT) {
+	if (!REGISTRY.has(name)) throw new Error(`untrusted-output flag on a tool that does not exist: ${name}`);
+}
 
 /** The function-calling schemas handed to the model. */
 export function toolDefinitions() {
 	return [...REGISTRY.values()].map((tool) => tool.definition);
 }
 
-/** Tool name -> { gated, keywords } (for tests/documentation). */
+/** Tool name -> { gated, keywords, untrusted } (for tests/documentation). */
 export function toolMeta() {
 	return [...REGISTRY.values()].map((tool) => ({
 		name: tool.name,
 		gated: Boolean(tool.gate),
 		keywords: tool.gate?.keywords ?? null,
+		untrusted: UNTRUSTED_OUTPUT.has(tool.name),
 	}));
 }
 
@@ -84,27 +106,51 @@ export function toolDescription(name) {
 export async function callTool(name, args = {}, deps) {
 	const tool = REGISTRY.get(name);
 	if (!tool) return { ok: false, spoken: t('tools.helpers.unknown_tool', { name }) };
+	const input = args ?? {};
+	// The rule about other people's words has to know which call it is judging (its arguments, and
+	// whether the owner has already said yes to it in this call), so such a call gets a deps of its own.
+	// The realtime path copies deps for every call already; everything else passes through untouched.
+	const callDeps = needsCallContext(deps, name) ? { ...deps, toolCall: { name, args: input, confirmed: false } } : deps;
+	if (input.confirm === true) await settleSpokenAnswer(callDeps, name);
 	if (tool.gate) {
-		const denied = await ownerGate(deps, tool.gate.keywords ?? null, name);
+		const denied = await ownerGate(callDeps, tool.gate.keywords ?? null, name);
 		if (denied) return denied;
 	}
+	let result;
 	try {
-		return await tool.handler(args ?? {}, deps, { name });
+		result = await tool.handler(input, callDeps, { name });
 	} catch (err) {
 		deps?.log?.(t('tools.helpers.log_tool_error', { name, error: String(err?.stack ?? err) }));
-		return { ok: false, spoken: t('tools.helpers.tool_error', { name, error: String(err?.message ?? err) }) };
+		result = { ok: false, spoken: t('tools.helpers.tool_error', { name, error: String(err?.message ?? err) }) };
 	}
+	if (!UNTRUSTED_OUTPUT.has(name)) return result;
+	// Marked whatever the outcome: a failure can still carry what the far end said.
+	if (callDeps) noteUntrustedRead(callDeps, name);
+	return { ...result, untrusted: true };
 }
 
-/** Turns a tool result into the function_call_output text sent back to the Responses backend. */
+/**
+ * Turns a tool result into the function_call_output text sent back to the Responses backend (and to the
+ * local brain). Other people's words (result.untrusted) go under "quoted", after a notice saying what
+ * they are, so the model can tell material it is reporting from a request it has been given.
+ */
 export function toolOutput(result) {
-	return JSON.stringify({
-		ok: Boolean(result?.ok),
-		summary: result?.spoken ?? '',
+	const status = {
 		...(result?.needs_confirmation ? { needs_confirmation: true } : {}),
 		...(result?.denied ? { denied: true } : {}),
 		...(result?.error ? { error: result.error } : {}),
+	};
+	const content = {
 		...(result?.data ? { data: result.data } : {}),
 		...(result?.warnings?.length ? { warnings: result.warnings } : {}),
-	});
+	};
+	if (result?.untrusted) {
+		return JSON.stringify({
+			ok: Boolean(result?.ok),
+			notice: t('tools.helpers.untrusted_notice'),
+			quoted: { summary: result?.spoken ?? '', ...content },
+			...status,
+		});
+	}
+	return JSON.stringify({ ok: Boolean(result?.ok), summary: result?.spoken ?? '', ...status, ...content });
 }

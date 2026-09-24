@@ -583,6 +583,11 @@ export class GuildSession {
 			awaitTranscript: (maxMs) => session.awaitTranscript(maxMs),
 			// For the gate's second opinion: what the owner said last, what the tool does, and Jev to ask.
 			ownerUtterance: (opts) => session.attribution.ownerUtterance(opts),
+			// For the two-step confirmation: where the conversation was when the question was put, and what the
+			// owner has said since. The answer is read from the same attribution the gate trusts, so only the
+			// owner's own voice can say yes; a confirm:true from the model on its own is not an answer.
+			speechMark: () => session.attribution.mark(),
+			ownerSpeechSince: (mark, opts) => session.attribution.ownerSpeechSince(mark, opts),
 			toolDescription: (name) => toolDescription(name),
 			get jev() {
 				return session.jev;
@@ -2486,9 +2491,11 @@ export class GuildSession {
 		const summary = this.memory.summaryFor(userId);
 		if (!summary) return;
 		this.memoryHinted.add(userId);
-		const name = await this.memberName(userId);
+		// The same cleaning as announceSpeaker: a display name or a note must not be able to start a new line
+		// of its own that reads like part of the frame around it.
+		const name = safeContext(await this.memberName(userId));
 		// The name may have come from Discord; the session can have closed while it did.
-		this.live?.appendContext('thinking', t('runtime.memory_notes', { name, summary }));
+		this.live?.appendContext('thinking', t('runtime.memory_notes', { name, summary: safeContext(summary, { keepLines: true }) }));
 	}
 
 	// ---------------------------------------------------------------- voice channel

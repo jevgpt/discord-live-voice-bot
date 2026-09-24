@@ -542,12 +542,26 @@ const WORD_KEYED = new Set(['keywords.color_names', 'keywords.permission_groups'
 const tableLeaf = (key, value) => WORD_KEYED.has(key) || typeof value.pattern === 'string';
 const shapes = new Map([...raw].map(([code, bundle]) => [code, new Set([...flatten(bundle, '', new Map(), tableLeaf).keys()].filter((key) => !symmetric(key)))]));
 
+// A whole table set to null opts that language out of it (Turkish glues its suffixes on, so the English
+// word_forms rules have nothing to say there). What the other language keeps under that key is then its
+// own business, and the null itself is not an extra table.
+const optedOut = (code, key) => {
+	let node = raw.get(code);
+	for (const part of key.split('.')) {
+		if (node === null) return true;
+		if (typeof node !== 'object' || !(part in node)) return false;
+		node = node[part];
+	}
+	return node === null;
+};
+const underOptOut = (code, key) => key.split('.').some((_, i, parts) => optedOut(code, parts.slice(0, i + 1).join('.')));
+
 for (const code of others) {
 	for (const key of shapes.get(reference)) {
-		if (!shapes.get(code).has(key)) problems.push(`missing  [${code}] ${key}  (vocabulary table present in ${reference})`);
+		if (!shapes.get(code).has(key) && !underOptOut(code, key)) problems.push(`missing  [${code}] ${key}  (vocabulary table present in ${reference})`);
 	}
 	for (const key of shapes.get(code)) {
-		if (!shapes.get(reference).has(key)) problems.push(`extra    [${code}] ${key}  (vocabulary table not in ${reference})`);
+		if (!shapes.get(reference).has(key) && !optedOut(code, key)) problems.push(`extra    [${code}] ${key}  (vocabulary table not in ${reference})`);
 	}
 }
 
