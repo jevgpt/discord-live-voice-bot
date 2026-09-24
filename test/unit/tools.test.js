@@ -505,7 +505,8 @@ describe('send_message / send_dm', () => {
 
 	it('send_dm obeys the rate limit', async () => {
 		resetDmLimiter();
-		const { deps, sent } = makeDeps();
+		// A DM to somebody other than the person asking is the owner's to ask for.
+		const { deps, sent } = makeDeps({ owner: true });
 		assert.equal((await callTool('send_dm', { to: 'Jane', text: 'one' }, deps)).ok, true);
 		assert.equal((await callTool('send_dm', { to: 'Jane', text: 'two' }, deps)).ok, true);
 		const third = await callTool('send_dm', { to: 'Jane', text: 'three' }, deps);

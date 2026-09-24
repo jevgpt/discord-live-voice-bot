@@ -440,7 +440,8 @@ export const PERMISSION_EVERYONE_WORDS = tList('keywords.permission_everyone_wor
 
 // Permission names that can be said out loud -> discord.js PermissionFlagsBits key. Dangerous, server-wide
 // permissions (Administrator, ManageRoles, ManageGuild, ManageWebhooks, Ban/Kick) are deliberately absent:
-// they cannot be handed out by voice.
+// they cannot be handed out by voice. The other way to hand them out is a role that carries them, and
+// grant_role refuses those (RISKY_ROLE_PERMISSIONS in roles.js).
 const PERMISSION_ALIASES = tRaw('keywords.permission_aliases');
 // Groups: one word, several permissions.
 const PERMISSION_GROUPS = tRaw('keywords.permission_groups');

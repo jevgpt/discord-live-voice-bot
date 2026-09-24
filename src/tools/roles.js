@@ -1,6 +1,7 @@
 // Role tools: create, edit, delete (confirmed), grant/revoke, list.
 
-import { t } from '../i18n/index.js';
+import { t, tRaw } from '../i18n/index.js';
+import { normalize } from '../text.js';
 import {
 	PermissionFlagsBits,
 	STALE_CONFIRMATION,
@@ -15,6 +16,47 @@ import {
 } from './helpers.js';
 import { P, defineTool } from './registry.js';
 
+/**
+ * Permissions that make a role a key to the server rather than a label on a member: running it,
+ * handing out roles or channels, removing people, and reaching everybody at once. A role carrying any
+ * of them is not handed out by voice at all. The owner gate proves who said the command word, and a
+ * spoken confirmation proves what was heard, but both rest on the same audio: if that audio can be
+ * fooled once it can be fooled twice, and what is lost here is the server itself. Giving such a role
+ * takes a click in Discord, where the person doing it is who they say they are.
+ */
+export const RISKY_ROLE_PERMISSIONS = [
+	'Administrator',
+	'ManageGuild',
+	'ManageRoles',
+	'ManageChannels',
+	'ManageWebhooks',
+	'BanMembers',
+	'KickMembers',
+	'ModerateMembers',
+	'MentionEveryone',
+	'ManageMessages',
+];
+
+/** The risky permissions this role carries, by flag name (none when it carries no permission data). */
+export function riskyPermissionsOf(role) {
+	const permissions = role?.permissions;
+	if (typeof permissions?.has !== 'function') return [];
+	return RISKY_ROLE_PERMISSIONS.filter((flag) => {
+		try {
+			// checkAdmin off: an Administrator role is reported as Administrator, not as all ten.
+			return Boolean(permissions.has(PermissionFlagsBits[flag], false));
+		} catch {
+			return false;
+		}
+	});
+}
+
+/** The risky permissions as they are said out loud. */
+function riskyLabels(flags) {
+	const names = tRaw('tools.roles.risky_permission_names') ?? {};
+	return flags.map((flag) => names[flag] ?? flag).join(', ');
+}
+
 async function grantOrRevoke(args, deps, { name }) {
 	const member = await findMember(deps, String(args.member ?? ''));
 	const role = resolveRole(deps, String(args.role ?? ''));
@@ -23,6 +65,15 @@ async function grantOrRevoke(args, deps, { name }) {
 	if (role.managed) {
 		// Bot/integration roles cannot be assigned by hand; do not make it look like a hierarchy error.
 		return { ok: false, spoken: t('tools.roles.managed_role', { role: role.name }) };
+	}
+	const granting = name === 'grant_role';
+	if (granting) {
+		const risky = riskyPermissionsOf(role);
+		if (risky.length) {
+			const permissions = riskyLabels(risky);
+			deps.log?.(t('tools.roles.log_risky_refused', { role: role.name, permissions }));
+			return { ok: false, denied: true, spoken: t('tools.roles.risky_role', { role: role.name, permissions }) };
+		}
 	}
 	const me = deps.guild.members.me;
 	const highest = me?.roles?.highest;
@@ -47,8 +98,20 @@ async function grantOrRevoke(args, deps, { name }) {
 			}),
 		};
 	}
+	// A role that only matched approximately ("mod" for "Moderator", a transcript's "chillz" for "Chill")
+	// is a guess at what the owner meant, and a wrong role is access the member keeps until somebody
+	// notices. The role that was found is named out loud, and the grant waits for a yes.
+	if (granting && normalize(role.name) !== normalize(args.role)) {
+		const decision = checkConfirmation(deps, {
+			key: name,
+			target: `${member.id}:${role.id}`,
+			confirm: args.confirm,
+			question: t('tools.roles.fuzzy_role_question', { name: String(args.role ?? ''), role: role.name, who }),
+		});
+		if (decision.ask) return askConfirmation(decision.ask, { member: who, role: role.name, fuzzy: true });
+	}
 	try {
-		if (name === 'grant_role') {
+		if (granting) {
 			await member.roles.add(role, t('tools.helpers.audit_reason'));
 			deps.log?.(t('tools.roles.log_granted', { who, role: role.name }));
 			return {
@@ -72,8 +135,10 @@ async function grantOrRevoke(args, deps, { name }) {
 export const tools = [
 	defineTool({
 		name: 'grant_role',
-		description: 'Gives a role to a member. Owner only.',
-		parameters: P.obj({ member: P.str('Member name'), role: P.str('Role name') }, ['member', 'role']),
+		description:
+			'Gives a role to a member. Owner only. A role carrying moderation or administration permissions cannot be given by voice; ' +
+			'a role name that only matched approximately is two-step (asks first, gives it with confirm:true).',
+		parameters: P.obj({ member: P.str('Member name'), role: P.str('Role name'), confirm: P.confirm() }, ['member', 'role']),
 		gate: { keywords: WORDS.role },
 		handler: grantOrRevoke,
 	}),

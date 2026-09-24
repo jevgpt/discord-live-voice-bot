@@ -385,7 +385,9 @@ function buildContext(session) {
 		summarize: (options) => session?.deps().summarize(options),
 		// Events from an interaction are tagged with the guild they belong to, like the session's own.
 		activity: (event) => (session ? session.activity.push(event) : activity.push(event)),
-		callTool: (name, args) => callTool(name, args, session.deps()),
+		// Marked as a slash command: commands.js has already checked the person who ran it against their
+		// own Discord account, so a tool must not measure the request against whoever last spoke in voice.
+		callTool: (name, args) => callTool(name, args, { ...session.deps(), fromSlashCommand: true }),
 		joinVoice: (channel, options) => joinChannel(channel, options),
 		leaveVoice: (options) => session?.leaveVoice(options),
 		// /status reports every server, this one first.

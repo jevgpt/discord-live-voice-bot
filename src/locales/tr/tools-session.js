@@ -4,6 +4,8 @@ export default {
 	log_character_changed: '[araç] karakter değişti: {character}',
 	persona_reason_character: 'araç: {character}',
 	character_switched: 'Tamam, artık {character} olarak konuşuyorum.',
+	// Owner-gate words for switching the character; the character's own name is added to these.
+	character_words: ['karakter', 'kisilik', 'persona', '=gec'],
 	character_active: '{name} (aktif)',
 	characters: 'Kayıtlı karakterler: {names}.',
 	characters_empty: 'Hiç kayıtlı karakter yok.',

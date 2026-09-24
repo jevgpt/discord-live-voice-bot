@@ -32,6 +32,7 @@ import { normalize, parseBool, stripDictationTail, stripSpokenPrefix } from './t
 import { callTool, toolDefinitions, toolOutput } from './tools.js';
 import { VoiceSession } from './voice.js';
 import { toolDescription } from './tools/index.js';
+import { speakerOfTurn } from './tools/access.js';
 import { SessionHealth } from './health.js';
 import { AudioTrace, SessionTrace } from './trace.js';
 
@@ -548,9 +549,24 @@ export class GuildSession {
 			channelLists: () => session.channelLists(),
 			joinVoice: (channel) => (session.joinChannel ? session.joinChannel(channel) : session.joinVoice(channel)),
 			leaveVoice: (options) => session.leaveVoice(options),
-			currentSpeakerChannel: () => session.guild?.voiceStates.cache.get(session.lastSpeakerId ?? '')?.channel ?? null,
-			currentSpeakerId: () => session.lastSpeakerId,
-			currentSpeakerName: () => (session.lastSpeakerId ? session.nameFor(session.lastSpeakerId) : null),
+			// Who is asking: the person whose line produced the request, read from the turn the request is
+			// pinned to. lastSpeakerId is only Discord's latest speaking event -- whoever made any sound while
+			// the model worked -- and a guest's request to write or clear a note passed as the owner's own
+			// whenever the owner made a sound at that moment. It is still the answer when there is no line to
+			// go on. These are methods rather than arrow functions so that a copy of the deps carrying a pinned
+			// `currentTurn` (the realtime and local paths make one per request) reads its own turn.
+			currentSpeakerId() {
+				const turn = typeof this?.currentTurn === 'function' ? this.currentTurn() : session.attribution.turn;
+				return speakerOfTurn(session.attribution, turn ?? null, session.lastSpeakerId ?? null);
+			},
+			currentSpeakerName() {
+				const id = typeof this?.currentSpeakerId === 'function' ? this.currentSpeakerId() : session.lastSpeakerId;
+				return id ? session.nameFor(id) : null;
+			},
+			currentSpeakerChannel() {
+				const id = typeof this?.currentSpeakerId === 'function' ? this.currentSpeakerId() : session.lastSpeakerId;
+				return session.guild?.voiceStates.cache.get(id ?? '')?.channel ?? null;
+			},
 			currentVoiceChannel: () => (session.voice.channelId ? (session.guild?.channels.cache.get(session.voice.channelId) ?? null) : null),
 			// Did the bot owner speak just now? Admin commands go through this gate.
 			// The audio path can tell the owner's speech apart, so the gate rests on "was the last voice heard the owner's".

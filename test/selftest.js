@@ -115,6 +115,8 @@ function makeToolDeps({ messages = new Map(), emojis = [], stickers = [] } = {})
 		id: '10',
 		name: 'general',
 		type: ChannelType.GuildText,
+		// A public channel: anybody may see it and read its history.
+		permissionsFor: () => ({ has: () => true }),
 		send: async (payload) => {
 			sent.push(payload);
 			return { id: 'm1' };
@@ -150,7 +152,7 @@ function makeToolDeps({ messages = new Map(), emojis = [], stickers = [] } = {})
 			]),
 			fetch: async () => new Map(),
 		},
-		roles: { cache: new Map([['2', { id: '2', name: 'Moderator' }]]) },
+		roles: { cache: new Map([['2', { id: '2', name: 'Moderator' }]]), everyone: { id: 'everyone' } },
 		emojis: { cache: new Map(emojis.map((e) => [e.id, e])) },
 		stickers: { cache: new Map(stickers.map((s) => [s.id, s])), fetch: async () => {} },
 	};
@@ -616,6 +618,10 @@ await checkAsync('executeAction: sends, reads, switches character and blocks a r
 	const readResult = await executeAction({ type: 'read', channel, count: 5 }, deps);
 	assert.equal(readResult.speak, true);
 
+	// Switching the character is for the owner and the administrators, as /character is.
+	deps.isOwnerActive = () => true;
+	deps.ownerSaidRecently = () => true;
+	deps.ownerMatch = (words) => words[0];
 	const characterResult = await executeAction({ type: 'character', character }, deps);
 	assert.equal(active, 'c1', 'the character must become active');
 	assert.equal(characterResult.speak, false, 'the model must stay quiet on a character switch (the session is rebuilt)');
@@ -859,6 +865,9 @@ await checkAsync('read_messages: reads the private conversation the bot was last
 		messages: { fetch: async () => dmMessages },
 	};
 	const { deps } = makeToolDeps();
+	// Private conversations are read for the owner only, so the owner is the one asking here.
+	deps.cfg.ownerId = '9';
+	deps.currentSpeakerId = () => '9';
 	deps.lastDirectMessage = () => ({ channelId: 'dm-1', name: 'Kaan' });
 	deps.client = { ...deps.client, channels: { cache: new Map([['dm-1', dmChannel]]), fetch: async () => dmChannel } };
 
@@ -1049,6 +1058,10 @@ check('pickRelativeVoiceChannel: picks the neighbour below or above', () => {
 await checkAsync('send_dm: finds the member by account name as well as by server nickname', async () => {
 	const fixture = makeToolDeps();
 	const { deps } = fixture;
+	// A DM to somebody other than the person asking is the owner's to ask for.
+	deps.isOwnerActive = () => true;
+	deps.ownerSaidRecently = () => true;
+	deps.ownerMatch = (words) => words[0];
 	const dms = [];
 	fixture.guild.members.cache.get('5').send = async (payload) => {
 		dms.push(payload.content);
@@ -1466,10 +1479,11 @@ await checkAsync('message management: deletes/edits its own messages, somebody e
 	deps.cfg.textChannelId = '10';
 	deps.isOwnerActive = () => false;
 
-	// Deleting its own message needs no permission
-	const own = await callTool('delete_messages', { own: true, count: 1 }, deps);
-	assert.equal(own.ok, true, own.spoken);
-	assert.deepEqual(deleted, ['2'], "only the bot's own message may be deleted");
+	// Even the bot's own posts need the owner: one of them may be an announcement the owner had it make
+	const ownRefused = await callTool('delete_messages', { own: true, count: 1 }, deps);
+	assert.equal(ownRefused.ok, false);
+	assert.ok(ownRefused.spoken.includes('Only the bot owner'), ownRefused.spoken);
+	assert.deepEqual(deleted, [], 'nothing is deleted without the owner');
 
 	// Deleting somebody else's message needs the owner
 	const denied = await callTool('delete_messages', { count: 1 }, deps);
@@ -1477,6 +1491,10 @@ await checkAsync('message management: deletes/edits its own messages, somebody e
 	assert.ok(denied.spoken.includes('Only the bot owner'), denied.spoken);
 
 	deps.isOwnerActive = () => true;
+	const own = await callTool('delete_messages', { own: true, count: 1 }, deps);
+	assert.equal(own.ok, true, own.spoken);
+	assert.deepEqual(deleted, ['2'], "only the bot's own message may be deleted");
+
 	const removed = await callTool('delete_messages', { count: 1 }, deps);
 	assert.equal(removed.ok, true, removed.spoken);
 	assert.deepEqual(deleted, ['2', '3'], "with the owner asking, somebody else's last message is deleted");
@@ -1535,7 +1553,12 @@ await checkAsync('member_roles + role matching: finds a role from a decorated or
 	assert.ok(roles.spoken.includes('Chill'));
 
 	deps.isOwnerActive = () => true;
-	const grant = await callTool('grant_role', { member: 'Naci', role: 'chillz' }, deps);
+	// "chillz" is only close to the role's name, so the role that was found is named and waits for a yes.
+	const asked = await callTool('grant_role', { member: 'Naci', role: 'chillz' }, deps);
+	assert.equal(asked.needs_confirmation, true, asked.spoken);
+	assert.ok(asked.spoken.includes('ᴄʜɪʟʟ'), asked.spoken);
+	assert.deepEqual(granted, [], 'nothing is granted before the answer');
+	const grant = await callTool('grant_role', { member: 'Naci', role: 'chillz', confirm: true }, deps);
 	assert.equal(grant.ok, true, grant.spoken);
 	assert.deepEqual(granted, ['ᴄʜɪʟʟ'], 'the role with the decorated name must be found and granted');
 });
@@ -1987,6 +2010,10 @@ await checkAsync('edit_message: with no id, or a deleted one, it edits the bot\'
 	const fixture = makeToolDeps();
 	const { deps } = fixture;
 	deps.selfId = 'bot1'; // the bot's own id (the fixture does not provide it)
+	// Editing what the bot posted is the owner's to ask for.
+	deps.isOwnerActive = () => true;
+	deps.ownerSaidRecently = () => true;
+	deps.ownerMatch = (words) => words[0];
 	const edited = [];
 	const others = { id: 'm1', author: { id: '1' }, content: "somebody else's message", createdTimestamp: 100, edit: async () => edited.push('other') };
 	const mineOld = { id: 'm2', author: { id: 'bot1' }, content: 'my older message', createdTimestamp: 200, edit: async (payload) => edited.push(payload.content) };

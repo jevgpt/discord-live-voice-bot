@@ -1,19 +1,41 @@
 // Session tools: character, voice, join/leave the voice channel, runtime settings.
 
-import { t } from '../i18n/index.js';
+import { t, tList } from '../i18n/index.js';
 import { VOICES } from '../voices.js';
-import { findCharacter } from '../text.js';
-import { WORDS, failure, resolveVoiceChannel } from './helpers.js';
+import { findCharacter, normalize } from '../text.js';
+import { requesterPrivileged } from './access.js';
+import { WORDS, failure, ownerGate, resolveVoiceChannel } from './helpers.js';
 import { P, defineTool } from './registry.js';
+
+// What the owner says when asking for another character; the character's own name counts as well.
+const CHARACTER_WORDS = tList('tools.session.character_words');
+
+/** The owner-gate words for switching to this character: the general words plus its name. */
+function characterWords(character) {
+	const own = normalize(character?.name ?? '')
+		.split(' ')
+		.filter((word) => word.length >= 3);
+	return [...new Set([...CHARACTER_WORDS, ...own])];
+}
 
 export const tools = [
 	defineTool({
 		name: 'switch_character',
-		description: 'Changes the character/persona of the voice assistant. The live session is rebuilt with the new character.',
+		description:
+			'Changes the character/persona of the voice assistant. The live session is rebuilt with the new character. Owner and server ' +
+			'administrators only.',
 		parameters: P.obj({ name: P.str('Name of a saved character') }, ['name']),
-		async handler(args, deps) {
+		async handler(args, deps, { name }) {
 			const character = findCharacter(deps.store.list(), String(args.name ?? ''));
 			if (!character) return { ok: false, spoken: t('tools.session.character_not_found', { name: args.name }) };
+			// The persona is the whole room's, and /character is limited to administrators; a voice asking
+			// for it is held to the same standard. An administrator is recognised the way the slash commands
+			// recognise one (src/auth.js), by the person whose line asked. Anybody else needs the owner's own
+			// voice asking for it, which is also what lets the owner through when their line was not named.
+			if (!(await requesterPrivileged(deps))) {
+				const denied = await ownerGate(deps, characterWords(character), name);
+				if (denied) return denied;
+			}
 			await deps.store.setActive(character.id);
 			deps.log?.(t('tools.session.log_character_changed', { character: character.name }));
 			await deps.refreshPersona?.(t('tools.session.persona_reason_character', { character: character.name }));

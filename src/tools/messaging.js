@@ -6,7 +6,9 @@ import { balanceCodeFences, normalize, stripDictationTail } from '../text.js';
 import {
 	SlidingLimiter,
 	WORDS,
+	askConfirmation,
 	authorizedBotSet,
+	checkConfirmation,
 	displayName,
 	failure,
 	findMember,
@@ -20,6 +22,7 @@ import {
 	selfIdOf,
 	textChannels,
 } from './helpers.js';
+import { canReadChannel, requesterId, requesterIsOwner } from './access.js';
 import { P, defineTool } from './registry.js';
 import { pickBest } from '../matcher.js';
 import { findChannelByName } from '../text.js';
@@ -27,6 +30,12 @@ import { findChannelByName } from '../text.js';
 // The DM rate limit is kept process-wide (so the model cannot fire off DMs back to back); tests reset it via resetDmLimiter.
 const dmLimiter = new SlidingLimiter();
 export const resetDmLimiter = () => dmLimiter.reset();
+
+// What the owner says when asking the bot to write to somebody privately, and when asking it to change
+// something it already wrote. The owner gate looks for one of these in the owner's own speech before
+// either happens.
+const DM_WORDS = tList('tools.messaging.dm_words');
+const EDIT_WORDS = tList('tools.messaging.edit_words');
 
 /**
  * The channel a message tool should act on. A DM is not a guild channel, so resolveTextChannel can never
@@ -49,6 +58,64 @@ const looksLikeId = (value) => /^\d{17,20}$/.test(String(value ?? '').trim());
 
 function isDirect(channel) {
 	return Boolean(channel) && !channel.name;
+}
+
+/** How a channel is named in a sentence: "#general", or "the private conversation with Ali". */
+function placeOf(channel) {
+	return isDirect(channel) ? channelLabel(channel) : `#${channel.name}`;
+}
+
+const hasValue = (value) => value !== undefined && value !== null && String(value).trim() !== '';
+
+/** Who a refusal was for, in the log. Somebody who cannot be named is measured against @everyone. */
+function askerLabel(deps) {
+	const id = requesterId(deps);
+	return id ? (deps.currentSpeakerName?.() ?? id) : '@everyone';
+}
+
+/**
+ * Private conversations are the owner's to read. The bot's DMs with a member are between the bot and
+ * that member, and the owner's own DMs with the bot are nobody else's business.
+ */
+function refuseDirectRead(deps) {
+	deps.log?.(t('tools.messaging.log_dm_read_refused', { who: askerLabel(deps) }));
+	return { ok: false, denied: true, spoken: t('tools.messaging.dm_read_owner_only') };
+}
+
+/**
+ * May the person asking have this channel read out to them? The bot sees every channel it was let
+ * into, staff rooms included, and reading one aloud hands its contents to whoever asked, so the asker
+ * has to be able to read it on their own: see it and read its history. The owner may read anything the
+ * bot can; somebody who cannot be named gets what @everyone can read.
+ * @returns {Promise<object|null>} the refusal, or null when reading is fine
+ */
+async function readRefusal(deps, channel) {
+	// A slash command is not a voice: commands.js checked the person who ran it against their own
+	// Discord account, and whoever last spoke in the voice channel has nothing to do with it.
+	if (deps.fromSlashCommand === true) return null;
+	if (requesterIsOwner(deps)) return null;
+	if (isDirect(channel)) return refuseDirectRead(deps);
+	const speakerId = requesterId(deps);
+	if (await canReadChannel(deps, channel, speakerId)) return null;
+	const label = channelLabel(channel);
+	deps.log?.(t('tools.messaging.log_read_refused', { channel: label, who: askerLabel(deps) }));
+	return {
+		ok: false,
+		denied: true,
+		spoken: speakerId ? t('tools.messaging.read_not_allowed', { channel: label }) : t('tools.messaging.read_not_allowed_unknown', { channel: label }),
+	};
+}
+
+/**
+ * The words that count as the owner asking for a crowd ping. @everyone/@here take the everyone words;
+ * a role also takes its own name, since naming the role is how the owner asks for it, the way
+ * "everyone" asks for @everyone.
+ */
+function pingWords(deps, entry) {
+	if (entry.kind !== 'role') return WORDS.everyone;
+	const role = deps.guild?.roles?.cache?.get(entry.id) ?? null;
+	const own = [entry.name, role?.name].flatMap((name) => normalize(name ?? '').split(' ')).filter((word) => word.length >= 3);
+	return [...new Set([...WORDS.everyone, ...own])];
 }
 
 async function resolveMessageChannel(deps, { channel, dm }) {
@@ -102,12 +169,12 @@ export const tools = [
 		name: 'send_message',
 		description:
 			'Sends a message to a Discord text channel. Use mentions to tag people, ":name:" inside the text or the emojis list for server ' +
-			'emojis, and stickers for server stickers. "everyone" (@everyone) is only pinged when the owner asks for it.',
+			'emojis, and stickers for server stickers. "everyone" (@everyone) and roles are only pinged when the owner asks for it.',
 		parameters: P.obj(
 			{
 				channel: P.str('Channel name (e.g. "chat"). Empty = the default channel, else the channel the conversation is in, else the voice channel chat.'),
 				text: P.str('Message text. Write :name: for a server emoji.'),
-				mentions: P.list('Member or role names to tag. "everyone" = @everyone (owner only)'),
+				mentions: P.list('Member or role names to tag. "everyone" = @everyone; @everyone and roles are pinged for the owner only'),
 				emojis: P.list('Server emojis to append to the message'),
 				stickers: P.list('Server stickers to send'),
 			},
@@ -136,6 +203,23 @@ export const tools = [
 					text: t('tools.messaging.everyone_denied_activity'),
 					meta: { tool: 'send_message', result: 'denied' },
 				});
+			}
+			// A role tag reaches everybody who holds the role, which for a large role is @everyone under
+			// another name, and roles like "moderators" exist precisely to be called on. The same rule
+			// applies: the owner's request pings it, anybody else's goes out with the tag dropped.
+			const refusedRoles = entries.filter((entry) => entry.kind === 'role' && !ownerAllowed(deps, pingWords(deps, entry)));
+			if (refusedRoles.length) {
+				entries = entries.filter((entry) => !refusedRoles.includes(entry));
+				for (const entry of refusedRoles) {
+					const role = deps.guild?.roles?.cache?.get(entry.id)?.name ?? entry.name;
+					warnings.push(t('tools.messaging.role_ping_warning', { role }));
+					deps.activity?.({
+						kind: 'gate',
+						whoName: deps.personaName?.() ?? 'bot',
+						text: t('tools.messaging.role_ping_denied_activity', { role }),
+						meta: { tool: 'send_message', result: 'denied' },
+					});
+				}
 			}
 			const { body, used, warnings: emojiWarnings } = resolveEmojis(deps, args.emojis ?? [], text);
 			const { ids: stickerIds, warnings: stickerWarnings } = await resolveStickers(deps, args.stickers ?? []);
@@ -195,20 +279,25 @@ export const tools = [
 		description:
 			'Reads the NEW messages in a channel (the ones that arrived after the bot started up / after the last read). For requests such as ' +
 			'older messages, "the recent messages", "who wrote last", "show me even older ones", pass all:true (the last N messages with no ' +
-			"new/old distinction); to go further back, pass the previous result's oldest_id value as before.",
+			"new/old distinction); to go further back, pass the previous result's oldest_id value as before. It only reads a channel the " +
+			'person asking can read themselves; private conversations (dm) are read for the owner only.',
 		parameters: P.obj({
 			channel: P.str('Channel name. Empty = the default channel.'),
-			dm: P.str('Read the private conversation with this person instead of a channel: their name, or "last" for the one you were just in.'),
+			dm: P.str('Read the private conversation with this person instead of a channel: their name, or "last" for the one you were just in. Owner only.'),
 			count: P.int('How many messages at most (1-10, default 5; 20 with all:true)'),
 			all: P.bool("true = read the channel's latest messages with no new-messages-only restriction (older messages included)"),
 			before: P.str('With all:true: read the messages before this message id (pagination; the oldest_id value of the previous result)'),
 		}),
 		async handler(args, deps) {
+			// Refused before the person is looked up: finding them opens a private channel with them.
+			if (hasValue(args.dm) && deps.fromSlashCommand !== true && !requesterIsOwner(deps)) return refuseDirectRead(deps);
 			// "Read the DM I just sent you" was answered with "I could not tell which channel to read":
 			// this tool was the only one in the family that could not look at a private conversation, while
 			// the bot was perfectly able to send one.
 			const channel = await resolveMessageChannel(deps, { channel: args.channel, dm: args.dm });
 			if (!channel) return { ok: false, spoken: t('tools.messaging.no_read_channel') };
+			const refusal = await readRefusal(deps, channel);
+			if (refusal) return refusal;
 			const count = Number.isFinite(Number(args.count)) && Number(args.count) > 0 ? Number(args.count) : deps.cfg.readLimit;
 			const label = channelLabel(channel);
 			// An id the model made up reads as "there is nothing older", which is a lie about the channel
@@ -268,7 +357,9 @@ export const tools = [
 
 	defineTool({
 		name: 'send_dm',
-		description: 'Sends a direct message (DM) to someone on the server. It is rate limited; do not fire off DMs back to back.',
+		description:
+			'Sends a direct message (DM) to someone on the server. Anyone may have it DM themselves; a DM to anybody else is for the owner only. ' +
+			'It is rate limited; do not fire off DMs back to back.',
 		parameters: P.obj(
 			{
 				to: P.str('Person name (display name or username)'),
@@ -276,11 +367,18 @@ export const tools = [
 			},
 			['to', 'text'],
 		),
-		async handler(args, deps) {
+		async handler(args, deps, { name }) {
 			const member = await findMember(deps, String(args.to ?? ''));
 			const text = balanceCodeFences(stripDictationTail(String(args.text ?? '')));
 			if (!member) return { ok: false, spoken: t('tools.messaging.member_not_found', { name: args.to }) };
 			if (!text) return { ok: false, spoken: t('tools.messaging.no_dm_text') };
+			// "Send me that link" is anybody's to ask. A DM to somebody else puts the bot's name on words the
+			// recipient reads alone, with nothing to say who asked for them, so that one is the owner's.
+			const speakerId = requesterId(deps);
+			if (!speakerId || String(member.id) !== speakerId) {
+				const denied = await ownerGate(deps, DM_WORDS, name);
+				if (denied) return denied;
+			}
 			const now = deps.now?.() ?? Date.now();
 			const perTarget = deps.cfg?.dmPerTargetPerMinute ?? 3;
 			const perMinute = deps.cfg?.dmPerMinute ?? 10;
@@ -306,16 +404,20 @@ export const tools = [
 	defineTool({
 		name: 'delete_messages',
 		description:
-			"Deletes messages. My own messages (own:true) freely; other people's only when the owner asks for it. With message_id a single " +
-			'message, otherwise the last N messages.',
+			'Deletes messages. Owner only. With message_id a single message, otherwise the last N messages; own:true keeps to my own ' +
+			"messages. Deleting several of other people's messages is two-step (asks first, deletes with confirm:true).",
 		parameters: P.obj({
 			channel: P.str('Channel name (empty = the default one, or the last direct message when dm is given)'),
 			dm: P.str('Act in a private conversation instead of a channel: the person\'s name, or the word for "the last one"'),
 			message_id: P.str('Id of the single message to delete (optional)'),
 			count: P.int('How many messages (1-20, default 1)'),
-			own: P.bool("Only the bot's own messages (no owner permission needed)"),
+			own: P.bool("Only the bot's own messages"),
 			from: P.str("Only this person's messages (optional)"),
+			confirm: P.confirm(),
 		}),
+		// The bot's own posts are not the bot's alone: an announcement the owner had it make is one of
+		// them, and letting anyone remove those let anyone take the owner's words down.
+		gate: { keywords: WORDS.delete },
 		async handler(args, deps, { name }) {
 			const channel = await resolveMessageChannel(deps, { channel: args.channel, dm: args.dm });
 			if (!channel) return { ok: false, spoken: t('tools.messaging.no_delete_channel') };
@@ -325,10 +427,6 @@ export const tools = [
 			if (args.message_id) {
 				try {
 					const message = await channel.messages.fetch(String(args.message_id));
-					if (message.author?.id !== selfId) {
-						const denied = await ownerGate(deps, WORDS.delete, name);
-						if (denied) return denied;
-					}
 					await message.delete();
 					deps.log?.(t('tools.messaging.log_deleted_one', { channel: channel.name }));
 					return { ok: true, spoken: t('tools.messaging.deleted_one'), data: { channel: channel.name, message_id: message.id } };
@@ -340,10 +438,6 @@ export const tools = [
 			const count = Math.min(Math.max(Number(args.count ?? 1) || 1, 1), 20);
 			const ownOnly = args.own === true;
 			const fromMember = args.from ? await findMember(deps, String(args.from)) : null;
-			if (!ownOnly) {
-				const denied = await ownerGate(deps, WORDS.delete, name);
-				if (denied) return denied;
-			}
 			try {
 				const fetched = await channel.messages.fetch({ limit: Math.max(count * 3, 10) });
 				// Discord hands them back newest-first; we sort ourselves rather than trusting that order.
@@ -352,6 +446,23 @@ export const tools = [
 				else if (fromMember) targets = targets.filter((message) => message.author?.id === fromMember.id);
 				targets = targets.slice(0, count);
 				if (!targets.length) return { ok: false, spoken: t('tools.messaging.nothing_to_delete') };
+				// Other people's words cannot be put back, and "the last five" is exactly what a transcript
+				// gets wrong: the count, the person, the channel. Several at once are named out loud and wait
+				// for a yes. The question is tied to what was asked for rather than to message ids, so a new
+				// message arriving in a busy channel between the question and the answer does not void it.
+				if (!ownOnly && targets.length > 1 && targets.some((message) => message.author?.id !== selfId)) {
+					const who = fromMember ? displayName(fromMember) : null;
+					const place = placeOf(channel);
+					const decision = checkConfirmation(deps, {
+						key: name,
+						target: `${channel.id}:${fromMember?.id ?? '*'}:${count}`,
+						confirm: args.confirm,
+						question: who
+							? t('tools.messaging.delete_many_from_question', { count: targets.length, who, channel: place })
+							: t('tools.messaging.delete_many_question', { count: targets.length, channel: place }),
+					});
+					if (decision.ask) return askConfirmation(decision.ask, { channel: place, count: targets.length, from: who });
+				}
 
 				let deleted = 0;
 				// Bulk delete for 2+ messages (a single request); one by one when they are older than 14 days or bulk delete is unsupported.
@@ -390,7 +501,7 @@ export const tools = [
 		name: 'edit_message',
 		description:
 			"Edits one of the bot's own messages: by message_id, or (when that is empty) its latest own message in the channel; with contains, " +
-			'the latest message holding that text.',
+			'the latest message holding that text. Owner only.',
 		parameters: P.obj(
 			{
 				channel: P.str('Channel name (empty = the default one, or the last direct message when dm is given)'),
@@ -401,6 +512,9 @@ export const tools = [
 			},
 			['text'],
 		),
+		// Rewriting what the bot already posted rewrites whatever the owner had it announce, under the
+		// bot's name and after people have read the original.
+		gate: { keywords: EDIT_WORDS },
 		async handler(args, deps) {
 			const channel = await resolveMessageChannel(deps, { channel: args.channel, dm: args.dm });
 			if (!channel) return { ok: false, spoken: t('tools.messaging.no_edit_channel') };
