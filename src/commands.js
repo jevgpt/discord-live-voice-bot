@@ -1078,12 +1078,25 @@ function extractQueueCommand(line) {
 }
 
 /**
+ * The line without the bot's name in front of it: "Aria, shuffle" and "Aria shuffle" -> "shuffle". The
+ * queue and seek commands have to be the whole sentence (the grammar's LEAD), and the name the bot is
+ * called by is not part of any sentence it is asked.
+ */
+function withoutBotName(line, characters = []) {
+	const match = /^\s*([\p{L}\p{N}'’]+)[,.!?:]?\s+(\S.*)$/su.exec(line);
+	if (!match) return line;
+	const names = [...(characters ?? []).map((character) => character?.name), ...(tRaw('runtime.wake_words') ?? [])];
+	const first = normalize(match[1]);
+	return names.some((name) => name && normalize(String(name)) === first) ? match[2] : line;
+}
+
+/**
  * Music command: { type:'music', action, ... } or null. Besides play (query, next?), volume (percent or
  * delta) and the bare controls, the queue commands: loop (mode), shuffle, clear, move (from, to),
- * remove (position) and seek (to, or by for a step).
+ * remove (position) and seek (to, or by for a step). `characters` are the bot's names (see withoutBotName).
  */
-export function extractMusic(text) {
-	const line = String(text ?? '');
+export function extractMusic(text, characters = []) {
+	const line = withoutBotName(String(text ?? ''), characters);
 	const setMatch = VOLUME_SET.exec(line);
 	if (setMatch && VOLUME_REQUIRES.test(line)) {
 		const percent = Math.max(0, Math.min(100, Number(setMatch[1])));
@@ -1160,7 +1173,7 @@ export function parseVoiceCommand(text, characters = [], channels = { text: [], 
 
 	if (LEAVE.test(line)) return { type: 'leave' };
 
-	const music = extractMusic(line);
+	const music = extractMusic(line, characters);
 	if (music) return music;
 
 	const quiet = extractQuiet(line, characters);

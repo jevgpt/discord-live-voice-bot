@@ -99,6 +99,16 @@ export const UNSUPPORTED_LINK = 'unsupported-link';
 export const QUEUE_FULL = 'queue-full';
 export const YTDLP_MISSING = 'ytdlp-missing';
 export const SEEK_PAST_END = 'seek-past-end';
+// A link nobody knows the length of (a live stream) can be started over, and nothing else: see seek().
+export const SEEK_UNSUPPORTED = 'seek-unsupported';
+// A place that is in no track at all: NaN, Infinity, 1e308.
+export const SEEK_OUT_OF_RANGE = 'seek-out-of-range';
+
+// The furthest into a track a seek, or a saved position, may point. No track the bot plays is a day long,
+// and a number past that is not a place in anything: `seek_music {by: 1e308}` reached ffmpeg as
+// "-ss Infinity", ffmpeg gave up, the track was dropped, and the bot read "2.777777777777778e+304:58:56"
+// out loud as the place it had jumped to.
+export const MAX_SEEK_SECONDS = 24 * 60 * 60;
 
 // "track" plays the current track again when it ends; "queue" sends every finished track to the back of
 // the queue, so the whole list comes round again.
@@ -220,17 +230,57 @@ export function ytDlpArgs(options, target) {
 	return ['--ignore-config', ...options, '--', target];
 }
 
-/** A link we are willing to hand to yt-dlp. */
-export function isAllowedMediaUrl(text) {
+// Control characters (NUL, tab, line breaks, DEL...). None belongs in a link, a path or a title, and a NUL
+// byte in an argument makes spawn() throw on the spot rather than report an error (see _startPipeline).
+const CONTROL_CHARS = /\p{Cc}/u;
+const CONTROL_RUNS = /\p{Cc}+/gu;
+
+/**
+ * A link we are willing to hand to yt-dlp, as the parser that checked it writes it; null for any other.
+ * The written-out form is what gets played, so what was checked is exactly what runs: URL() percent-encodes
+ * a NUL and drops a tab where it stands, and the raw text, handed on after passing the check, carried both
+ * to yt-dlp -- a NUL straight into spawn(), a tab into another parser's idea of where the host ends. Text
+ * with a control character in it is refused before it is parsed at all: no link that was ever a real one
+ * has any.
+ */
+export function mediaUrl(text) {
+	const raw = typeof text === 'string' ? text.trim() : '';
+	if (!raw || CONTROL_CHARS.test(raw)) return null;
 	let url;
 	try {
-		url = new URL(String(text ?? '').trim());
+		url = new URL(raw);
 	} catch {
-		return false;
+		return null;
 	}
-	if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+	if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
 	const host = url.hostname.toLowerCase().replace(/^www\./u, '');
-	return MEDIA_HOSTS.some((allowed) => host === allowed || host.endsWith(`.${allowed}`));
+	return MEDIA_HOSTS.some((allowed) => host === allowed || host.endsWith(`.${allowed}`)) ? url.href : null;
+}
+
+/** A link we are willing to hand to yt-dlp. */
+export function isAllowedMediaUrl(text) {
+	return mediaUrl(String(text ?? '')) !== null;
+}
+
+/** A title or a name, with any control character in it turned into a space: it is read out and shown, never run. */
+function plainText(value, max = 200) {
+	return typeof value === 'string' ? value.replace(CONTROL_RUNS, ' ').trim().slice(0, max) : '';
+}
+
+/** The track's length in seconds when it is known; null when it is not (a local file, a live stream). */
+function knownLength(track) {
+	const duration = track?.duration;
+	return typeof duration === 'number' && Number.isFinite(duration) && duration > 0 ? duration : null;
+}
+
+/**
+ * Can the decoder be started part-way into this track? A file can (ffmpeg jumps in it), and so can a link
+ * of known length. A link of no known length is almost always a live stream, and after the yt-dlp pipe
+ * -ss drops everything up to its place: "rewind 10 seconds" half an hour into a stream asked for the
+ * first 29 minutes 50 of the stream to be thrown away, and the channel heard silence for that long.
+ */
+function seekable(track) {
+	return track?.kind === 'file' || knownLength(track) !== null;
 }
 const formatDuration = (seconds) => {
 	if (!Number.isFinite(seconds) || seconds <= 0) return null;
@@ -265,7 +315,8 @@ export function parseSeekTarget(value) {
  * download up to that point, but it asks nothing of yt-dlp, whose call stays exactly as ytDlpArgs builds it.
  */
 export function decoderArgs(track, from = 0) {
-	const at = from > 0 ? ['-ss', (Math.round(from * 1000) / 1000).toFixed(3)] : [];
+	// Only a number ffmpeg can read as a time: toFixed() writes 1e21 and up in exponent form, and Infinity as it is.
+	const at = Number.isFinite(from) && from > 0 && from <= MAX_SEEK_SECONDS ? ['-ss', (Math.round(from * 1000) / 1000).toFixed(3)] : [];
 	const args = ['-hide_banner', '-loglevel', 'error', '-nostdin'];
 	if (track.kind === 'file') args.push(...at, '-i', track.url);
 	else args.push('-i', 'pipe:0', ...at);
@@ -388,7 +439,8 @@ export class MusicPlayer {
 
 	/** Resolves text into track info: a local file, a URL or a YouTube search. */
 	async resolve(query) {
-		const text = String(query ?? '').trim();
+		// Control characters go before anything reads the text: it is searched for, and handed to yt-dlp.
+		const text = String(query ?? '').replace(CONTROL_RUNS, ' ').trim();
 		if (!text) throw new Error(t('music.error_empty_query'));
 
 		const local = this.findLocal(text);
@@ -408,11 +460,13 @@ export class MusicPlayer {
 		} catch {
 			throw new Error(t('music.error_bad_output'));
 		}
-		const url = info.webpage_url ?? info.original_url ?? info.url;
-		if (!url) throw new Error(t('music.error_no_url'));
+		const page = info.webpage_url ?? info.original_url ?? info.url;
+		if (!page) throw new Error(t('music.error_no_url'));
 		// The page that gets played is the one yt-dlp answered with, not the text it was given: a search
-		// result, or wherever an allowed link redirected to. It is held to the same hosts as a spoken link.
-		if (!isAllowedMediaUrl(url)) throw new Error(UNSUPPORTED_LINK);
+		// result, or wherever an allowed link redirected to. It is held to the same hosts as a spoken link,
+		// and kept in the form that check read it in (mediaUrl).
+		const url = mediaUrl(String(page));
+		if (!url) throw new Error(UNSUPPORTED_LINK);
 		const duration = Number(info.duration) || null;
 		if (this.maxMinutes > 0 && duration && duration > this.maxMinutes * 60) {
 			throw new Error(t('music.error_too_long', { duration: formatDuration(duration), minutes: this.maxMinutes }));
@@ -478,8 +532,22 @@ export class MusicPlayer {
 		// back round on its own when it finished, and from the outside it looked like the music would not
 		// end. Saying so is more use than a second copy nobody asked for.
 		const same = (other) => other && (other.url ? other.url === track.url : other.title === track.title);
-		if (same(this.current)) return { track, position: this.queue.length, startedNow: false, duplicate: true };
+		if (same(this.current)) {
+			// The track a restored queue is waiting on is not playing, whatever it looks like from here: asking
+			// for it is asking for it to play. It was answered "already playing or waiting", and nothing played.
+			if (this.parked) {
+				this.resume();
+				return { track: this.current, position: 0, startedNow: true, resumed: true };
+			}
+			return { track, position: this.queue.length, startedNow: false, duplicate: true };
+		}
 		const waiting = this.queue.findIndex(same);
+		if (waiting >= 0 && this.parked) {
+			// One waiting behind it in a restored queue is somebody wanting that one now; it plays as a new
+			// request would (below), and leaves no second copy behind.
+			const [wanted] = this.queue.splice(waiting, 1);
+			return this._playOverParked(wanted);
+		}
 		if (waiting >= 0) {
 			if (!next) return { track, position: this.queue.length, startedNow: false, duplicate: true };
 			// "Play it next" about a track that is already waiting is a request to move it up, not a second copy.
@@ -489,16 +557,7 @@ export class MusicPlayer {
 			return { track: moved, position: 1, startedNow: false, moved: true };
 		}
 		if (this.queue.length >= this.maxQueue) throw new Error(QUEUE_FULL);
-		if (this.parked) {
-			// A restored queue waits for somebody to say "resume". A new request is somebody wanting music now:
-			// it plays at once, and the track that was waiting keeps its place, and its position, right behind it.
-			const held = this.current;
-			held.startAt = this.elapsed;
-			this.current = null;
-			this.queue.unshift(track, held);
-			this.startNext();
-			return { track, position: 0, startedNow: true };
-		}
+		if (this.parked) return this._playOverParked(track);
 		if (next) this.queue.unshift(track);
 		else this.queue.push(track);
 		if (!this.current) {
@@ -507,6 +566,20 @@ export class MusicPlayer {
 		}
 		this._changed();
 		return { track, position: next ? 1 : this.queue.length, startedNow: false };
+	}
+
+	/**
+	 * A restored queue waits for somebody to say "resume". A request for another track is somebody wanting
+	 * music now: it plays at once, and the track that was waiting keeps its place, and its position, right
+	 * behind it.
+	 */
+	_playOverParked(track) {
+		const held = this.current;
+		held.startAt = this.elapsed;
+		this.current = null;
+		this.queue.unshift(track, held);
+		this.startNext();
+		return { track, position: 0, startedNow: true };
 	}
 
 	/** `repeat` marks the same track starting over (loop "track"), so the listener can leave the announcement out. */
@@ -526,8 +599,9 @@ export class MusicPlayer {
 			this._changed();
 			return null;
 		}
-		// A track that was left part-way (a restored queue put back behind a new request) carries on where it was.
-		const from = Math.max(0, Number(next.startAt) || 0);
+		// A track that was left part-way (a restored queue put back behind a new request) carries on where it
+		// was, if a decoder can be started there at all (seekable); a live stream starts again from now.
+		const from = seekable(next) ? Math.min(MAX_SEEK_SECONDS, Math.max(0, Number(next.startAt) || 0)) : 0;
 		delete next.startAt;
 		this.current = next;
 		this.stopping = false;
@@ -559,24 +633,30 @@ export class MusicPlayer {
 		}
 		const ffArgs = decoderArgs(track, from);
 		let ytdlp = null;
-		if (track.kind !== 'file') {
-			ytdlp = this.spawn(
-				this.ytDlp ?? 'yt-dlp',
-				ytDlpArgs(['-f', 'bestaudio/best', '-o', '-', '--no-playlist', '--no-warnings', '-q'], track.url),
-				{ stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
-			);
-			ytdlp.stderr.on('data', (chunk) => this.log(t('music.log_ytdlp', { message: String(chunk).trim().slice(0, 200) })));
-			ytdlp.once('error', (err) => {
-				// A yt-dlp of a track that has since been skipped or stopped can still report; failing on its
-				// word would skip whatever is playing now.
-				if (this.procs?.ytdlp !== ytdlp) return;
-				this._fail(track, t('music.log_ytdlp', { message: err.message }));
+		let ffmpeg = null;
+		try {
+			if (track.kind !== 'file') {
+				ytdlp = this.spawn(
+					this.ytDlp ?? 'yt-dlp',
+					ytDlpArgs(['-f', 'bestaudio/best', '-o', '-', '--no-playlist', '--no-warnings', '-q'], track.url),
+					{ stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
+				);
+				ytdlp.stderr.on('data', (chunk) => this.log(t('music.log_ytdlp', { message: String(chunk).trim().slice(0, 200) })));
+				ytdlp.once('error', (err) => {
+					// A yt-dlp of a track that has since been skipped or stopped can still report; failing on its
+					// word would skip whatever is playing now.
+					if (this.procs?.ytdlp !== ytdlp) return;
+					this._fail(track, t('music.log_ytdlp', { message: err.message }));
+				});
+			}
+			ffmpeg = this.spawn(this.ffmpeg, ffArgs, {
+				stdio: [ytdlp ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+				windowsHide: true,
 			});
+		} catch (err) {
+			this._spawnRefused(track, ytdlp, err);
+			return;
 		}
-		const ffmpeg = this.spawn(this.ffmpeg, ffArgs, {
-			stdio: [ytdlp ? 'pipe' : 'ignore', 'pipe', 'pipe'],
-			windowsHide: true,
-		});
 		if (ytdlp) {
 			ytdlp.stdout.pipe(ffmpeg.stdin);
 			ffmpeg.stdin.on('error', () => {}); // keeps EPIPE noise away when ffmpeg closes early
@@ -608,6 +688,28 @@ export class MusicPlayer {
 				return;
 			}
 			this.decodeDone = true; // once the buffered remainder has played we move on to the next track
+		});
+	}
+
+	/**
+	 * spawn() does not always answer with an 'error' event: arguments it will not pass on at all (a NUL byte
+	 * in a link, say) make it throw on the spot. Thrown here, that went up through startNext and readFrame
+	 * into the bridge's 20 ms tick and took the whole process down; the shutdown then saved the same track
+	 * as the one playing, and the next start crashed on it again. It is treated like the 'error' it would
+	 * otherwise have been: the track fails, a moment later, and the next one plays. A placeholder stands in
+	 * for the processes meanwhile, so the track does not read as parked, and a skip or a stop that replaces
+	 * it first is noticed. A yt-dlp already started for it is not left streaming into nothing.
+	 */
+	_spawnRefused(track, ytdlp, err) {
+		try {
+			ytdlp?.kill();
+		} catch {
+			/* ignore */
+		}
+		const refused = { ytdlp: null, ffmpeg: null, track };
+		this.procs = refused;
+		queueMicrotask(() => {
+			if (this.procs === refused) this._fail(track, t('music.error_spawn_refused', { message: err.message }));
 		});
 	}
 
@@ -737,14 +839,19 @@ export class MusicPlayer {
 	/**
 	 * Jumps to `seconds` into the current track by starting its decoder again from there (decoderArgs).
 	 * A paused track stays paused at the new place. Past the end of a track whose length is known it
-	 * refuses (SEEK_PAST_END) rather than quietly skipping it. Returns { track, from, to } or null when
-	 * nothing is playing.
+	 * refuses (SEEK_PAST_END) rather than quietly skipping it; a link of no known length can only go back
+	 * to its start (SEEK_UNSUPPORTED, see seekable); and a number that is no place in any track is refused
+	 * outright (SEEK_OUT_OF_RANGE). So every place a decoder is started from lies in [0, length]. Returns
+	 * { track, from, to } or null when nothing is playing.
 	 */
 	seek(seconds) {
 		if (!this.current) return null;
-		const target = Math.max(0, Number(seconds) || 0);
-		const duration = Number(this.current.duration) || 0;
+		const wanted = Number(seconds);
+		if (!Number.isFinite(wanted) || Math.abs(wanted) > MAX_SEEK_SECONDS) throw new Error(SEEK_OUT_OF_RANGE);
+		const target = Math.max(0, wanted);
+		const duration = knownLength(this.current);
 		if (duration && target >= duration) throw new Error(SEEK_PAST_END);
+		if (target > 0 && !seekable(this.current)) throw new Error(SEEK_UNSUPPORTED);
 		const from = this.elapsed;
 		this.offsetSeconds = target;
 		this.samplesRead = 0;
@@ -764,7 +871,9 @@ export class MusicPlayer {
 	/** seek() by a step from where the track is now; a step back past the start lands on the start. */
 	seekBy(delta) {
 		if (!this.current) return null;
-		return this.seek(Math.max(0, this.elapsed + (Number(delta) || 0)));
+		const step = Number(delta);
+		if (!Number.isFinite(step) || Math.abs(step) > MAX_SEEK_SECONDS) throw new Error(SEEK_OUT_OF_RANGE);
+		return this.seek(Math.max(0, this.elapsed + step));
 	}
 
 	/** off / track / queue; null (and nothing changed) for anything else. */
@@ -886,9 +995,7 @@ export class MusicPlayer {
 	 */
 	restore(saved) {
 		const result = { restored: 0, dropped: 0, current: null };
-		if (!saved || typeof saved !== 'object' || this.current || this.queue.length) return result;
-		if (Number.isFinite(saved.volume)) this.volume = Math.max(0, Math.min(1, saved.volume));
-		if (LOOP_MODES.includes(saved.loop)) this.loop = saved.loop;
+		if (!saved || typeof saved !== 'object' || Array.isArray(saved) || this.current || this.queue.length) return result;
 		const entries = [saved.current, ...(Array.isArray(saved.queue) ? saved.queue : [])].filter(Boolean);
 		const tracks = [];
 		for (const entry of entries) {
@@ -896,6 +1003,9 @@ export class MusicPlayer {
 			if (track) tracks.push(track);
 			else result.dropped += 1;
 		}
+		// Settled only once every entry has been read, so the player is never left holding half a restore.
+		if (typeof saved.volume === 'number' && Number.isFinite(saved.volume)) this.volume = Math.max(0, Math.min(1, saved.volume));
+		if (LOOP_MODES.includes(saved.loop)) this.loop = saved.loop;
 		const [head, ...rest] = tracks;
 		if (head) {
 			this.current = head;
@@ -913,29 +1023,36 @@ export class MusicPlayer {
 
 	/** One saved entry as a track, or null when it can no longer be played (see restore). */
 	_restorable(entry) {
-		if (!entry || typeof entry !== 'object') return null;
-		const duration = Number(entry.duration) > 0 ? Number(entry.duration) : null;
+		if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+		// Every field is taken only as the type snapshot() writes it, and nothing is converted: the file can be
+		// edited by hand, and String() or Number() of {"toString": 1} throws. It did, out of the session's
+		// start, and the server never came up.
+		const number = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : null);
+		const duration = number(entry.duration) > 0 ? entry.duration : null;
 		// The length limit may have been lowered since the queue was saved.
 		if (this.maxMinutes > 0 && duration && duration > this.maxMinutes * 60) return null;
 		let url = null;
-		if (entry.kind === 'url' && isAllowedMediaUrl(entry.url)) url = String(entry.url).trim();
+		// The link as the check wrote it, never the text it was given (see mediaUrl).
+		if (entry.kind === 'url') url = mediaUrl(entry.url);
 		else if (entry.kind === 'file') url = this._localFile(entry.url);
 		if (!url) return null;
-		const title = String(entry.title ?? '').trim().slice(0, 200) || path.basename(url);
-		const position = Number(entry.position);
-		return {
+		const title = plainText(entry.title) || path.basename(url);
+		const track = {
 			kind: entry.kind,
 			url,
 			title,
-			uploader: entry.uploader ? String(entry.uploader).slice(0, 200) : null,
+			uploader: plainText(entry.uploader) || null,
 			duration,
 			query: title,
 			requestedBy: null,
 			id: ++this.seq,
 			// It did not come through resolve() in this run (see _startPipeline).
 			restored: true,
-			...(position > 0 && (!duration || position < duration) ? { startAt: position } : {}),
 		};
+		// A saved place is kept only where a decoder can be started (seekable), inside the track.
+		const position = number(entry.position);
+		if (position > 0 && position <= MAX_SEEK_SECONDS && (!duration || position < duration) && seekable(track)) track.startAt = position;
+		return track;
 	}
 
 	/**
@@ -944,7 +1061,7 @@ export class MusicPlayer {
 	 * on trust.
 	 */
 	_localFile(file) {
-		if (!this.musicDir || typeof file !== 'string' || !file) return null;
+		if (!this.musicDir || typeof file !== 'string' || !file || CONTROL_CHARS.test(file)) return null;
 		const full = path.resolve(file);
 		if (path.dirname(full) !== path.resolve(this.musicDir)) return null;
 		if (!AUDIO_EXTENSIONS.has(path.extname(full).toLowerCase())) return null;

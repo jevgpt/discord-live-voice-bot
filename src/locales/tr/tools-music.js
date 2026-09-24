@@ -65,6 +65,7 @@ export default {
 	seeked: '{title} parçasında {position} noktasına geçtim.',
 	seeked_paused: '{title} parçasında {position} noktasına geldim; hâlâ duraklatılmış.',
 	seek_past_end: '{title} yalnızca {duration} uzunluğunda, oraya gidemem.',
+	seek_live: '{title} parçasının uzunluğu belli değil, büyük ihtimalle canlı yayın; baştan başlatabilirim ama içinde ileri geri gidemem.',
 	seek_event: '{position} noktasına geçildi: {title}',
 	bad_seek: 'Nereye gideceğimi anlayamadım: 1:30 gibi bir zaman ya da kaç saniye ileri veya geri gideceğimi söyle.',
 	saved: 'Kaydettim: {title}',

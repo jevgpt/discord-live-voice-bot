@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, it } from 'node:test';
 import { setLocale } from '../../src/i18n/index.js';
 import { MetricsHistory } from '../../src/metrics.js';
@@ -116,6 +119,58 @@ describe('the new routes keep every lock the panel had', () => {
 			assert.match(stream.headers['content-type'], /^text\/event-stream/u);
 			assert.equal(stream.headers['cache-control'], 'no-store');
 			stream.close();
+		} finally {
+			await panel.close();
+		}
+	});
+
+	// Found in review: a browser sends no Origin for a frame, an image or a script, and a page served from
+	// another port of this machine is the same site, so the SameSite cookie went along too. Eight iframes on
+	// it held every stream slot, and the owner's own page was answered 503.
+	it('refuse what a browser marks as another origin or as no fetch of the page, and take a script as before', async () => {
+		const panel = await startPanel({ activity: new ActivityLog(), port: 0, log: () => {}, history: new MetricsHistory() });
+		try {
+			for (const route of NEW_ROUTES) {
+				for (const site of ['same-site', 'cross-site']) {
+					assert.equal((await send(`${panel.url}${route}`, { headers: { 'sec-fetch-site': site, 'sec-fetch-dest': 'empty' } })).status, 403, `${route}, ${site}`);
+				}
+				for (const dest of ['iframe', 'image', 'script', 'document', 'embed']) {
+					assert.equal((await send(`${panel.url}${route}`, { headers: { 'sec-fetch-site': 'same-origin', 'sec-fetch-dest': dest } })).status, 403, `${route} as ${dest}`);
+				}
+				const own = await send(`${panel.url}${route}`, { headers: { 'sec-fetch-site': 'same-origin', 'sec-fetch-mode': 'cors', 'sec-fetch-dest': 'empty' } });
+				assert.equal(own.status, 200, `${route} fetched by the panel's own page`);
+				assert.equal((await send(`${panel.url}${route}`)).status, 200, `${route} from a script, which sends none of these`);
+			}
+			assert.equal(panel.stream.counts.opened, 2, 'only the page and the script ever held a slot');
+			await waitUntil(() => panel.stream.size === 0);
+		} finally {
+			await panel.close();
+		}
+	});
+
+	it('no page anywhere may frame any of it: every response says so, refusals included', async () => {
+		const panel = await startPanel({ activity: new ActivityLog(), port: 0, token: TOKEN, log: () => {}, history: new MetricsHistory() });
+		const bearer = { authorization: `Bearer ${TOKEN}` };
+		try {
+			const responses = [
+				await send(`${panel.url}/`, { headers: bearer }),
+				await send(`${panel.url}/api/events`, { headers: bearer }),
+				await send(`${panel.url}/api/export`, { headers: bearer }),
+				await send(`${panel.url}/api/stream`, { headers: bearer }),
+				await send(`${panel.url}/metrics`, { headers: bearer }),
+				await send(`${panel.url}/nowhere`, { headers: bearer }),
+				await send(`${panel.url}/api/events`),
+				await send(`${panel.url}/api/events`, { headers: { ...bearer, host: 'evil.example.com' } }),
+			];
+			assert.deepEqual(
+				responses.map((response) => response.status),
+				[200, 200, 200, 200, 200, 404, 401, 403],
+			);
+			for (const response of responses) {
+				assert.equal(response.headers['x-frame-options'], 'DENY');
+				assert.match(response.headers['content-security-policy'], /frame-ancestors 'none'/u);
+			}
+			assert.match(responses[0].headers['content-security-policy'], /script-src/u, "the page keeps its own, whole policy");
 		} finally {
 			await panel.close();
 		}
@@ -276,6 +331,51 @@ describe('the event stream', () => {
 			assert.equal(gate.status, 200);
 			assert.ok(!/secret/iu.test(gate.text), gate.text);
 			assert.equal(JSON.parse(gate.text).rows[0].reason, 'Gus spoke after the owner: "…"');
+		} finally {
+			await panel.close();
+		}
+	});
+
+	// Found in review: only the stream redacted again. The page's own polling (/api/events) and the export
+	// served the words a run with recording on had written to activity.jsonl.
+	it('and neither do the polling route, the export or the search, for words read back from a recording-on run', async () => {
+		const dir = mkdtempSync(path.join(os.tmpdir(), 'panel-redact-'));
+		const file = path.join(dir, 'activity.jsonl');
+		writeFileSync(
+			file,
+			[
+				{ id: 1, at: new Date().toISOString(), kind: 'voice', direction: 'in', who: '42', whoName: 'Dana', text: 'my card PIN is 4912', meta: { guild: 'G' } },
+				{ id: 2, at: new Date().toISOString(), kind: 'gate', whoName: 'bot', text: 'ban_member: denied', meta: { tool: 'ban_member', result: 'denied', text: 'ban him he said secret' } },
+				{ id: 3, at: new Date().toISOString(), kind: 'tool', text: 'send_message ok', meta: { args: '{"text":"the secret plan"}' } },
+			]
+				.map((entry) => JSON.stringify(entry))
+				.join('\n') + '\n',
+		);
+		const activity = new ActivityLog({ file, redact: () => true });
+		await activity.load(500);
+		const panel = await startPanel({ activity, port: 0, log: () => {} });
+		try {
+			const events = await send(`${panel.url}/api/events?since=0&limit=500`);
+			assert.equal(events.status, 200);
+			assert.ok(!/4912|secret/iu.test(events.text), events.text);
+			const parsed = JSON.parse(events.text).events;
+			assert.equal(parsed[0].text, '[19 characters, not recorded]');
+			assert.equal(parsed[0].whoName, 'Dana', 'who spoke is not the words');
+			assert.equal(parsed[1].meta.result, 'denied', 'a decision stays readable');
+
+			const exported = await send(`${panel.url}/api/export`);
+			assert.equal(exported.status, 200);
+			assert.ok(!/4912|secret/iu.test(exported.text), exported.text);
+			assert.equal(JSON.parse(exported.text.split('\n')[0]).text, '[19 characters, not recorded]');
+
+			// A search that still matched the words would tell whoever types guesses into it what was said.
+			for (const guess of ['4912', 'PIN', 'secret']) {
+				const found = JSON.parse((await send(`${panel.url}/api/events?q=${guess}`)).text);
+				assert.equal(found.events.length, 0, guess);
+				assert.equal((await send(`${panel.url}/api/export?q=${guess}`)).text, '', `export, ${guess}`);
+			}
+			assert.equal(JSON.parse((await send(`${panel.url}/api/events?q=Dana`)).text).events.length, 1, 'a name can still be searched for');
+			assert.equal(activity.events[0].text, 'my card PIN is 4912', 'the buffer itself is left as it is; only what goes out is redacted');
 		} finally {
 			await panel.close();
 		}

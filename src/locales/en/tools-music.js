@@ -65,6 +65,7 @@ export default {
 	seeked: 'Jumped to {position} in {title}.',
 	seeked_paused: 'Moved to {position} in {title}; it is still paused.',
 	seek_past_end: '{title} is only {duration} long, so I cannot go there.',
+	seek_live: '{title} has no known length, a live stream most likely, so I can start it over but not jump around in it.',
 	seek_event: 'jumped to {position}: {title}',
 	bad_seek: 'I could not work out where to go: say a time such as 1:30, or how many seconds to go ahead or back.',
 	saved: 'Saved: {title}',

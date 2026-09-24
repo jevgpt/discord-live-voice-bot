@@ -4,7 +4,17 @@
 // somebody else's listening, and stop_music -- which clears the whole queue -- set that bar long ago.
 
 import { t } from '../i18n/index.js';
-import { LOOP_MODES, QUEUE_FULL, SEEK_PAST_END, UNSUPPORTED_LINK, YTDLP_MISSING, parseSeekTarget } from '../music.js';
+import {
+	LOOP_MODES,
+	MAX_SEEK_SECONDS,
+	QUEUE_FULL,
+	SEEK_OUT_OF_RANGE,
+	SEEK_PAST_END,
+	SEEK_UNSUPPORTED,
+	UNSUPPORTED_LINK,
+	YTDLP_MISSING,
+	parseSeekTarget,
+} from '../music.js';
 import { MAX_SAVED_PER_USER, pickSaved } from '../savedtracks.js';
 import { formatClock } from '../text.js';
 import { P, defineTool } from './registry.js';
@@ -286,7 +296,8 @@ export const tools = [
 		name: 'seek_music',
 		description:
 			'Jumps within the current track. "to" is a place: "1:30", "90" (seconds) or "0" for the start ("go to 1:30", "start the song over"); ' +
-			'"+30" / "-10" in "to", or "by" in seconds, is a step from where it is now ("skip ahead 30 seconds", "rewind 10 seconds").',
+			'"+30" / "-10" in "to", or "by" in seconds, is a step from where it is now ("skip ahead 30 seconds", "rewind 10 seconds"). ' +
+			'A link with no known length (a live stream) can only be started over.',
 		parameters: P.obj({
 			to: P.str('Where to go: "1:30", "90", "0" for the start, or a step such as "+30" / "-10"'),
 			by: P.int('Seconds from the current position: positive = ahead, negative = back'),
@@ -301,14 +312,21 @@ export const tools = [
 				: given(args.by) && Number.isFinite(Number(args.by))
 					? { by: Math.round(Number(args.by)) }
 					: null;
-			if (!target) return { ok: false, spoken: t('tools.music.bad_seek') };
+			// A model can send any number at all. One that is no place in any track (1e308 reached ffmpeg as
+			// "-ss Infinity") is answered here, in words, before the player is asked.
+			const amount = target ? ('by' in target ? target.by : target.to) : null;
+			if (!target || !Number.isFinite(amount) || Math.abs(amount) > MAX_SEEK_SECONDS) return { ok: false, spoken: t('tools.music.bad_seek') };
 			const title = music.current.title;
 			let result;
 			try {
 				result = 'by' in target ? music.seekBy(target.by) : music.seek(target.to);
 			} catch (err) {
-				if (err.message !== SEEK_PAST_END) throw err;
-				return { ok: false, spoken: t('tools.music.seek_past_end', { title, duration: formatClock(music.current.duration) }) };
+				if (err.message === SEEK_PAST_END) {
+					return { ok: false, spoken: t('tools.music.seek_past_end', { title, duration: formatClock(music.current.duration) }) };
+				}
+				if (err.message === SEEK_UNSUPPORTED) return { ok: false, spoken: t('tools.music.seek_live', { title }) };
+				if (err.message === SEEK_OUT_OF_RANGE) return { ok: false, spoken: t('tools.music.bad_seek') };
+				throw err;
 			}
 			if (!result) return nothingPlaying();
 			const position = formatClock(result.to);

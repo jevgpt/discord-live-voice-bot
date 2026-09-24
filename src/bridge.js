@@ -76,6 +76,7 @@ export class AudioBridge {
 		this.padEnd = 0; // the far end's buffer end, in our clock, under the padding model (see LEAD_FRAMES)
 		this.leadDue = true; // the lead goes out on the first ready tick, and again after the session was not ready
 		this.gen = 0; // start() generation, so a deferred run after stop() does nothing
+		this.musicFailing = false; // the music player threw on the last tick (see readMusic)
 	}
 
 	/** Audio sent per wall-clock second, as a ratio (1 = exactly real time); null until there is enough of it. */
@@ -149,6 +150,25 @@ export class AudioBridge {
 		return this.output?.destroyed === true || this.output?.writable === false;
 	}
 
+	/**
+	 * One frame of music, or silence when the player throws. The tick runs straight off a timer with nothing
+	 * above it, so a throw from here was an uncaught exception, and the process shut down over one bad
+	 * track: a saved link with a NUL byte in it did exactly that on every start. The voice and the model's
+	 * input stream do not depend on the music, so a failing player costs the music and nothing else. It is
+	 * logged once per run of failures, not fifty times a second.
+	 */
+	readMusic() {
+		try {
+			const n = this.music.readFrame(this.musicOut, STEREO_SAMPLES_PER_FRAME_48K);
+			this.musicFailing = false;
+			return n;
+		} catch (err) {
+			if (!this.musicFailing) this.log(t('voice.music_read_failed', { error: err?.message ?? String(err) }));
+			this.musicFailing = true;
+			return 0;
+		}
+	}
+
 	/** Runs exactly one 20 ms step. Returns what happened (used by tests). */
 	tick() {
 		const { pcm, active, present, priority, others, frames = 1 } = this.mixer.tick();
@@ -182,7 +202,7 @@ export class AudioBridge {
 		let musicPlayed = false;
 		let gain = 1;
 		if (this.music?.active) {
-			const n = this.music.readFrame(this.musicOut, STEREO_SAMPLES_PER_FRAME_48K);
+			const n = this.readMusic();
 			if (typeof this.music.duckRatio === 'number') this.ducker.duck = this.music.duckRatio;
 			gain = this.ducker.tick(voice);
 			if (n > 0) {

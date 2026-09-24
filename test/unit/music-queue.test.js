@@ -4,9 +4,19 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
-import { PassThrough } from 'node:stream';
-import { STEREO_SAMPLES_PER_FRAME_48K } from '../../src/audio.js';
-import { LOOP_MODES, MusicPlayer, SEEK_PAST_END, decoderArgs, parseSeekTarget } from '../../src/music.js';
+import { PassThrough, Writable } from 'node:stream';
+import { PlaybackQueue, SpeakerMixer, STEREO_SAMPLES_PER_FRAME_48K } from '../../src/audio.js';
+import { AudioBridge } from '../../src/bridge.js';
+import {
+	LOOP_MODES,
+	MAX_SEEK_SECONDS,
+	MusicPlayer,
+	SEEK_OUT_OF_RANGE,
+	SEEK_PAST_END,
+	SEEK_UNSUPPORTED,
+	decoderArgs,
+	parseSeekTarget,
+} from '../../src/music.js';
 import { formatClock, parseClock } from '../../src/text.js';
 
 // The queue, the repeat modes, the shuffle, seeking and the saved queue of the music player. The decoder
@@ -469,5 +479,264 @@ describe('MusicPlayer: saving and restoring the queue', () => {
 		assert.equal(saved.at(-1).current.title, 'a');
 		assert.deepEqual(saved.at(-1).queue.map((track) => track.title), ['b']);
 		assert.equal(player.current, null);
+	});
+});
+
+// ---------------------------------------------------------------- a saved queue nobody can trust
+
+describe('MusicPlayer: a saved queue is read as data, whatever is in it', () => {
+	// Found in review: a link with a NUL byte in it passed the host check (URL() percent-encodes it), was
+	// handed to spawn() raw, and spawn() threw inside the bridge's tick: the process shut down, the shutdown
+	// saved the same link as the one playing, and the next start crashed on it again.
+	it('drops a link with a control character in it, and keeps every other link in the form the check read it in', () => {
+		const player = new MusicPlayer({ spawnImpl: () => assert.fail('nothing may be started by a restore'), log: () => {} });
+		const result = player.restore({
+			current: { kind: 'url', url: 'https://www.youtube.com/watch?v=aaa', title: 'A', duration: 100 },
+			queue: [
+				{ kind: 'url', url: 'https://www.youtube.com/watch?v=bbb\u0000', title: 'NUL' },
+				{ kind: 'url', url: 'https://evil.example\t@youtube.com/x', title: 'Tab' },
+				{ kind: 'url', url: 'https://www.youtube.com/watch?v=c\r\nd', title: 'Line break' },
+				{ kind: 'url', url: 'HTTPS://YouTube.com/watch?v=Kept', title: 'Kept' },
+			],
+		});
+		assert.deepEqual([result.restored, result.dropped], [2, 3]);
+		assert.deepEqual(
+			player.queue.map((track) => [track.title, track.url]),
+			[['Kept', 'https://youtube.com/watch?v=Kept']],
+			'the written-out form is what will be played',
+		);
+	});
+
+	it('takes nothing but the types it wrote: objects in any field neither throw nor get through', () => {
+		const dir = musicDir('a.wav');
+		const player = new MusicPlayer({ musicDir: dir, spawnImpl: () => assert.fail('nothing may be started by a restore'), log: () => {} });
+		const trap = { toString: 1, valueOf: 1 };
+		let result;
+		assert.doesNotThrow(() => {
+			result = player.restore({
+				volume: trap,
+				loop: trap,
+				current: { kind: 'url', url: 'https://youtu.be/x', title: trap, uploader: trap, duration: trap, position: trap },
+				queue: [
+					{ kind: 'url', url: trap, title: 'Link object' },
+					{ kind: 'file', url: trap, title: 'Path object' },
+					{ kind: 'file', url: path.join(dir, 'a.wav\u0000'), title: 'Path with a NUL' },
+					['not', 'an', 'entry'],
+					{ kind: 'url', url: 'https://youtu.be/y', title: 'Line\u0000one\nand two', uploader: 'Band\u0007' },
+				],
+			});
+		});
+		assert.deepEqual([result.restored, result.dropped], [2, 4]);
+		assert.deepEqual([player.current.title, player.current.duration, player.current.uploader], ['x', null, null]);
+		assert.equal(player.elapsed, 0, 'an object is no position');
+		assert.deepEqual([player.volume, player.loop], [0.35, 'off'], 'nor a volume or a loop mode');
+		assert.deepEqual([player.queue[0].title, player.queue[0].uploader], ['Line one and two', 'Band'], 'a title is kept, without its control characters');
+	});
+
+	it('keeps a saved place only where a decoder can start from it', () => {
+		const dir = musicDir('a.wav');
+		const player = new MusicPlayer({ musicDir: dir, spawnImpl: fakeSpawn(() => null).spawn, log: () => {} });
+		player.restore({
+			current: { kind: 'file', url: path.join(dir, 'a.wav'), title: 'a', position: 1e300 },
+			queue: [
+				{ kind: 'url', url: 'https://www.twitch.tv/somebody', title: 'Live', position: 1800 },
+				{ kind: 'url', url: 'https://youtu.be/known', title: 'Known', duration: 200, position: 60 },
+			],
+		});
+		assert.equal(player.elapsed, 0, 'no track is 1e300 seconds long');
+		assert.equal(player.queue[0].startAt, undefined, 'a stream of no known length starts from now');
+		assert.equal(player.queue[1].startAt, 60);
+	});
+});
+
+describe('MusicPlayer: a decoder that cannot even be started', () => {
+	it('fails the track, a moment later, when spawn() throws instead of reporting, and plays the next one', async () => {
+		const fake = fakeSpawn(() => pcmSeconds(1));
+		const failed = [];
+		const player = new MusicPlayer({
+			log: () => {},
+			onError: (track, message) => failed.push([track.title, message]),
+			spawnImpl: (binary, args, options) => {
+				if (args.at(-1) === 'https://www.youtube.com/watch?v=Broken') {
+					throw Object.assign(new TypeError('The argument must be a string without null bytes'), { code: 'ERR_INVALID_ARG_VALUE' });
+				}
+				return fake.spawn(binary, args, options);
+			},
+		});
+		player.ytDlp = 'yt-dlp';
+		player.queue.push(urlTrack('Broken', { duration: 100 }), urlTrack('Fine', { duration: 100 }));
+		assert.doesNotThrow(() => player.startNext(), 'the throw does not travel up into whoever asked for the next track');
+		assert.equal(player.parked, false, 'waiting on its failure, not parked');
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(failed.length, 1);
+		assert.equal(failed[0][0], 'Broken');
+		assert.match(failed[0][1], /null bytes/u);
+		assert.equal(player.current.title, 'Fine', 'the next track plays');
+		player.stop();
+	});
+
+	it('does the same with the real spawn(): a NUL in a link never reaches a process', async () => {
+		const failed = [];
+		const player = new MusicPlayer({ ytDlpPath: '/nonexistent/yt-dlp', ffmpegPath: '/nonexistent/ffmpeg', log: () => {}, onError: (track) => failed.push(track.title) });
+		player.ytDlp = '/nonexistent/yt-dlp';
+		player.queue.push({ kind: 'url', url: 'https://www.youtube.com/watch?v=bbb\u0000', title: 'Poisoned', id: 1 });
+		player.startNext();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.deepEqual(failed, ['Poisoned']);
+		assert.equal(player.current, null);
+	});
+
+	it('a skip before the failure lands is not undone by it', async () => {
+		const fake = fakeSpawn(() => pcmSeconds(1));
+		const failed = [];
+		const player = new MusicPlayer({
+			log: () => {},
+			onError: (track) => failed.push(track.title),
+			spawnImpl: (binary, args, options) => {
+				if (args.at(-1).endsWith('Broken')) throw new TypeError('refused');
+				return fake.spawn(binary, args, options);
+			},
+		});
+		player.ytDlp = 'yt-dlp';
+		player.queue.push(urlTrack('Broken'), urlTrack('Next'));
+		player.startNext();
+		player.skip();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.deepEqual(failed, [], 'the refused track was already gone');
+		assert.equal(player.current.title, 'Next');
+		player.stop();
+	});
+});
+
+describe('AudioBridge: a music player that throws costs the music, not the process', () => {
+	const sink = () => {
+		const written = [];
+		const out = new Writable({
+			write(chunk, _enc, cb) {
+				written.push(chunk);
+				cb();
+			},
+		});
+		return { out, written };
+	};
+
+	it('treats the throw as silence, logs it once per run of failures, and plays again when the player recovers', () => {
+		const logged = [];
+		let failing = true;
+		const music = {
+			active: true,
+			volume: 1,
+			duckRatio: 0.2,
+			readFrame: (dst, n) => {
+				if (failing) throw new TypeError('The argument must be a string without null bytes');
+				dst.fill(1000, 0, n);
+				return n;
+			},
+		};
+		const { out, written } = sink();
+		const bridge = new AudioBridge({ mixer: new SpeakerMixer(), playback: new PlaybackQueue(), output: out, getLive: () => null, music, log: (line) => logged.push(line) });
+		for (let i = 0; i < 5; i++) assert.equal(bridge.tick().music, false);
+		assert.equal(written.length, 5, 'the output kept getting its frames');
+		assert.equal(logged.length, 1, 'said once, not fifty times a second');
+		assert.match(logged[0], /null bytes/u);
+		failing = false;
+		assert.equal(bridge.tick().music, true);
+		failing = true;
+		bridge.tick();
+		assert.equal(logged.length, 2, 'a new failure after a recovery is news again');
+	});
+
+	it('keeps ticking over a link with a NUL byte in it, from resume to the failure', async () => {
+		const failed = [];
+		const player = new MusicPlayer({ ytDlpPath: '/nonexistent/yt-dlp', ffmpegPath: '/nonexistent/ffmpeg', log: () => {}, onError: (track) => failed.push(track.title) });
+		// What restore() can no longer produce, put in place by hand: the pipeline is the last line of defence.
+		player.ytDlp = '/nonexistent/yt-dlp';
+		player.current = { kind: 'url', url: 'https://www.youtube.com/watch?v=bbb\u0000', title: 'Poisoned', id: 1, duration: 10 };
+		player.paused = true;
+		const { out } = sink();
+		const bridge = new AudioBridge({ mixer: new SpeakerMixer(), playback: new PlaybackQueue(), output: out, getLive: () => null, music: player, log: () => {} });
+		assert.doesNotThrow(() => {
+			player.resume();
+			bridge.tick();
+		});
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.doesNotThrow(() => bridge.tick());
+		assert.deepEqual(failed, ['Poisoned']);
+	});
+});
+
+describe('MusicPlayer: seeking stays inside the track', () => {
+	it('will not seek a link of no known length (a live stream) anywhere but its start', () => {
+		const fake = fakeSpawn(() => null);
+		const player = new MusicPlayer({ spawnImpl: fake.spawn, log: () => {} });
+		player.ytDlp = 'yt-dlp';
+		player.queue.push({ kind: 'url', url: 'https://www.twitch.tv/somebody', title: 'Live', id: 1, duration: null });
+		player.startNext();
+		// Half an hour into the stream: "rewind 10 seconds" was -ss 1790 on a stream that starts again at
+		// now, which is half an hour of silence.
+		player.samplesRead = RATE_SAMPLES * 1800;
+		const spawnedBefore = fake.spawned.length;
+		assert.throws(() => player.seekBy(-10), new RegExp(SEEK_UNSUPPORTED));
+		assert.throws(() => player.seek(90), new RegExp(SEEK_UNSUPPORTED));
+		assert.equal(fake.spawned.length, spawnedBefore, 'no new decoder was started');
+		assert.equal(Math.round(player.elapsed), 1800, 'and nothing moved');
+		assert.equal(player.seek(0).to, 0, 'starting it over is still fine');
+		assert.equal(fake.ffmpegCalls().at(-1).args.includes('-ss'), false);
+		player.stop();
+	});
+
+	it('refuses a place that is in no track: NaN, Infinity, 1e308, more than a day', () => {
+		const dir = musicDir('a.wav');
+		const fake = fakeSpawn(() => null);
+		const player = new MusicPlayer({ musicDir: dir, spawnImpl: fake.spawn, log: () => {} });
+		player.queue.push({ kind: 'file', url: path.join(dir, 'a.wav'), title: 'a', id: 1, duration: null });
+		player.startNext();
+		const spawnedBefore = fake.spawned.length;
+		for (const value of [Number.NaN, Number.POSITIVE_INFINITY, 1e308, MAX_SEEK_SECONDS + 1]) {
+			assert.throws(() => player.seek(value), new RegExp(SEEK_OUT_OF_RANGE), String(value));
+			assert.throws(() => player.seekBy(value), new RegExp(SEEK_OUT_OF_RANGE), String(value));
+		}
+		assert.equal(fake.spawned.length, spawnedBefore);
+		assert.equal(player.elapsed, 0);
+		player.stop();
+		for (const from of [Number.POSITIVE_INFINITY, Number.NaN, 1e21]) {
+			assert.equal(decoderArgs({ kind: 'file', url: '/music/a.mp3' }, from).includes('-ss'), false, `no -ss for ${from}`);
+		}
+	});
+});
+
+describe('MusicPlayer: asking for the track a restored queue waits on', () => {
+	it('plays it, from where it was left, instead of answering that it is already playing', async () => {
+		const fake = fakeSpawn(() => pcmSeconds(1));
+		const player = new MusicPlayer({ spawnImpl: fake.spawn, log: () => {} });
+		player.ytDlp = 'yt-dlp';
+		player.restore({ current: { kind: 'url', url: 'https://www.youtube.com/watch?v=abc', title: 'Song', duration: 200, position: 42 }, queue: [] });
+		player.resolve = async () => ({ kind: 'url', url: 'https://www.youtube.com/watch?v=abc', title: 'Song', duration: 200 });
+		const result = await player.enqueue('Song');
+		assert.equal(result.duplicate, undefined);
+		assert.equal(result.startedNow, true);
+		assert.deepEqual([player.parked, player.playing, player.queue.length], [false, true, 0]);
+		const decoder = fake.ffmpegCalls().at(-1).args;
+		assert.equal(decoder[decoder.indexOf('-ss') + 1], '42.000', 'from where it was left');
+		const again = await player.enqueue('Song');
+		assert.equal(again.duplicate, true, 'once it plays, asking again is the same request twice');
+		player.stop();
+	});
+
+	it('plays one waiting behind it at once, with the restored track right behind that, and no second copy', async () => {
+		const fake = fakeSpawn(() => pcmSeconds(1));
+		const player = new MusicPlayer({ spawnImpl: fake.spawn, log: () => {} });
+		player.ytDlp = 'yt-dlp';
+		player.restore({
+			current: { kind: 'url', url: 'https://www.youtube.com/watch?v=one', title: 'One', duration: 200, position: 30 },
+			queue: [{ kind: 'url', url: 'https://www.youtube.com/watch?v=two', title: 'Two', duration: 200 }],
+		});
+		player.resolve = async () => ({ kind: 'url', url: 'https://www.youtube.com/watch?v=two', title: 'Two', duration: 200 });
+		const result = await player.enqueue('Two');
+		assert.equal(result.startedNow, true);
+		assert.equal(player.current.title, 'Two');
+		assert.deepEqual(player.queue.map((track) => track.title), ['One']);
+		assert.equal(player.snapshot().queue[0].position, 30);
+		player.stop();
 	});
 });

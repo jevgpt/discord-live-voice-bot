@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import { PassThrough } from 'node:stream';
-import { toolCallFor } from '../../src/agent.js';
+import { executeAction, toolCallFor } from '../../src/agent.js';
 import { setLocale } from '../../src/i18n/index.js';
 import enCommands from '../../src/locales/en/commands.js';
 import trCommands from '../../src/locales/tr/commands.js';
@@ -79,6 +79,41 @@ describe('queue voice commands (en)', () => {
 		}
 		assert.deepEqual(english.parseVoiceCommand('move 3 to 1', [], { text: [], voice: [] }), music({ action: 'move', from: 3, to: 1 }));
 	});
+
+	// Found in review: these commands run with no wake word, and every one of these everyday sentences ran
+	// one. A command has to be the sentence, and has to name the music where the words alone do not.
+	it('leaves people talking alone', () => {
+		const talk = [
+			"let's go back to the beginning",
+			'we should take it from the top',
+			'I will go to 3:30',
+			'I had to go back 10 seconds',
+			'ok take two out',
+			'remove the third one from the list',
+			'I keep looping this in my head',
+			'could you go to 3:30?',
+			'stop repeating yourself',
+			'I put it on repeat all day',
+			'can you repeat that one more time',
+			'add milk to the top of the list',
+		];
+		for (const line of talk) {
+			assert.equal(english.extractMusic(line), null, line);
+			assert.equal(english.parseVoiceCommand(line, [], { text: [], voice: [] }), null, line);
+		}
+	});
+
+	it('still takes the command after the bot\'s name, with a comma or without, and put as a question where it names the music', () => {
+		const aria = [{ name: 'Aria' }];
+		assert.deepEqual(english.parseVoiceCommand('Aria shuffle', aria, { text: [], voice: [] }), music({ action: 'shuffle' }));
+		assert.deepEqual(english.parseVoiceCommand('Aria, go back ten seconds', aria, { text: [], voice: [] }), music({ action: 'seek', by: -10 }));
+		assert.deepEqual(english.extractMusic('bot, go to 1:30'), music({ action: 'seek', to: 90 }), 'a wake word is a name too');
+		assert.deepEqual(english.extractMusic('can you loop this song?'), music({ action: 'loop', mode: 'track' }));
+		assert.deepEqual(english.extractMusic('could you remove song 2 please'), music({ action: 'remove', position: 2 }));
+		assert.deepEqual(english.extractMusic('go back to the beginning of the song'), music({ action: 'seek', to: 0 }));
+		assert.deepEqual(english.extractMusic('take the third song out'), music({ action: 'remove', position: 3 }));
+		assert.equal(english.extractMusic('Dana shuffle'), null, 'somebody else\'s name, with no comma, is not the bot being asked');
+	});
 });
 
 describe('queue voice commands (tr)', () => {
@@ -131,6 +166,129 @@ describe('queue voice commands (tr)', () => {
 		for (const line of ['bunu tekrarla', 'kafamı karıştır', 'on dakika sonra gel', 'bugün hava çok güzel']) {
 			assert.equal(turkish.extractMusic(line), null, line);
 		}
+	});
+
+	// Found in review: every one of these ran a command with no wake word. "Onu" (him, it) was read as "on"
+	// (ten) with a case ending, "gel" (come) as a way of going to a place in the song, and "araya koy", "hadi
+	// karıştır" and "bir daha tekrarlama" as being about music at all.
+	it('leaves people talking alone', () => {
+		const talk = [
+			'on dakikaya gelirim',
+			'beş dakikaya geliyorum',
+			'saat 9.30 a gel',
+			'akşam 8.30a gelirim',
+			'onu sıradan çıkar',
+			'onu en başa al',
+			'çayı araya koy',
+			'hadi karıştır',
+			'bir daha tekrarlama',
+			'hadi, karıştır',
+			'30 saniye geri sardım',
+			'bundan sonra kapıyı aç',
+			'bunu en başa al',
+			'biri sıradan çıkar',
+			'şarkıları karıştırdım',
+			'saat 1:30a git',
+		];
+		for (const line of talk) {
+			assert.equal(turkish.extractMusic(line), null, line);
+			assert.equal(turkish.parseVoiceCommand(line, [], { text: [], voice: [] }), null, line);
+		}
+	});
+
+	it('still takes the command after the bot\'s name, and put as a question', () => {
+		const melis = [{ name: 'Melis' }];
+		assert.deepEqual(turkish.parseVoiceCommand('Melis karıştır', melis, { text: [], voice: [] }), music({ action: 'shuffle' }));
+		assert.deepEqual(turkish.extractMusic('Melis, karıştır'), music({ action: 'shuffle' }));
+		assert.deepEqual(turkish.extractMusic('karıştırır mısın'), music({ action: 'shuffle' }));
+		assert.deepEqual(turkish.extractMusic('şarkıyı 30 saniye ileri sarar mısın'), music({ action: 'seek', by: 30 }));
+		assert.deepEqual(turkish.extractMusic('bu şarkıyı döngüye alır mısın'), music({ action: 'loop', mode: 'track' }));
+		assert.deepEqual(turkish.extractMusic('üç numaralı şarkıyı sıradan çıkar'), music({ action: 'remove', position: 3 }));
+		assert.deepEqual(turkish.extractMusic('hadi 10 saniye geri sarsana'), music({ action: 'seek', by: -10 }));
+		assert.deepEqual(turkish.extractMusic('Tarkan şımarık şarkısını araya koy'), music({ action: 'play', query: 'Tarkan şımarık', next: true }));
+		assert.deepEqual(turkish.extractMusic('bundan sonra Tarkan şımarık şarkısını aç'), music({ action: 'play', query: 'Tarkan şımarık', next: true }));
+	});
+});
+
+// Found in review: "Nothing is playing right now" was the bot's answer to every sentence the grammar took
+// for a music command while no music was on. With nothing for it to act on, a command nobody woke the bot
+// for is most likely not one.
+describe('a music command heard with no music to act on', () => {
+	// Nothing is remembered between the cases: each one runs as if it were the first.
+	const recorder = () => ({ remember: () => {}, recall: () => null });
+	const idleDeps = (overrides = {}) => ({ music: { current: null, queue: [], volume: 0.5, state: () => ({}), nowPlayingText: () => 'Nothing is playing right now.' }, recentActions: recorder(), log: () => {}, ...overrides });
+
+	it('stays quiet, and runs nothing, when it came from the grammar', async () => {
+		for (const command of [
+			music({ action: 'seek', by: -10 }),
+			music({ action: 'seek', to: 0 }),
+			music({ action: 'loop', mode: 'off' }),
+			music({ action: 'skip' }),
+			music({ action: 'pause' }),
+			music({ action: 'stop' }),
+			music({ action: 'remove', position: 10 }),
+			music({ action: 'move', from: 10, to: 1 }),
+			music({ action: 'shuffle' }),
+			music({ action: 'clear' }),
+			music({ action: 'status' }),
+			music({ action: 'volume', delta: -15 }),
+		]) {
+			assert.equal(await executeAction(command, idleDeps()), null, command.action);
+		}
+	});
+
+	it('acts on the queue commands only when something is waiting, and on the track ones only when something plays', async () => {
+		const playingNothingWaiting = idleDeps({ music: { current: { title: 'x' }, queue: [], volume: 0.5 } });
+		assert.equal(await executeAction(music({ action: 'shuffle' }), playingNothingWaiting), null);
+		const shuffle = await executeAction(music({ action: 'shuffle' }), idleDeps({ music: { current: null, queue: [{ title: 'a' }], volume: 0.5, shuffle: () => 1 } }));
+		assert.notEqual(shuffle, null, 'something is waiting');
+	});
+
+	it('still takes a request to play, answers about music that is there, and answers the model whatever it asks', async () => {
+		const { deps, player } = toolDeps();
+		const heard = { ...deps, recentActions: recorder() };
+		const play = await executeAction(music({ action: 'play', query: 'alpha' }), heard);
+		assert.equal(play.text, 'Playing: alpha.');
+		assert.match((await executeAction(music({ action: 'status' }), heard)).text, /^Playing: alpha/u);
+		player.stop();
+		const asked = await executeAction(music({ action: 'skip' }), heard, { delegated: true });
+		assert.equal(asked.text, 'There is no track to skip.', 'the model asked, and is owed an answer');
+	});
+});
+
+describe('seek_music at the tool boundary', () => {
+	it('answers a number that is no place in any track in words, and leaves the player alone', async () => {
+		const { deps, player } = toolDeps();
+		await callTool('play_music', { query: 'alpha' }, deps);
+		for (const args of [{ by: 1e308 }, { by: -1e308 }, { to: 1e308 }, { to: '999999' }, { by: 'Infinity' }]) {
+			const result = await callTool('seek_music', args, deps);
+			assert.equal(result.ok, false, JSON.stringify(args));
+			assert.match(result.spoken, /^I could not work out where to go/u, JSON.stringify(args));
+		}
+		assert.equal(player.elapsed, 0);
+		assert.equal(player.current.title, 'alpha', 'the track was not dropped');
+		player.stop();
+	});
+
+	it('will only start a live stream over, and says why in both languages', async () => {
+		const { deps, player } = toolDeps();
+		player.ytDlp = 'yt-dlp';
+		player.queue.push({ kind: 'url', url: 'https://www.twitch.tv/somebody', title: 'Live radio', id: 1, duration: null });
+		player.startNext();
+		player.samplesRead = 48_000 * 2 * 1800;
+		let result = await callTool('seek_music', { by: -10 }, deps);
+		assert.deepEqual([result.ok, result.spoken], [false, 'Live radio has no known length, a live stream most likely, so I can start it over but not jump around in it.']);
+		setLocale('tr');
+		try {
+			result = await callTool('seek_music', { to: '1:30' }, deps);
+			assert.equal(result.spoken, 'Live radio parçasının uzunluğu belli değil, büyük ihtimalle canlı yayın; baştan başlatabilirim ama içinde ileri geri gidemem.');
+		} finally {
+			setLocale('en');
+		}
+		assert.equal(Math.round(player.elapsed), 1800);
+		result = await callTool('seek_music', { to: '0' }, deps);
+		assert.equal(result.ok, true, 'starting it over is fine');
+		player.stop();
 	});
 });
 

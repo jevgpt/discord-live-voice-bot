@@ -18,6 +18,7 @@ export default {
 	log_queue_save_failed: 'music: the queue could not be saved: {error}',
 	log_queue_restored: 'music: restored the saved queue ({count} tracks), paused on "{title}" at {position}; {dropped} dropped. "Resume" carries on.',
 	log_queue_restore_empty: 'music: none of the {dropped} tracks in the saved queue can be played any more; nothing restored',
+	log_queue_restore_failed: 'music: the saved queue could not be read back ({error}); starting with an empty one, and the saved one stays on disk until music is played again',
 	// --- failure reasons; they are read out through the music tools
 	error_empty_query: 'I could not work out what to play',
 	error_no_results: 'no results found',
@@ -28,6 +29,7 @@ export default {
 	error_spawn_failed: '{binary} could not be started: {message}',
 	error_exit_code: 'exit code {code}',
 	error_ffmpeg_spawn: 'ffmpeg could not be started: {message}',
+	error_spawn_refused: 'the player refused to start it: {message}',
 	error_no_audio: 'no audio data arrived',
 	error_decode: 'decoding error ({code})',
 	// --- downloading yt-dlp (src/ytdlp.js); these reach the log, not the voice channel

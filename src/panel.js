@@ -7,9 +7,9 @@
 //
 // New events reach an open page over Server-Sent Events (/api/stream) with a metrics tick every few
 // seconds; a page that cannot hold a stream polls /api/events as it always did. Every route, the stream
-// included, sits behind the same Host check and the same token, and a page from another site cannot read
-// or hold any of them open. The page itself is in src/panelpage.js; the hour of history it draws is kept
-// by src/metrics.js.
+// included, sits behind the same Host check and the same token, and a page from another origin (another
+// port of this machine included) cannot read or hold any of them open, nor show any of it in a frame. The
+// page itself is in src/panelpage.js; the hour of history it draws is kept by src/metrics.js.
 
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
@@ -200,6 +200,9 @@ export class ActivityLog {
 		const fromMs = from ? Date.parse(from) : null;
 		const toMs = to ? Date.parse(to) : null;
 		const server = guild ? String(guild) : null;
+		// While recording is off the words are searched as they would be shown: a search that still matched
+		// words kept from before the switch would tell anybody typing guesses into it what had been said.
+		const hide = needle && this.redacting();
 		const filtered = this.events.filter((event) => {
 			if (event.id <= since) return false;
 			if (kinds.length && !kinds.includes(event.kind)) return false;
@@ -207,7 +210,8 @@ export class ActivityLog {
 			if (Number.isFinite(fromMs) && Date.parse(event.at) < fromMs) return false;
 			if (Number.isFinite(toMs) && Date.parse(event.at) > toMs) return false;
 			if (!needle) return true;
-			return `${event.whoName ?? ''} ${event.text} ${event.meta ? JSON.stringify(event.meta) : ''}`.toLowerCase().includes(needle);
+			const seen = hide ? redactEntry({ ...event }) : event;
+			return `${seen.whoName ?? ''} ${seen.text} ${seen.meta ? JSON.stringify(seen.meta) : ''}`.toLowerCase().includes(needle);
 		});
 		const take = Math.max(1, Math.min(5000, Number(limit) || 300));
 		const events = filtered.slice(-take);
@@ -590,12 +594,26 @@ export function startPanel({
 		);
 	};
 
+	// A browser also says, on its own and on every request, where a request comes from and what it is for
+	// (Fetch Metadata). The page's own reads are fetches and an EventSource from its own origin, destination
+	// "empty". Origin cannot tell the rest apart: a browser sends none for a frame, an image or a script, so
+	// eight iframes on a page served from another port of this same machine -- the same site, so even the
+	// SameSite=Strict cookie went along -- took every stream slot, and the owner's own page got 503. A
+	// request without these headers (curl, a script, an older browser) is taken as it always was.
+	const fetchedByPage = (request) => {
+		const site = request.headers['sec-fetch-site'];
+		const dest = request.headers['sec-fetch-dest'];
+		return (site === undefined || site === 'same-origin' || site === 'none') && (dest === undefined || dest === 'empty');
+	};
+
 	const hub = new StreamHub(streamOptions);
 	const redacting = () => (typeof activity.redacting === 'function' ? activity.redacting() : false);
 	/**
 	 * An event as the page gets it: its kind's label, a name for whoever it is about, and for a gate
 	 * decision its audit row. `strict` also redacts it again when recording is off now -- an event from
-	 * before the switch still has its words in the buffer, and the newer routes never hand them out.
+	 * before the switch, or read back from the file a run with recording on wrote, still has its words in
+	 * the buffer, and no route hands them out: /api/events and /api/export served them for as long as
+	 * only the stream asked for this.
 	 */
 	const present = (event, { strict = false } = {}) => {
 		const off = redacting();
@@ -679,6 +697,10 @@ export function startPanel({
 	let actualPort = port;
 	const server = http.createServer(async (request, response) => {
 		try {
+			// No page anywhere may show any of the panel inside itself: not the page, not a route, not a refusal.
+			// The page's own policy says the same (frame-ancestors) and replaces this one where it is sent.
+			response.setHeader('x-frame-options', 'DENY');
+			response.setHeader('content-security-policy', "frame-ancestors 'none'");
 			if (!hostAllowed(request.headers.host, actualPort, { own, extra })) {
 				response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
 				response.end(t('panel.local_only'));
@@ -727,7 +749,7 @@ export function startPanel({
 					response.end(t('panel.not_found'));
 					return;
 				}
-				if (!originAllowed(request)) {
+				if (!originAllowed(request) || !fetchedByPage(request)) {
 					response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
 					response.end(t('panel.local_only'));
 					return;
@@ -775,7 +797,7 @@ export function startPanel({
 			}
 			if (url.pathname === '/api/events') {
 				const payload = activity.list({ ...filters(), limit: Math.min(500, Number(url.searchParams.get('limit') ?? 200) || 200) });
-				payload.events = payload.events.map((event) => present(event));
+				payload.events = payload.events.map((event) => present(event, { strict: true }));
 				payload.state = state();
 				response.writeHead(200, JSON_HEADERS);
 				response.end(JSON.stringify(payload));
@@ -829,11 +851,14 @@ export function startPanel({
 			}
 			if (url.pathname === '/api/export') {
 				const payload = activity.list({ ...filters(), since: 0, limit: 5000 });
+				// The events as they are kept, without the page's additions; but a copy, redacted again while
+				// recording is off, like every other route (see present).
+				const off = redacting();
 				response.writeHead(200, {
 					'content-type': 'application/x-ndjson; charset=utf-8',
 					'content-disposition': `attachment; filename="activity-${new Date().toISOString().slice(0, 10)}.jsonl"`,
 				});
-				response.end(payload.events.map((event) => JSON.stringify(event)).join('\n'));
+				response.end(payload.events.map((event) => JSON.stringify(off ? redactEntry({ ...event }) : event)).join('\n'));
 				return;
 			}
 			if (url.pathname === '/healthz') {

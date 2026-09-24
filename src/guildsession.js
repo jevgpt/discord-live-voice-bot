@@ -107,6 +107,8 @@ export class GuildSession {
 		this.savedTracks = savedTracks;
 		// The music queues kept between runs (src/queuestore.js), one entry per server; null keeps nothing.
 		this.queueStore = queueStore;
+		// Set when this server's saved queue could not be read back: see restoreMusicQueue.
+		this.musicQueueHeld = false;
 		// Which guild an event came from is stamped on HERE, once, instead of at every push() call site:
 		// the panel needs it to tell two servers apart, and a new call site cannot forget it.
 		const guildLabel = guild?.name ?? guild?.id ?? null;
@@ -842,6 +844,12 @@ export class GuildSession {
 	saveMusicQueue() {
 		const guildId = this.guild?.id;
 		if (!this.queueStore || !this.music || !guildId) return;
+		// After a restore that failed, the entry on disk is the only copy of that queue left: an empty player
+		// is not written over it. The first time the player holds music again, that is the queue from then on.
+		if (this.musicQueueHeld) {
+			if (!this.music.current && !this.music.queue.length) return;
+			this.musicQueueHeld = false;
+		}
 		this.queueStore.put(String(guildId), this.music.snapshot());
 		this.queueStore.save().catch((err) => this.log(t('music.log_queue_save_failed', { error: err.message })));
 	}
@@ -856,7 +864,18 @@ export class GuildSession {
 		if (!this.queueStore || !this.music || !guildId) return null;
 		const saved = this.queueStore.get(String(guildId));
 		if (!saved) return null;
-		const result = this.music.restore(saved);
+		let result;
+		try {
+			result = this.music.restore(saved);
+		} catch (err) {
+			// A saved queue is not worth a server that does not come up. This ran inside start(), so a throw
+			// here rejected it, and the stop() after that wrote the empty player over the file. The server
+			// starts with no queue instead, and the one on disk is kept (saveMusicQueue) for another look.
+			this.musicQueueHeld = true;
+			this.music.stop();
+			this.log(t('music.log_queue_restore_failed', { error: err?.message ?? String(err) }));
+			return null;
+		}
 		if (result.current) {
 			this.log(
 				t('music.log_queue_restored', {

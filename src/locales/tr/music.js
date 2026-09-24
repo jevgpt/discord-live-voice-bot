@@ -18,6 +18,7 @@ export default {
 	log_queue_save_failed: 'müzik: sıra kaydedilemedi: {error}',
 	log_queue_restored: 'müzik: kayıtlı sıra geri yüklendi ({count} parça), "{title}" {position} noktasında duraklatılmış bekliyor; {dropped} parça çıkarıldı. "Devam" denince sürer.',
 	log_queue_restore_empty: 'müzik: kayıtlı sıradaki {dropped} parçanın hiçbiri artık çalınamıyor; hiçbir şey geri yüklenmedi',
+	log_queue_restore_failed: 'müzik: kayıtlı sıra geri okunamadı ({error}); boş bir sırayla başlanıyor, kayıtlı olan yeniden müzik çalınana kadar diskte kalıyor',
 	// --- failure reasons; they are read out through the music tools
 	error_empty_query: 'ne çalacağımı anlayamadım',
 	error_no_results: 'sonuç bulunamadı',
@@ -28,6 +29,7 @@ export default {
 	error_spawn_failed: '{binary} çalıştırılamadı: {message}',
 	error_exit_code: 'çıkış kodu {code}',
 	error_ffmpeg_spawn: 'ffmpeg çalıştırılamadı: {message}',
+	error_spawn_refused: 'çalar bunu başlatmayı reddetti: {message}',
 	error_no_audio: 'ses verisi gelmedi',
 	error_decode: 'çözme hatası ({code})',
 	// --- downloading yt-dlp (src/ytdlp.js); these reach the log, not the voice channel

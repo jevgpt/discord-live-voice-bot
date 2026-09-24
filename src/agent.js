@@ -86,9 +86,30 @@ export function toolCallFor(command, deps) {
 	return { name, args };
 }
 
-/** Runs the command; returns { speak, text, ok } (speak=false means the model should stay quiet). */
-export async function executeAction(command, deps) {
+// The music commands that act on what is waiting; every other one but "play" acts on the track playing now.
+const QUEUE_ACTIONS = new Set(['shuffle', 'clear', 'move', 'remove']);
+
+/**
+ * A music command heard with nothing for it to act on. Those words were matched with no wake word, and
+ * with no music at all they are far more likely somebody talking than somebody asking: "stop repeating",
+ * "go back ten seconds", "a bit quieter". The bot answered every one of them with "Nothing is playing
+ * right now". A request to play is the one that needs no music to be there already.
+ */
+function actsOnNothing(command, music) {
+	if (command?.type !== 'music' || command.action === 'play') return false;
+	if (QUEUE_ACTIONS.has(command.action)) return !music?.queue?.length;
+	return !music?.current;
+}
+
+/**
+ * Runs the command; returns { speak, text, ok } (speak=false means the model should stay quiet), or null
+ * when there is nothing to run. A command is taken to come from the voice grammar -- matched in what
+ * somebody said, no model involved -- unless `delegated` says the model asked for it; only the model is
+ * owed an answer when there is no music for a music command to act on.
+ */
+export async function executeAction(command, deps, { delegated = false } = {}) {
 	const { recentActions } = deps;
+	if (!delegated && actsOnNothing(command, deps.music)) return null;
 	// A read is remembered per person: whether a channel may be read is a question about who asked, and
 	// the owner's reading of #staff handed back from the cache to a guest asking half a minute later is
 	// #staff read to the guest.
@@ -142,7 +163,7 @@ export function createTaskRunner(deps) {
 		const text = deps.getUserText();
 		const route = routeDelegation(text ?? '', deps.store.list(), deps.channelLists());
 		if (route.kind === 'action') {
-			const result = await executeAction(route.command, deps);
+			const result = await executeAction(route.command, deps, { delegated: true });
 			if (!result) return { mode: 'commentary', text: t('agent.request_unclear') };
 			// Switching character rebuilds the session; no answer is sent to the old delegation.
 			if (!result.speak && !result.reused) return { mode: 'none', text: '' };

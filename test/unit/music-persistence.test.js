@@ -182,6 +182,62 @@ describe('GuildSession: the saved music queue', () => {
 		second.session.stop();
 	});
 
+	// Found in review: {"title": {"toString": 1}} in the file made restore() throw inside start(), so the
+	// server never came up, and the stop() after that wrote the empty player over the saved queue.
+	it('a saved queue that cannot be read back costs the queue, not the server, and is not written over', async () => {
+		const file = path.join(tmp(), 'music-queues.json');
+		const saved = { volume: 0.4, loop: 'off', current: { kind: 'url', url: 'https://youtu.be/one', title: 'One' }, queue: [] };
+		const store = new QueueStore(file);
+		store.put('alpha', saved);
+		await store.save();
+		const { session, lines } = makeSession({ queueStore: await new QueueStore(file).load() });
+		session.music.restore = () => {
+			throw new TypeError('Cannot convert object to primitive value');
+		};
+		assert.doesNotThrow(() => session.restoreMusicQueue());
+		assert.equal(session.music.current, null, 'it starts with no queue');
+		assert.ok(lines.some((line) => line.includes('could not be read back') && line.includes('Cannot convert')), lines.join(' | '));
+
+		session.music.setVolume(0.9);
+		session.stop();
+		await session.queueStore.flush();
+		assert.equal(JSON.parse(readFileSync(file, 'utf8')).guilds.alpha.current.title, 'One', 'neither a change to nothing nor the shutdown wrote over it');
+
+		// The first time the player holds music again, that is the queue from then on.
+		const next = makeSession({ queueStore: await new QueueStore(file).load() });
+		next.session.music.restore = () => {
+			throw new TypeError('still broken');
+		};
+		next.session.restoreMusicQueue();
+		next.session.music.queue.push({ kind: 'url', url: 'https://youtu.be/two', title: 'Two', id: 2 });
+		next.session.music.setVolume(0.5);
+		await next.session.queueStore.flush();
+		assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')).guilds.alpha.queue.map((track) => track.title), ['Two']);
+		next.session.music.queue.length = 0;
+		next.session.stop();
+	});
+
+	it('restores a hand-edited queue with objects where the text should be, instead of failing the start', async () => {
+		const file = path.join(tmp(), 'music-queues.json');
+		writeFileSync(
+			file,
+			JSON.stringify({
+				guilds: {
+					alpha: {
+						volume: 0.5,
+						current: { kind: 'url', url: 'https://youtu.be/one', title: { toString: 1 }, duration: { valueOf: 1, toString: 1 } },
+						queue: [{ kind: 'url', url: 'https://youtu.be/two\u0000', title: 'Poisoned' }],
+					},
+				},
+			}),
+		);
+		const { session } = makeSession({ queueStore: await new QueueStore(file).load() });
+		const result = session.restoreMusicQueue();
+		assert.deepEqual([result.restored, result.dropped], [1, 1]);
+		assert.deepEqual([session.music.current.url, session.music.current.duration], ['https://youtu.be/one', null]);
+		session.stop();
+	});
+
 	it('without a store (the tests, MUSIC=0 builds) a change is simply not kept, and nothing is restored', () => {
 		const { session } = makeSession({ queueStore: null });
 		assert.equal(session.restoreMusicQueue(), null);
