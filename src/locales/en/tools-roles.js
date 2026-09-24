@@ -14,6 +14,7 @@ export default {
 	revoked_self: 'I took the {role} role off myself.',
 	risky_role: 'The {role} role carries {permissions}; I do not hand out roles like that by voice. It has to be given in Discord itself.',
 	fuzzy_role_question: 'I could not match the role "{name}" exactly; the closest is {role}. Should I give {role} to {who}?',
+	unheard_role_question: 'I did not hear the name {role} in what you said. Should I give {role} to {who}?',
 	log_risky_refused: '[tool] grant refused: {role} carries {permissions}',
 	// The permissions that keep a role from being handed out by voice, as Discord's settings name them.
 	risky_permission_names: {
@@ -27,6 +28,14 @@ export default {
 		ModerateMembers: 'Timeout Members',
 		MentionEveryone: 'Mention @everyone',
 		ManageMessages: 'Manage Messages',
+		MoveMembers: 'Move Members',
+		MuteMembers: 'Mute Members',
+		DeafenMembers: 'Deafen Members',
+		ManageNicknames: 'Manage Nicknames',
+		ManageThreads: 'Manage Threads',
+		ManageEvents: 'Manage Events',
+		ManageGuildExpressions: 'Manage Expressions',
+		ViewAuditLog: 'View Audit Log',
 	},
 	update_failed: 'I could not update that role',
 	default_name: 'new-role',

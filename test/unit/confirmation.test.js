@@ -10,6 +10,7 @@ import { LocalBrain } from '../../src/localbrain.js';
 import { ActivityLog } from '../../src/panel.js';
 import { ChannelReader } from '../../src/reader.js';
 import { callTool, toolOutput } from '../../src/tools.js';
+import { checkConfirmation } from '../../src/tools/helpers.js';
 
 // The two-step confirmation used to take the model's word for it: a second call with confirm:true and
 // the same target was the whole of the "answer". On the realtime path the backend is told to carry on
@@ -80,22 +81,88 @@ describe('readAnswer: what counts as a yes', () => {
 			assert.deepEqual(readAnswer(text), { yes: false, no: false }, text);
 		}
 		assert.deepEqual(readAnswer("yes... no, don't do it"), { yes: true, no: true }, 'a yes taken back is both');
-		assert.deepEqual(readAnswer('yes, cancel it'), { yes: true, no: false }, 'the verb of the action is not a no');
+	});
+
+	// Each of these used to be read as a plain yes, and a ban went through on it.
+	it('hears the no in an English answer that also holds a yes word', () => {
+		for (const text of [
+			"you shouldn't do it",
+			"I didn't say yes",
+			"I can't confirm that",
+			"I won't say yes to that",
+			'I cannot confirm that',
+			'okay, forget it',
+			'ok stop',
+			'okay, leave it',
+			'sure, skip it',
+			'do it... actually leave it',
+			'yeah right, as if',
+			"that isn't correct",
+			'okay, cancel',
+			'absolutely not',
+		]) {
+			const answer = readAnswer(text);
+			assert.equal(answer.no, true, text);
+		}
+		// A curly apostrophe is the same apostrophe.
+		assert.equal(readAnswer('you shouldn’t do it').no, true);
+		assert.deepEqual(readAnswer('I can do it, yes'), { yes: true, no: false }, '"can" on its own is not "can\'t"');
+	});
+
+	it('takes the verb of the request as the verb it is, and as a no anywhere else', () => {
+		const cancel = ['cancel', 'delete', 'remove', 'scrap'];
+		assert.deepEqual(readAnswer('yes, cancel it', { action: cancel }), { yes: true, no: false }, 'to "should I cancel movie night?"');
+		assert.equal(readAnswer('yes, cancel it').no, true, 'to "should I ban Sam?" it takes the yes back');
+		assert.deepEqual(readAnswer('yes forget it', { action: ['forget', 'delete'] }), { yes: true, no: false }, 'to "should I forget that note?"');
+		assert.equal(readAnswer("yes, cancel it... no don't", { action: cancel }).no, true, 'a real no still counts');
 	});
 
 	it('reads Turkish answers, with the negative glued onto the verb', () => {
 		setLocale('tr');
 		try {
-			for (const text of ['evet', 'evet yap', 'tamam', 'tamamdır', 'olur', 'aynen', 'onaylıyorum', 'onayla', 'yapabilirsin', 'evet iptal et']) {
+			for (const text of ['evet', 'evet yap', 'tamam', 'tamamdır', 'olur', 'aynen', 'onaylıyorum', 'onayla', 'yapabilirsin', 'evet hemen sil', 'tamam banla gitsin']) {
 				assert.deepEqual(readAnswer(text), { yes: true, no: false }, text);
 			}
-			for (const text of ['hayır', 'yok', 'vazgeç', 'dur', 'bekle', 'yapma', 'onaylamıyorum', 'olmaz', 'yapmıyoruz']) {
+			for (const text of ['hayır', 'yok', 'vazgeç', 'dur', 'bekle', 'yapma', 'onaylamıyorum', 'olmaz', 'yapmıyoruz', 'değil', 'kalsın', 'boş ver']) {
 				assert.deepEqual(readAnswer(text), { yes: false, no: true }, text);
 			}
 			assert.equal(readAnswer('tamamen yanlış anladın').yes, false, '"tamamen" is not "tamam"');
 			assert.equal(readAnswer('yapay zeka').yes, false, '"yapay" is not "yap"');
 			assert.deepEqual(readAnswer('hayırlı olsun aslanım'), { yes: false, no: false }, 'a blessing and a pet name are not a no');
 			assert.deepEqual(readAnswer('evet... yok yapma'), { yes: true, no: true });
+		} finally {
+			setLocale('en');
+		}
+	});
+
+	// The negative sits on the verb the answer is about, which is in no word list: "tamam, banlama" is
+	// "okay, do not ban", and it used to be read as the "okay".
+	it('hears the no on whatever verb a Turkish answer negates', () => {
+		setLocale('tr');
+		try {
+			for (const text of [
+				'tamam, banlama',
+				'peki silme',
+				'peki silme o zaman',
+				'tamam atma onu',
+				'kesinlikle değil',
+				'tamam değil',
+				'tamam kalsın',
+				'peki, kalsın',
+				'evet ama yasaklama',
+				'tamam kilitleme',
+				'yapmasan iyi olur',
+				'tamam yapmayın',
+				'olur ama silmeyelim',
+				'tamam, iptal',
+			]) {
+				assert.equal(readAnswer(text).no, true, text);
+			}
+			assert.deepEqual(readAnswer('evet iptal et', { action: ['iptal', 'sil', 'kaldir'] }), { yes: true, no: false }, 'to "etkinliği iptal edeyim mi?"');
+			assert.deepEqual(readAnswer('evet unut gitsin', { action: ['unut', 'sil'] }), { yes: true, no: false }, 'to "notu unutayım mı?"');
+			// The verbal noun is built the same way and is not a negative: "I want you to delete it".
+			assert.equal(readAnswer('evet silmeni istiyorum').no, false);
+			assert.equal(readAnswer('tamam, silmen lazım').no, false);
 		} finally {
 			setLocale('en');
 		}
@@ -190,7 +257,7 @@ describe('two-step confirmation: the owner has to say yes', () => {
 		assert.deepEqual(banned, ['1']);
 	});
 
-	it('takes a no as a no, and still hears a yes said after it', async () => {
+	it('takes a no as the end of the question, and asks again only when asked to', async () => {
 		const a = new SpeakerAttribution({ ownerId: 'owner' });
 		const { guild, banned } = makeGuild();
 		const deps = voiceDeps(a, guild);
@@ -198,12 +265,76 @@ describe('two-step confirmation: the owner has to say yes', () => {
 		const no = await callTool('ban_member', { member: 'Jane', confirm: true }, pinned(deps, talk(a, 'owner', "no don't")));
 		assert.equal(no.ok, false);
 		assert.match(no.spoken, /said no/);
+		// What used to happen: the no put the question again from there, and the next thing the owner said
+		// with an "okay" in it was a yes to a ban they had just refused.
+		const later = await callTool('ban_member', { member: 'Jane', confirm: true }, pinned(deps, talk(a, 'owner', 'okay thanks')));
+		assert.equal(later.ok, false, later.spoken);
+		assert.equal(later.needs_confirmation, true, 'the question is put again, from scratch');
+		assert.deepEqual(banned, []);
+		// A yes taken back in the same breath ends the question as well.
 		const unclear = await callTool('ban_member', { member: 'Jane', confirm: true }, pinned(deps, talk(a, 'owner', 'yes no wait')));
 		assert.equal(unclear.ok, false, 'a yes taken back in the same breath is not a yes');
 		assert.deepEqual(banned, []);
+		// Asked again, and answered yes after the question was put: that is a yes.
+		await callTool('ban_member', { member: 'Jane' }, pinned(deps, talk(a, 'owner', 'actually, ban Jane')));
 		const yes = await callTool('ban_member', { member: 'Jane', confirm: true }, pinned(deps, talk(a, 'owner', 'okay go ahead')));
 		assert.equal(yes.ok, true, yes.spoken);
 		assert.deepEqual(banned, ['1']);
+	});
+
+	it('does not act on an answer whose no sits on its verb', async () => {
+		for (const [locale, request, answer] of [
+			['en', 'ban Jane', "you shouldn't do it"],
+			['en', 'ban Jane', "I didn't say yes"],
+			['en', 'ban Jane', 'okay, forget it'],
+			['en', 'ban Jane', 'ok stop'],
+			['tr', 'Jane i banla', 'tamam, banlama'],
+			['tr', 'Jane i banla', 'kesinlikle değil'],
+			['tr', 'Jane i banla', 'tamam kalsın'],
+		]) {
+			setLocale(locale);
+			try {
+				const a = new SpeakerAttribution({ ownerId: 'owner' });
+				const { guild, banned } = makeGuild();
+				const deps = voiceDeps(a, guild, { commandSpeaker: undefined, isOwnerActive: () => true, ownerSaidRecently: () => true, ownerMatch: (w) => w[0] });
+				await callTool('ban_member', { member: 'Jane' }, pinned(deps, talk(a, 'owner', request)));
+				const result = await callTool('ban_member', { member: 'Jane', confirm: true }, pinned(deps, talk(a, 'owner', answer)));
+				assert.equal(result.ok, false, `${locale}: "${answer}" -> ${result.spoken}`);
+				assert.deepEqual(banned, [], answer);
+			} finally {
+				setLocale('en');
+			}
+		}
+	});
+
+	it('reads a "not" that reached the transcript in two pieces', () => {
+		const a = new SpeakerAttribution({ ownerId: 'owner' });
+		talk(a, 'owner', 'ban Jane');
+		const mark = a.mark();
+		const from = a.audioMs;
+		for (let i = 0; i < 40; i++) a.onFrame({ priority: true, active: ['owner'], present: ['owner'] });
+		const middle = from + 400;
+		a.noteTranscript(' yes I didn', { startMs: from, endMs: middle });
+		a.noteTranscript("'t mean that", { startMs: middle, endMs: a.audioMs });
+		const said = a.ownerSpeechSince(mark, { turn: a.markTurn() })?.text ?? '';
+		assert.match(said, /\bnot\b/, said);
+		assert.equal(readAnswer(said).no, true);
+	});
+
+	it('takes "yes, cancel it" as a yes to cancelling an event, and as no yes to a ban', async () => {
+		const answerTo = (key, answer) => {
+			const a = new SpeakerAttribution({ ownerId: 'owner' });
+			const deps = voiceDeps(a, makeGuild().guild);
+			const call = (confirm) => checkConfirmation(pinned(deps, a.turn), { key, target: 'x', confirm, question: 'really?' });
+			talk(a, 'owner', 'do the thing');
+			call(undefined);
+			talk(a, 'owner', answer);
+			return call(true);
+		};
+		assert.deepEqual(answerTo('cancel_event', 'yes, cancel it'), { ok: true });
+		assert.deepEqual(answerTo('untrusted:cancel_event', 'yes, cancel it'), { ok: true }, 'and to the question put about it after a read');
+		assert.equal(answerTo('ban_member', 'yes, cancel it').ok, undefined);
+		assert.equal(answerTo('cancel_event', "yes, cancel it... no, don't").ok, undefined);
 	});
 
 	it('does not take a yes said before the question as the answer to it', async () => {

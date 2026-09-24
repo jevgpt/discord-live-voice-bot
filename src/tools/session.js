@@ -25,6 +25,8 @@ export const tools = [
 			'Changes the character/persona of the voice assistant. The live session is rebuilt with the new character. Owner and server ' +
 			'administrators only.',
 		parameters: P.obj({ name: P.str('Name of a saved character') }, ['name']),
+		// Anybody but an administrator goes through the owner gate, which can ask the owner first.
+		asks: true,
 		async handler(args, deps, { name }) {
 			const character = findCharacter(deps.store.list(), String(args.name ?? ''));
 			if (!character) return { ok: false, spoken: t('tools.session.character_not_found', { name: args.name }) };

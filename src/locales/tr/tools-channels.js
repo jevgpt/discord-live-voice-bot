@@ -37,6 +37,8 @@ export default {
 	target_role: '{role} rolü',
 	target_member: '{name} kişisi',
 	unknown_permissions: 'Şu izinleri tanımadım: {unknown}. Bildiklerim: {help}.',
+	risky_permission: '{permissions} iznini sesle vermiyorum, ne kanalda ne başka yerde; bunun Discord üzerinden elle ayarlanması gerekiyor. Geri almak istersen alabilirim.',
+	log_risky_permission_refused: '[araç] #{channel}: {target} için {permissions} reddedildi (sesle verilmez)',
 	reset_everyone_blocked: 'Herkes için hangi izinleri sıfırlayayım? Gizli kanal açığa çıkmasın diye hepsini birden kaldırmıyorum.',
 	permissions_reset: '#{channel} kanalında {target} için özel izinleri kaldırdım.',
 	which_permission: 'Hangi izni açayım ya da kapatayım? Örneğin: bağlan, gör, yaz, konuş.',

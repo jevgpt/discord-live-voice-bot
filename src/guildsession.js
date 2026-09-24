@@ -28,7 +28,7 @@ import { LocalTts, firstClause, splitSentences } from './localtts.js';
 import { MemberIndex } from './matcher.js';
 import { Ducker, MusicPlayer } from './music.js';
 import { SessionUsage } from './quota.js';
-import { normalize, parseBool, stripDictationTail, stripSpokenPrefix } from './text.js';
+import { normalize, parseBool, safeContext, stripDictationTail, stripSpokenPrefix } from './text.js';
 import { callTool, toolDefinitions, toolOutput } from './tools.js';
 import { VoiceSession } from './voice.js';
 import { toolDescription } from './tools/index.js';
@@ -159,19 +159,6 @@ const SETTING_ALIASES = tRaw('runtime.setting_aliases') ?? {};
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/**
- * Cleans a value that came from a channel member (a display name, a transcript, a saved note) before it
- * is handed to the model. Newlines and control characters are what let such a value pretend to be a new
- * instruction line, so they collapse to spaces; notes keep their line breaks because they are a list.
- */
-function safeContext(text, { keepLines = false } = {}) {
-	const raw = String(text ?? '');
-	const cleaned = keepLines ? raw.replace(/\r/gu, '') : raw.replace(/[\r\n]+/gu, ' ');
-	// Control characters are stripped on purpose: they are the other way a value can fake a new line.
-	// oxlint-disable-next-line no-control-regex
-	return cleaned.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, '').trim();
-}
-
 export class GuildSession {
 	/**
 	 * @param {object} services the process-wide services; everything that belongs to this one guild is
@@ -226,7 +213,19 @@ export class GuildSession {
 		// Which guild an event came from is stamped on HERE, once, instead of at every push() call site:
 		// the panel needs it to tell two servers apart, and a new call site cannot forget it.
 		const guildLabel = guild?.name ?? guild?.id ?? null;
-		const tagGuild = (event) => ({ ...event, meta: { ...(event.meta ?? null), guild: guildLabel } });
+		const guildId = guild?.id ? String(guild.id) : null;
+		const tagGuild = (event) => {
+			const meta = { ...(event.meta ?? null), guild: guildLabel };
+			// A voice line also carries the server's id and the voice channel it was said in. A summary keeps a
+			// line only for people who could have been in that channel (src/summary.js); without the channel a
+			// line from a staff voice room was quoted to anybody who asked what was said today.
+			if (event.kind === 'voice') {
+				if (guildId && meta.guildId === undefined) meta.guildId = guildId;
+				const voiceChannelId = this.voice?.channelId ?? this.channelId ?? null;
+				if (voiceChannelId && meta.channelId === undefined) meta.channelId = String(voiceChannelId);
+			}
+			return { ...event, meta };
+		};
 		this.activity = {
 			push: (event) => activity.push(tagGuild(event)),
 			// summarize() reads the shared event buffer through this wrapper.
@@ -555,22 +554,23 @@ export class GuildSession {
 			joinVoice: (channel) => (session.joinChannel ? session.joinChannel(channel) : session.joinVoice(channel)),
 			leaveVoice: (options) => session.leaveVoice(options),
 			// Who is asking: the person whose line produced the request, read from the turn the request is
-			// pinned to. lastSpeakerId is only Discord's latest speaking event -- whoever made any sound while
-			// the model worked -- and a guest's request to write or clear a note passed as the owner's own
-			// whenever the owner made a sound at that moment. It is still the answer when there is no line to
-			// go on. These are methods rather than arrow functions so that a copy of the deps carrying a pinned
-			// `currentTurn` (the realtime and local paths make one per request) reads its own turn.
+			// pinned to, and only when the audio is sure of them (see speakerOfTurn). lastSpeakerId is only
+			// Discord's latest speaking event -- whoever made any sound while the model worked -- and it is no
+			// longer the answer even when there is no line to go on: a guest's request passed as the owner's
+			// own whenever the owner made a sound at the right moment. Nobody is judged as @everyone. These are
+			// methods rather than arrow functions so that a copy of the deps carrying a pinned `currentTurn`
+			// (the realtime and local paths make one per request) reads its own turn.
 			currentSpeakerId() {
 				const turn = typeof this?.currentTurn === 'function' ? this.currentTurn() : session.attribution.turn;
-				return speakerOfTurn(session.attribution, turn ?? null, session.lastSpeakerId ?? null);
+				return speakerOfTurn(session.attribution, turn ?? null);
 			},
 			currentSpeakerName() {
-				const id = typeof this?.currentSpeakerId === 'function' ? this.currentSpeakerId() : session.lastSpeakerId;
+				const id = typeof this?.currentSpeakerId === 'function' ? this.currentSpeakerId() : null;
 				return id ? session.nameFor(id) : null;
 			},
 			currentSpeakerChannel() {
-				const id = typeof this?.currentSpeakerId === 'function' ? this.currentSpeakerId() : session.lastSpeakerId;
-				return session.guild?.voiceStates.cache.get(id ?? '')?.channel ?? null;
+				const id = typeof this?.currentSpeakerId === 'function' ? this.currentSpeakerId() : null;
+				return id ? (session.guild?.voiceStates.cache.get(id)?.channel ?? null) : null;
 			},
 			currentVoiceChannel: () => (session.voice.channelId ? (session.guild?.channels.cache.get(session.voice.channelId) ?? null) : null),
 			// Did the bot owner speak just now? Admin commands go through this gate.
@@ -1612,7 +1612,7 @@ export class GuildSession {
 		if (straddles) from = buf.lastEnd;
 		if (Number.isFinite(endMs) && (!Number.isFinite(buf.lastEnd) || endMs > buf.lastEnd)) buf.lastEnd = endMs;
 		if (speaker === 'user') this.noteWindowShape(straddles);
-		let part = { text, startMs: from, endMs, id: null, sure: false, confidence: 'unsure', ids: [] };
+		let part = { text, startMs: from, endMs, id: null, sure: false, owner: false, confidence: 'unsure', ids: [] };
 		if (speaker === 'user') {
 			// ONE resolution per delta, made where the audio track lives and then reused for the record, for
 			// the model's context and for the run. Resolving it again downstream is how two parts of the code
@@ -1625,7 +1625,7 @@ export class GuildSession {
 			// The reply gate asks its question as soon as the pieces stop for a moment (see judgeEarly).
 			if (this.earlyJudgeTimer) clearTimeout(this.earlyJudgeTimer);
 			this.earlyJudgeTimer = setTimeout(() => this.judgeEarly(), JEV_SETTLE_MS);
-			if (hit) part = { text, startMs: from, endMs, id: hit.id, sure: hit.sure, confidence: hit.confidence, ids: hit.ids };
+			if (hit) part = { text, startMs: from, endMs, id: hit.id, sure: hit.sure, owner: hit.owner === true, confidence: hit.confidence, ids: hit.ids };
 			// From the audio position to the wall clock: when did the user actually stop speaking?
 			const lag = Number.isFinite(endMs) ? Math.max(0, this.attribution.audioMs - endMs) : 0;
 			this.latency.userSpeechEnd(Date.now() - lag);
@@ -1807,14 +1807,19 @@ export class GuildSession {
 				}),
 			);
 		}
+		// Whether the line is the owner's by the gate's own test (the owner alone for most of it), which is
+		// a stricter question than whose name it carries; runVoiceCommand asks it before acting as the owner.
+		const spoken = run.parts.filter((part) => String(part.text ?? '').trim());
+		const ownerAlone = span ? this.attribution.speakerAt(span[0], span[1]) === true : spoken.length > 0 && spoken.every((part) => part.owner === true);
 		// No position on any part (or nothing in the track for it): fall back on what the deltas said.
-		if (!hit || (hit.heardMs <= 0 && !hit.id)) return { id: run.id, mixed: run.mixed, candidates: runCandidates(run) };
+		if (!hit || (hit.heardMs <= 0 && !hit.id)) return { id: run.id, mixed: run.mixed, owner: ownerAlone, candidates: runCandidates(run) };
 		const candidates = hit.ids.length ? hit.ids : runCandidates(run);
 		return {
 			id: hit.id ?? null,
 			// A run that swallowed somebody else's words stays mixed however clean the audio looks: the
 			// text really does hold two people.
 			mixed: run.mixed || hit.confidence !== 'sure',
+			owner: ownerAlone,
 			candidates,
 		};
 	}
@@ -1854,15 +1859,18 @@ export class GuildSession {
 		// flagged mixed, so refusing them here left the deterministic route permanently unused.
 		if (item.mixed && command.type !== 'quiet' && !HARMLESS_VOICE_ACTIONS.has(command.type)) return refuse();
 		const lineTurn = this.lineTurn(item);
-		const speakerId = String(item.id);
+		// The line's own speaker, rather than whoever Discord last reported as speaking: the music queue,
+		// the memory notes and "move me" all act under this identity. A mixed line runs its harmless command
+		// for nobody in particular, though: "read the staff channel" is harmless only as far as the person
+		// asking may read it, and on a line two voices share, whose request it was is exactly what is not
+		// known. The owner's name goes only on a line that was the owner's alone (see speakerOfTurn).
+		const speakerId = item.mixed || (this.isOwnerId(item.id) && item.owner !== true) ? null : String(item.id);
 		void executeAction(command, {
 			...this.taskDeps,
 			currentTurn: () => lineTurn,
-			// The line's own speaker, rather than whoever Discord last reported as speaking: the music queue,
-			// the memory notes and "move me" all act under this identity.
 			currentSpeakerId: () => speakerId,
-			currentSpeakerName: () => this.nameFor(speakerId),
-			currentSpeakerChannel: () => this.guild?.voiceStates.cache.get(speakerId)?.channel ?? null,
+			currentSpeakerName: () => (speakerId ? this.nameFor(speakerId) : null),
+			currentSpeakerChannel: () => (speakerId ? (this.guild?.voiceStates.cache.get(speakerId)?.channel ?? null) : null),
 		})
 			.then((result) => {
 				if (result?.speak && result.text && !result.reused) this.say(result.text);
@@ -1993,21 +2001,24 @@ export class GuildSession {
 		const name = safeContext(this.speakerLabel(userId));
 		const owner = this.isOwnerId(userId);
 		// An "instructions" note: the model takes it as hard fact ("thinking" notes are too weak in conversation).
-		const lines = [
+		this.live.appendContext(
+			'instructions',
 			t('runtime.speaker_context', {
 				name,
 				ownerNote: owner ? t('runtime.speaker_context_owner') : '',
 				ownerAnswer: owner ? t('runtime.speaker_context_owner_answer') : '',
 			}),
-		];
+		);
+		// The notes go on "thinking", as hintMemory sends them, and never on "instructions": anybody can
+		// have a note kept about themselves in words of their choosing, and the channel the model treats as
+		// hard fact is no place for them, however they are framed.
 		if (this.memory && !this.memoryHinted.has(userId)) {
 			const summary = this.memory.summaryFor(userId);
 			if (summary) {
 				this.memoryHinted.add(userId);
-				lines.push(t('runtime.memory_notes', { name, summary: safeContext(summary, { keepLines: true }) }));
+				this.live.appendContext('thinking', t('runtime.memory_notes', { name, summary: safeContext(summary, { keepLines: true }) }));
 			}
 		}
-		this.live.appendContext('instructions', lines.join('\n'));
 		if (this.cfg.transcripts) this.log(t('runtime.log_context_speaker', { name, owner: owner ? t('runtime.owner_tag') : '' }));
 	}
 

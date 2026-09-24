@@ -152,6 +152,7 @@ export default {
 	read_failed: 'Okuyamadım: {reason}',
 	reading: '#{channel} kanalından {count} mesaj okuyorum{suffix}.',
 	reading_new_suffix: ' (yeni)',
+	reading_private: 'Sesli kanaldaki herkes #{channel} kanalını okuyamıyor, o yüzden yalnızca sana gösteriyorum:\n{text}',
 
 	status_voice: 'Sesli kanal: {channel}',
 	status_voice_none: 'değil',

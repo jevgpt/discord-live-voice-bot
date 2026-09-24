@@ -37,6 +37,7 @@ import { SavedTracks } from './savedtracks.js';
 import { CharacterStore } from './store.js';
 import { summarizeConversation } from './summary.js';
 import { callTool, toolDefinitions } from './tools.js';
+import { roomMayRead } from './tools/access.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = path.join(here, '..', 'data');
@@ -399,9 +400,25 @@ function buildContext(session) {
 		summarize: (options) => session?.deps().summarize(options),
 		// Events from an interaction are tagged with the guild they belong to, like the session's own.
 		activity: (event) => (session ? session.activity.push(event) : activity.push(event)),
-		// Marked as a slash command: commands.js has already checked the person who ran it against their
-		// own Discord account, so a tool must not measure the request against whoever last spoke in voice.
-		callTool: (name, args) => callTool(name, args, { ...session.deps(), fromSlashCommand: true }),
+		// Marked as a slash command, and asked for by the person who ran it: commands.js has checked them
+		// against their own Discord account, so a tool measures the request against them and not against
+		// whoever last spoke in voice. Being allowed to run /read is not being allowed into every channel,
+		// so read_messages still asks whether THEY may read the one named. No voice turn is in flight
+		// either: the rule about other people's words belongs to the voice turn that read them.
+		callTool: (name, args, { userId = null } = {}) => {
+			const invoker = userId ? String(userId) : null;
+			const deps = session.deps();
+			return callTool(name, args, {
+				...deps,
+				fromSlashCommand: true,
+				currentTurn: () => null,
+				currentSpeakerId: () => invoker,
+				currentSpeakerName: () => (invoker ? session.nameFor(invoker) : null),
+				currentSpeakerChannel: () => (invoker ? (session.guild?.voiceStates.cache.get(invoker)?.channel ?? null) : null),
+			});
+		},
+		// May everybody in the bot's voice channel read this channel? /read speaks what it read to the room.
+		roomMayRead: (channel) => (session ? roomMayRead(session.deps(), channel) : Promise.resolve(true)),
 		joinVoice: (channel, options) => joinChannel(channel, options),
 		leaveVoice: (options) => session?.leaveVoice(options),
 		// /status reports every server, this one first.

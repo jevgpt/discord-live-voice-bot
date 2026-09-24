@@ -7,7 +7,7 @@
 //   recording switch are limited to the owner / ADMIN_USER_IDS / ADMIN_ROLE_IDS / members with the
 //   "Manage Server" permission (src/auth.js). /join in a server outside GUILD_ID/VOICE_TARGETS builds a
 //   new session there, so it takes the owner or ADMIN_USER_IDS (mayStartSession). /summary covers only
-//   the channels the member could read themselves, unless they pass the gate above.
+//   the channels the member could read themselves (the owner excepted), and so does /read.
 // Voice commands (picked up from what is said in the channel) -- the phrasings themselves live in
 //   src/locales/<code>/grammar.js, so every language brings its own:
 //   "switch to the <name> character"     -> change character (the live session is rebuilt)
@@ -330,12 +330,15 @@ async function denyUnlessMayStartSession(interaction, ctx) {
 
 /**
  * Who a written summary is for (see summarizeConversation in src/summary.js). The log it is made from
- * holds every text channel of the server, so a member gets the channels they could read themselves; the
- * people the bot already trusts with /read get all of them. It is this server only either way. A DM has
- * no server to judge a member by, so there it is null: the command answers that it needs a server.
+ * holds every text channel of the server, so a member gets the channels they could read themselves, and
+ * that includes the admins: /read holds them to their own account as well, and Manage Server is a
+ * permission people hand out more freely than the moderators' channel. Only the owner gets everything.
+ * It is this server only either way. A DM has no member to judge, so there it is null (the owner aside):
+ * the command answers that it needs a server.
  */
 export function summaryAudience(interaction, cfg) {
-	if (interactionPrivileged(interaction, cfg)) return { everything: true };
+	const userId = interaction.user?.id ? String(interaction.user.id) : null;
+	if (userId && cfg?.ownerId && userId === String(cfg.ownerId)) return { everything: true };
 	if (!interaction.guildId || !interaction.member) return null;
 	return { readers: [interaction.member] };
 }
@@ -405,7 +408,7 @@ async function handleCommand(interaction, ctx) {
 			const channel = interaction.options.getChannel('channel', true);
 			const message = interaction.options.getString('message', true);
 			await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-			const result = await ctx.callTool('send_message', { channel, text: message });
+			const result = await ctx.callTool('send_message', { channel, text: message }, { userId: interaction.user?.id ?? null });
 			await interaction.editReply({
 				content: result.ok ? t('commands.sent', { channel: channel.name }) : t('commands.send_failed', { reason: result.spoken }),
 			});
@@ -416,9 +419,21 @@ async function handleCommand(interaction, ctx) {
 			const channel = interaction.options.getChannel('channel', true);
 			const count = interaction.options.getInteger('count') ?? ctx.config.readLimit;
 			await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-			const result = await ctx.callTool('read_messages', { channel, count });
+			// Read as the person who ran the command: read_messages checks that THEY may read the channel.
+			const result = await ctx.callTool('read_messages', { channel, count }, { userId: interaction.user?.id ?? null });
 			if (!result.ok) {
 				await interaction.editReply({ content: t('commands.read_failed', { reason: result.spoken }) });
+				return;
+			}
+			// Said out loud, it is read to everybody in the voice channel, and the person who ran /read may be
+			// able to read a channel that somebody listening may not. Then it is shown to them alone, in this
+			// reply, instead: the simplest answer that leaks nothing, and they still get what they asked for.
+			// (Refusing would work as well and help nobody; waiting for the room to empty is not an answer.)
+			const aloud = typeof ctx.roomMayRead === 'function' ? await ctx.roomMayRead(channel) : true;
+			if (!aloud) {
+				await interaction.editReply({
+					content: t('commands.reading_private', { channel: channel.name, text: String(result.spoken ?? '') }).slice(0, 1900),
+				});
 				return;
 			}
 			ctx.say(result.spoken);
@@ -500,7 +515,7 @@ async function handleCommand(interaction, ctx) {
 				return;
 			}
 			await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-			const result = await ctx.callTool(tool, args);
+			const result = await ctx.callTool(tool, args, { userId: interaction.user?.id ?? null });
 			await interaction.editReply({ content: result.spoken ?? (result.ok ? t('commands.ok') : t('commands.failed')) });
 			return;
 		}

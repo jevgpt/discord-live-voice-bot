@@ -147,6 +147,42 @@ describe('/join in a server without a session', () => {
 	});
 });
 
+describe('/read: read as the person who ran it, and aloud only to people who may hear it', () => {
+	function readContext({ roomMayRead }) {
+		const { ctx } = context({ session: true });
+		const calls = [];
+		const said = [];
+		ctx.callTool = async (name, args, options) => (calls.push({ name, args, options }), { ok: true, spoken: 'mod1: ban Sam tomorrow', data: { count: 1 } });
+		ctx.say = (text) => said.push(text);
+		ctx.roomMayRead = async () => roomMayRead;
+		return { ctx, calls, said };
+	}
+	const staff = { id: 'staff', name: 'staff', type: ChannelType.GuildText };
+
+	it('hands the person who ran it to the tool, which reads what THEY may read', async () => {
+		const { ctx, calls } = readContext({ roomMayRead: true });
+		const interaction = slash('read', { guildId: 'home', userId: 'helper', channel: staff });
+		await handleInteraction(interaction, ctx);
+		assert.deepEqual(calls.map((call) => [call.name, call.options]), [['read_messages', { userId: 'helper' }]]);
+	});
+
+	it('reads it out when everybody in the voice channel may read the channel', async () => {
+		const { ctx, said } = readContext({ roomMayRead: true });
+		const interaction = slash('read', { guildId: 'home', userId: 'owner', channel: staff });
+		await handleInteraction(interaction, ctx);
+		assert.deepEqual(said, ['mod1: ban Sam tomorrow']);
+	});
+
+	it('shows it to the person alone when somebody listening may not read it', async () => {
+		const { ctx, said } = readContext({ roomMayRead: false });
+		const interaction = slash('read', { guildId: 'home', userId: 'owner', channel: staff });
+		await handleInteraction(interaction, ctx);
+		assert.deepEqual(said, [], 'nothing was said to the room');
+		assert.match(interaction.replies.at(-1).content, /ban Sam tomorrow/);
+		assert.match(interaction.replies.at(-1).content, /for you only/);
+	});
+});
+
 describe('/summary: who it is written for', () => {
 	it('a member gets the channels they can read: the command hands their member object on', async () => {
 		const { ctx, summaries } = context({ session: true });
@@ -159,13 +195,13 @@ describe('/summary: who it is written for', () => {
 		assert.equal(interaction.replies.at(-1).content, 'the summary');
 	});
 
-	it('the people /read already trusts get every channel of this server', () => {
+	it('the owner gets every channel of this server; an admin gets what their own account can read', () => {
 		assert.deepEqual(summaryAudience(slash('summary', { guildId: 'home', userId: 'owner' }), cfg), { everything: true });
 		const manager = member('manager', { manager: true });
-		assert.deepEqual(summaryAudience(slash('summary', { guildId: 'home', userId: 'manager', who: manager }), cfg), { everything: true });
+		assert.deepEqual(summaryAudience(slash('summary', { guildId: 'home', userId: 'manager', who: manager }), cfg), { readers: [manager] });
 		const moderator = member('moderator', { roles: ['mod-role'] });
 		assert.deepEqual(summaryAudience(slash('summary', { guildId: 'home', userId: 'moderator', who: moderator }), cfg), {
-			everything: true,
+			readers: [moderator],
 		});
 	});
 

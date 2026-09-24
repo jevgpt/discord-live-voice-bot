@@ -68,6 +68,29 @@ describe('English gate words: whole words and their forms', () => {
 		for (const [name, text] of cases) assert.equal(said(text, group(name)), true, `${name}: ${text}`);
 	});
 
+	it('hears the commands that went quiet when the words stopped being prefixes', () => {
+		assert.equal(said('configure the bot', group('setting')), true);
+		assert.equal(said('can you reconfigure nothing', group('setting')), false);
+		assert.equal(said('get rid of the role', gateOf('delete_role')), true);
+		assert.equal(said('get rid of movie night', gateOf('cancel_event')), true);
+		assert.equal(said('that riddle again', gateOf('delete_role')), false);
+	});
+
+	it('does not hear a command in a set phrase that holds the word', () => {
+		const cases = [
+			['kick', 'we kick off at nine'],
+			['kick', 'the match kicked off late'],
+			['kick', 'boot up the computer first'],
+			['kick', 'it is booting up'],
+			['timeout', 'silence is golden'],
+			['setting', 'silence is golden'],
+		];
+		for (const [name, text] of cases) assert.equal(said(text, group(name)), false, `${name}: ${text}`);
+		assert.equal(said('kick him off the server', group('kick')), true, 'the verb with its object between is still the verb');
+		assert.equal(said('boot him', group('kick')), true);
+		assert.equal(said('silence him', group('timeout')), true);
+	});
+
 	it('keeps a pinned entry to the word and its plural', () => {
 		assert.equal(said('make a new room', group('channel')), true);
 		assert.equal(said('two rooms', group('channel')), true);
@@ -117,6 +140,41 @@ describe('Turkish gate words: prefixes without their look-alikes', () => {
 				['cancel', 'etkinliği iptal et'],
 			];
 			for (const [name, text] of cases) assert.equal(said(text, group(name)), true, `${name}: ${text}`);
+		});
+	});
+
+	// The verbal noun is made with the same -ma/-me as the negative, and is asking for the thing, not
+	// refusing it: "I want you to delete the channel".
+	it('hears the command in its verbal noun, which only looks like the negative', () => {
+		inTurkish(() => {
+			const cases = [
+				['delete', 'kanalı silmeni istiyorum'],
+				['delete', 'rolü silmen lazım'],
+				['delete', 'mesajları silmeni rica ediyorum'],
+				['delete', 'silmesini istiyorum'],
+				['delete', 'silmeyi unutma'],
+				['ban', 'onu banlaman lazım'],
+			];
+			for (const [name, text] of cases) assert.equal(said(text, group(name)), true, `${name}: ${text}`);
+		});
+	});
+
+	// "Banlama" is "do not ban": the negative sits after the -la that makes a verb of "ban", and the
+	// prefix match on "ban" never looked past it.
+	it('does not hear a command in its negative, after a verb made from a noun either', () => {
+		inTurkish(() => {
+			const cases = [
+				['ban', 'onu banlama'],
+				['ban', 'yasaklama onu'],
+				['channel', 'sakın kilitleme'],
+				['delete', 'silmesin'],
+				['delete', 'silmeyin lütfen'],
+				['delete', 'pardon, silme'],
+				['pin', 'sabitleme'],
+			];
+			for (const [name, text] of cases) assert.equal(said(text, group(name)), false, `${name}: ${text}`);
+			assert.equal(said('banlamak istiyorum', group('ban')), true, 'the infinitive is not a negative');
+			assert.equal(said('kanalı kilitle', group('channel')), true);
 		});
 	});
 });

@@ -4,7 +4,9 @@
 // The panel log is ONE buffer for the whole process: every text channel of every server the bot serves
 // lands in it, moderator channels included, next to the voice transcripts of every session. A summary is
 // therefore always cut down to the server it was asked in (guildScope) and, message by message, to the
-// channels the people it is for could read themselves (channelFilterFor). Both fail closed: an event that
+// channels the people it is for could read themselves (channelFilterFor). A voice line is placed by the
+// voice channel it was said in, and the bot's own spoken lines, which repeat whatever it was asked to
+// read, are left out for anybody not trusted with everything. All of it fails closed: an event that
 // cannot be placed is left out rather than guessed into somebody's summary.
 
 import { ChannelType, PermissionFlagsBits } from 'discord.js';
@@ -16,13 +18,15 @@ const KINDS = new Set(['voice', 'channel', 'dm']);
 // Reading a channel's past is what a summary does, so both are needed: View Channel alone shows only
 // what arrives while the member is looking.
 const READ_HISTORY = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory];
+// What was said in a voice channel was heard by the people who could go in: see it, and connect.
+const HEAR_VOICE = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect];
 
 /**
- * May this reader read the channel's history? `reader` is a GuildMember; null stands for somebody the bot
- * cannot place (no speaker known, a member it has not cached) and is judged as @everyone, the least
- * anyone in the server can see.
+ * May this reader read the channel's history (or, for a voice line, have been in the voice channel)?
+ * `reader` is a GuildMember; null stands for somebody the bot cannot place (no speaker known, a member it
+ * has not cached) and is judged as @everyone, the least anyone in the server can see.
  */
-function mayRead(channel, reader) {
+function mayRead(channel, reader, need = READ_HISTORY) {
 	const subject = reader ?? channel.guild?.roles?.everyone ?? null;
 	if (!subject) return false;
 	let permissions = null;
@@ -32,7 +36,7 @@ function mayRead(channel, reader) {
 		// Something that is not a whole member (a raw interaction payload) cannot be judged, so it reads nothing.
 		return false;
 	}
-	if (!permissions?.has?.(READ_HISTORY)) return false;
+	if (!permissions?.has?.(need)) return false;
 	// A private thread takes more than its parent's permissions: being in it, or managing threads.
 	if (channel.type === ChannelType.PrivateThread) {
 		if (permissions.has(PermissionFlagsBits.ManageThreads)) return true;
@@ -42,23 +46,25 @@ function mayRead(channel, reader) {
 }
 
 /**
- * The text channels a summary may quote for `readers`: a channel message is kept only when EVERY one of
- * them may read that channel, because a spoken summary is heard by the whole room and not just the person
- * who asked. An empty list is judged as @everyone. A channel the server no longer has (deleted, or never
- * cached) and a message logged without its channel id are left out.
- * @returns {(channelId: string|null) => boolean}
+ * The channels a summary may quote for `readers`: a channel message is kept only when EVERY one of them
+ * may read that channel, because a spoken summary is heard by the whole room and not just the person who
+ * asked. A voice line is kept the same way, by its voice channel, which they must all be able to see and
+ * connect to (`{ voice: true }`). An empty list is judged as @everyone. A channel the server no longer
+ * has (deleted, or never cached) and an event logged without its channel id are left out.
+ * @returns {(channelId: string|null, options?: { voice?: boolean }) => boolean}
  */
 export function channelFilterFor(guild, readers = []) {
 	const list = readers?.length ? readers : [null];
 	const verdicts = new Map();
-	return (channelId) => {
+	return (channelId, { voice = false } = {}) => {
 		if (!channelId) return false;
 		const id = String(channelId);
-		if (!verdicts.has(id)) {
+		const key = `${voice ? 'voice' : 'text'}:${id}`;
+		if (!verdicts.has(key)) {
 			const channel = guild?.channels?.cache?.get?.(id) ?? null;
-			verdicts.set(id, Boolean(channel) && list.every((reader) => mayRead(channel, reader)));
+			verdicts.set(key, Boolean(channel) && list.every((reader) => mayRead(channel, reader, voice ? HEAR_VOICE : READ_HISTORY)));
 		}
-		return verdicts.get(id);
+		return verdicts.get(key);
 	};
 }
 
@@ -85,7 +91,8 @@ export function guildScope(guild, client = null) {
 
 /**
  * Turns the events to be summarised into plain text (maxChars at most). `inGuild` and `canRead` narrow it
- * down to one server and to the channels the audience may read; summarizeConversation always passes both.
+ * down to one server and to the channels the audience may read; summarizeConversation always passes both,
+ * and passes no `canRead` only for an audience trusted with everything.
  */
 export function transcriptFromEvents(
 	events,
@@ -96,9 +103,15 @@ export function transcriptFromEvents(
 		if (!KINDS.has(event.kind)) continue;
 		if (event.kind === 'dm' && !includeDm) continue;
 		if (inGuild && !inGuild(event)) continue;
-		// Voice lines stay: they were said out loud in this server's voice channel. Channel messages are
-		// the ones that can come from a room the audience is not allowed into.
 		if (canRead && event.kind === 'channel' && !canRead(event.meta?.channelId ?? null)) continue;
+		if (canRead && event.kind === 'voice') {
+			// A voice line is from a room too: a voice channel the audience may not be able to go into, placed
+			// by the channel id GuildSession stamps on it (a line without one cannot be placed and stays out).
+			// And the bot's own lines are left out altogether: what it said out loud includes whatever it was
+			// asked to read, and "In #mod-chat, mod1 wrote..." read to the owner is #mod-chat by another road.
+			if (event.direction === 'out') continue;
+			if (!canRead(event.meta?.channelId ?? null, { voice: true })) continue;
+		}
 		if (sinceMs && Date.parse(event.at) < sinceMs) continue;
 		const text = String(event.text ?? '').trim();
 		if (!text) continue;

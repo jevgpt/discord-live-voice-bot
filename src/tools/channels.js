@@ -24,6 +24,7 @@ import {
 import { t, tList } from '../i18n/index.js';
 import { normalize } from '../text.js';
 import { P, defineTool } from './registry.js';
+import { riskyFlagsOf, riskyLabels } from './roles.js';
 
 /** Channel permission target: everyone (@everyone), a role or a single person. */
 /**
@@ -308,6 +309,16 @@ export const tools = [
 				return { ok: false, spoken: t('tools.channels.unknown_permissions', { unknown: unknown.join(', '), help: PERMISSION_HELP }) };
 			}
 			const reset = args.reset === true;
+			// A moderator's powers in this channel (Manage Messages, Move Members, Mention @everyone...) given
+			// to a person or a role are a moderator role by another road, and grant_role refuses those by
+			// voice (RISKY_ROLE_PERMISSIONS in roles.js). Taking them away, or putting them back to default,
+			// is still fine.
+			const risky = reset ? [] : riskyFlagsOf(allow.flags);
+			if (risky.length) {
+				const permissions = riskyLabels(risky);
+				deps.log?.(t('tools.channels.log_risky_permission_refused', { channel: channel.name, target: label, permissions }));
+				return { ok: false, denied: true, spoken: t('tools.channels.risky_permission', { permissions }) };
+			}
 			const touched = [...new Set([...allow.flags, ...deny.flags])];
 			const reason = t('tools.helpers.audit_reason');
 			try {

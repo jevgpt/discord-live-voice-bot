@@ -6,6 +6,7 @@ import { balanceCodeFences, normalize, stripDictationTail } from '../text.js';
 import {
 	SlidingLimiter,
 	WORDS,
+	askAfterUntrustedRead,
 	askConfirmation,
 	authorizedBotSet,
 	checkConfirmation,
@@ -22,7 +23,7 @@ import {
 	selfIdOf,
 	textChannels,
 } from './helpers.js';
-import { canReadChannel, requesterId, requesterIsOwner } from './access.js';
+import { canReadChannel, everyoneMayRead, requesterId, requesterIsOwner } from './access.js';
 import { P, defineTool } from './registry.js';
 import { pickBest } from '../matcher.js';
 import { findChannelByName } from '../text.js';
@@ -87,12 +88,14 @@ function refuseDirectRead(deps) {
  * into, staff rooms included, and reading one aloud hands its contents to whoever asked, so the asker
  * has to be able to read it on their own: see it and read its history. The owner may read anything the
  * bot can; somebody who cannot be named gets what @everyone can read.
+ *
+ * A slash command is judged the same way, by the Discord account that ran it: src/index.js hands that
+ * person over as the one asking. Being allowed to run /read (an administrator, a holder of Manage
+ * Server) is not the same as being allowed into every channel; only the owner reads everything.
+ * list_pins asks the same question (src/tools/reactions.js).
  * @returns {Promise<object|null>} the refusal, or null when reading is fine
  */
-async function readRefusal(deps, channel) {
-	// A slash command is not a voice: commands.js checked the person who ran it against their own
-	// Discord account, and whoever last spoke in the voice channel has nothing to do with it.
-	if (deps.fromSlashCommand === true) return null;
+export async function readRefusal(deps, channel) {
 	if (requesterIsOwner(deps)) return null;
 	if (isDirect(channel)) return refuseDirectRead(deps);
 	const speakerId = requesterId(deps);
@@ -104,6 +107,18 @@ async function readRefusal(deps, channel) {
 		denied: true,
 		spoken: speakerId ? t('tools.messaging.read_not_allowed', { channel: label }) : t('tools.messaging.read_not_allowed_unknown', { channel: label }),
 	};
+}
+
+/**
+ * Reading what @everyone cannot (a staff channel, a private conversation) after other people's words were
+ * read in the same turn waits for the owner's spoken yes (see askAfterUntrustedRead). The owner may read
+ * #mod-chat; what is in question is whether a message the bot has just read chose to have it read, on
+ * its way to being posted where everybody can see it.
+ * @returns {Promise<object|null>} the question, or null to go ahead
+ */
+export async function askBeforePrivateRead(deps, channel, tool) {
+	if (!isDirect(channel) && (await everyoneMayRead(deps, channel))) return null;
+	return askAfterUntrustedRead(deps, tool);
 }
 
 /**
@@ -180,7 +195,9 @@ export const tools = [
 			},
 			['text'],
 		),
-		async handler(args, deps) {
+		// Open to everybody, and still the way out for anything read in the same turn (askAfterUntrustedRead).
+		asks: true,
+		async handler(args, deps, { name }) {
 			let channel = resolveTextChannel(deps, args.channel);
 			if (!channel && !args.channel) channel = sendableFallback(deps);
 			if (!channel) {
@@ -189,6 +206,10 @@ export const tools = [
 					spoken: args.channel ? t('tools.messaging.channel_not_found', { name: args.channel }) : t('tools.messaging.no_send_channel'),
 				};
 			}
+			// After other people's words were read in this turn, a message goes out only on the owner's yes:
+			// "post what #mod-chat says in #general" is exactly the order such a message would give.
+			const asked = askAfterUntrustedRead(deps, name);
+			if (asked) return asked;
 			const text = balanceCodeFences(stripDictationTail(String(args.text ?? '')));
 			const resolved = await resolveMentions(deps, args.mentions ?? []);
 			const warnings = [...resolved.warnings];
@@ -288,9 +309,17 @@ export const tools = [
 			all: P.bool("true = read the channel's latest messages with no new-messages-only restriction (older messages included)"),
 			before: P.str('With all:true: read the messages before this message id (pagination; the oldest_id value of the previous result)'),
 		}),
-		async handler(args, deps) {
-			// Refused before the person is looked up: finding them opens a private channel with them.
-			if (hasValue(args.dm) && deps.fromSlashCommand !== true && !requesterIsOwner(deps)) return refuseDirectRead(deps);
+		// A staff channel or a private conversation, read after other people's words in the same turn, waits
+		// for the owner's yes (askBeforePrivateRead).
+		asks: true,
+		async handler(args, deps, { name }) {
+			// Refused before the person is looked up: finding them opens a private channel with them. And for
+			// the same reason the owner is asked, when this turn has read other people's words, before one is.
+			if (hasValue(args.dm)) {
+				if (!requesterIsOwner(deps)) return refuseDirectRead(deps);
+				const asked = askAfterUntrustedRead(deps, name);
+				if (asked) return asked;
+			}
 			// "Read the DM I just sent you" was answered with "I could not tell which channel to read":
 			// this tool was the only one in the family that could not look at a private conversation, while
 			// the bot was perfectly able to send one.
@@ -298,6 +327,8 @@ export const tools = [
 			if (!channel) return { ok: false, spoken: t('tools.messaging.no_read_channel') };
 			const refusal = await readRefusal(deps, channel);
 			if (refusal) return refusal;
+			const asked = await askBeforePrivateRead(deps, channel, name);
+			if (asked) return asked;
 			const count = Number.isFinite(Number(args.count)) && Number(args.count) > 0 ? Number(args.count) : deps.cfg.readLimit;
 			const label = channelLabel(channel);
 			// An id the model made up reads as "there is nothing older", which is a lie about the channel
@@ -367,6 +398,8 @@ export const tools = [
 			},
 			['to', 'text'],
 		),
+		// A DM to somebody else goes through the owner gate, and any DM after other people's words were read.
+		asks: true,
 		async handler(args, deps, { name }) {
 			const member = await findMember(deps, String(args.to ?? ''));
 			const text = balanceCodeFences(stripDictationTail(String(args.text ?? '')));
@@ -379,6 +412,11 @@ export const tools = [
 				const denied = await ownerGate(deps, DM_WORDS, name);
 				if (denied) return denied;
 			}
+			// Written to somebody alone, with nothing to say who asked: after other people's words were read
+			// in this turn, that waits for the owner's yes too, whoever it goes to. (The owner gate above has
+			// already put this question when it ran; the owner's yes to it is not asked for twice.)
+			const asked = askAfterUntrustedRead(deps, name);
+			if (asked) return asked;
 			const now = deps.now?.() ?? Date.now();
 			const perTarget = deps.cfg?.dmPerTargetPerMinute ?? 3;
 			const perMinute = deps.cfg?.dmPerMinute ?? 10;
@@ -437,7 +475,10 @@ export const tools = [
 
 			const count = Math.min(Math.max(Number(args.count ?? 1) || 1, 1), 20);
 			const ownOnly = args.own === true;
-			const fromMember = args.from ? await findMember(deps, String(args.from)) : null;
+			const fromMember = hasValue(args.from) ? await findMember(deps, String(args.from)) : null;
+			// "Delete Sam's last five" with a Sam nobody could find used to go on without the filter: five
+			// messages of whoever wrote last, and a question that no longer named anybody.
+			if (hasValue(args.from) && !fromMember) return { ok: false, spoken: t('tools.messaging.member_not_found', { name: String(args.from) }) };
 			try {
 				const fetched = await channel.messages.fetch({ limit: Math.max(count * 3, 10) });
 				// Discord hands them back newest-first; we sort ourselves rather than trusting that order.

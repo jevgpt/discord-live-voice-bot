@@ -6,40 +6,55 @@
 // bot can see and send far more than any member can, so every answer here is measured against the person
 // asking, never against the bot.
 
-import { PermissionFlagsBits } from 'discord.js';
+import { ChannelType, PermissionFlagsBits } from 'discord.js';
 import { isPrivileged } from '../auth.js';
 
 // How far back the line behind a turn may lie. A tool call can arrive well after the model started
 // answering (the backend thinks first, and a second call follows the first), and the attribution keeps a
-// minute of lines. The gate's fifteen-second window would drop the line and hand the question back to
-// Discord's speaking events, which is the guess this replaces.
+// minute of lines. The gate's fifteen-second window would drop the line and leave the request unnamed.
 const TURN_LINE_WINDOW_MS = 60_000;
 
 /**
- * The person whose line produced a turn: the last line heard before the model started answering, as
- * the attribution named it. That is the name the model itself was given for the line, so a tool acting
- * for "me" acts for the same person the model thinks it is talking to.
+ * The person whose request a turn answers: the last line heard before the model started answering, and
+ * whatever ran straight into it, as the attribution named them. That is the name the model itself was
+ * given for the line, so a tool acting for "me" acts for the same person the model thinks it is talking to.
  *
- * `fallback` (Discord's last speaking event) is used only when there is no line to go on: no turn, a
- * transcript still on its way, or nothing heard in the window. A line that names nobody (two voices at
- * once) gives null, not the fallback: the model was told the line could not be named, and guessing from
- * speaking events there is how a cough from somebody else became the author of a request.
- * @param {{ lastUtterance?: Function, transcriptLagging?: Function, ownerId?: string|null }|null} attribution
+ * Whatever this names reads staff channels, recalls notes and writes to people as that person, and the
+ * owner's name reads everything, so it names somebody only when the audio is sure, and nobody otherwise:
+ *  - a line that was only leaning towards somebody (the owner alone for part of it and a guest talking
+ *    over the rest) names nobody, although the owner's voice is in it;
+ *  - the owner's name goes only on a line that was the owner's by the gate's own test (alone in the
+ *    audio), never on one that merely carries the owner's id;
+ *  - a request whose lines are two people's (a guest asks, the owner says "hmm" before the model
+ *    answers) names nobody: whose request it was cannot be heard;
+ *  - no turn, a transcript still on its way, nothing heard: nobody. Discord's last speaking event used to
+ *    stand in here, and it is whoever made a sound while the model worked, a cough included.
+ * Nobody is judged as @everyone by every check that asks, which is the least anybody present can do.
+ * @param {{ requestSpeaker?: Function, lastUtterance?: Function, transcriptLagging?: Function, ownerId?: string|null }|null} attribution
  * @param {object|null} turn the pinned turn ({ at, audioMs })
- * @param {string|null} fallback
  * @returns {string|null}
  */
-export function speakerOfTurn(attribution, turn, fallback = null) {
-	const guess = fallback === null || fallback === undefined || fallback === '' ? null : String(fallback);
-	if (!turn || typeof attribution?.lastUtterance !== 'function') return guess;
+export function speakerOfTurn(attribution, turn) {
+	if (!turn || !attribution) return null;
+	const lineOf =
+		typeof attribution.requestSpeaker === 'function'
+			? (options) => attribution.requestSpeaker(options)
+			: typeof attribution.lastUtterance === 'function'
+				? (options) => attribution.lastUtterance(options)
+				: null;
+	if (!lineOf) return null;
 	// The transcript of the line that triggered the turn has not arrived yet, so the newest line on
 	// record belongs to an earlier turn and would name whoever spoke before.
-	if (typeof attribution.transcriptLagging === 'function' && attribution.transcriptLagging({ turn })) return guess;
-	const line = attribution.lastUtterance({ turn, windowMs: TURN_LINE_WINDOW_MS });
-	if (!line) return guess;
-	if (line.id) return String(line.id);
-	if (line.owner && attribution.ownerId) return String(attribution.ownerId);
-	return null;
+	if (typeof attribution.transcriptLagging === 'function' && attribution.transcriptLagging({ turn })) return null;
+	const line = lineOf({ turn, windowMs: TURN_LINE_WINDOW_MS });
+	if (!line || line.shared || line.sure === false) return null;
+	const ownerId = attribution.ownerId ? String(attribution.ownerId) : null;
+	if (line.owner) return ownerId ?? (line.id ? String(line.id) : null);
+	if (!line.id) return null;
+	// The owner's id on a line that was not the owner's alone: the owner's authority does not go on it,
+	// and neither does anybody else's name.
+	if (ownerId && String(line.id) === ownerId) return null;
+	return String(line.id);
 }
 
 /** The person asking, as an id string, or null when nobody can be named. */
@@ -86,10 +101,15 @@ export async function requesterPrivileged(deps) {
  * reading a channel out loud hands its contents to whoever asked, so the asker's own permissions decide.
  * Somebody who cannot be named, or cannot be found on the server, is measured against @everyone: what
  * anybody in the room could read anyway. A channel that carries no permissions to check is refused.
+ *
+ * A private thread answers permissionsFor with its parent's permissions, which everybody in the parent
+ * channel has; the thread itself is for the people in it. So it also takes membership, or Manage Threads
+ * (the same rule src/summary.js reads a thread by).
  */
 export async function canReadChannel(deps, channel, userId) {
 	if (typeof channel?.permissionsFor !== 'function') return false;
-	const subject = (await memberFor(deps, userId)) ?? deps?.guild?.roles?.everyone ?? null;
+	const member = await memberFor(deps, userId);
+	const subject = member ?? deps?.guild?.roles?.everyone ?? null;
 	if (!subject) return false;
 	let permissions = null;
 	try {
@@ -98,5 +118,35 @@ export async function canReadChannel(deps, channel, userId) {
 		permissions = null;
 	}
 	if (typeof permissions?.has !== 'function') return false;
-	return Boolean(permissions.has(PermissionFlagsBits.ViewChannel) && permissions.has(PermissionFlagsBits.ReadMessageHistory));
+	if (!permissions.has(PermissionFlagsBits.ViewChannel) || !permissions.has(PermissionFlagsBits.ReadMessageHistory)) return false;
+	if (channel.type === ChannelType.PrivateThread) {
+		if (permissions.has(PermissionFlagsBits.ManageThreads)) return true;
+		if (!member?.id) return false;
+		const id = String(member.id);
+		if (channel.members?.cache?.has?.(id)) return true;
+		// The thread's member list is not always cached; asking Discord answers a member who is not in it
+		// with an error, which is a no.
+		if (typeof channel.members?.fetch !== 'function') return false;
+		return Boolean(await channel.members.fetch(id).catch(() => null));
+	}
+	return true;
+}
+
+/** Could anybody on the server read this channel: is it open to @everyone? */
+export async function everyoneMayRead(deps, channel) {
+	return canReadChannel(deps, channel, null);
+}
+
+/**
+ * May everybody in the bot's voice channel read this channel? Whatever the bot says there is heard by all
+ * of them, so reading a channel out loud is reading it to each of them. Nobody in the room (the bot is not
+ * in one) holds nobody back.
+ */
+export async function roomMayRead(deps, channel) {
+	const room = typeof deps?.currentVoiceChannel === 'function' ? deps.currentVoiceChannel() : null;
+	for (const member of room?.members?.values?.() ?? []) {
+		if (!member || member.user?.bot) continue;
+		if (!(await canReadChannel(deps, channel, member.id))) return false;
+	}
+	return true;
 }

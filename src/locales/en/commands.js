@@ -154,6 +154,7 @@ export default {
 	read_failed: 'I could not read it: {reason}',
 	reading: 'Reading {count} messages from #{channel}{suffix}.',
 	reading_new_suffix: ' (new)',
+	reading_private: 'Not everybody in the voice channel may read #{channel}, so here it is for you only:\n{text}',
 
 	status_voice: 'Voice channel: {channel}',
 	status_voice_none: 'none',

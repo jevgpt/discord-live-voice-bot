@@ -37,6 +37,8 @@ export default {
 	target_role: 'the {role} role',
 	target_member: '{name}',
 	unknown_permissions: 'I do not recognise these permissions: {unknown}. The ones I know: {help}.',
+	risky_permission: 'I do not hand out {permissions} by voice, in a channel or anywhere else; that has to be set in Discord itself. I can still take it away.',
+	log_risky_permission_refused: '[tool] #{channel}: {permissions} for {target} refused (not by voice)',
 	reset_everyone_blocked: 'Which permissions should I reset for everyone? I am not clearing them all at once, in case that exposes a hidden channel.',
 	permissions_reset: 'I removed the custom permissions for {target} in #{channel}.',
 	which_permission: 'Which permission should I turn on or off? For example: connect, view, send, speak.',

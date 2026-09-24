@@ -37,6 +37,20 @@ export function squash(text) {
 }
 
 /**
+ * Cleans a value that came from a channel member (a display name, a transcript, a saved note) before it
+ * is handed to the model. Newlines and control characters are what let such a value pretend to be a new
+ * instruction line, so they collapse to spaces; notes keep their line breaks because they are a list.
+ * (It lived in guildsession.js; the text replies in messages.js hand the same notes to a model too.)
+ */
+export function safeContext(text, { keepLines = false } = {}) {
+	const raw = String(text ?? '');
+	const cleaned = keepLines ? raw.replace(/\r/gu, '') : raw.replace(/[\r\n]+/gu, ' ');
+	// Control characters are stripped on purpose: they are the other way a value can fake a new line.
+	// oxlint-disable-next-line no-control-regex
+	return cleaned.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, '').trim();
+}
+
+/**
  * Takes off the part that has already been said. Some transcript streams re-send the text so far on
  * every delta, and a flush landing in between then records one sentence twice with the second copy
  * carrying the first — which reads, in the log and the panel, exactly like the bot repeating itself.

@@ -65,7 +65,11 @@ export function toolCallFor(command, deps) {
 /** Runs the command; returns { speak, text, ok } (speak=false means the model should stay quiet). */
 export async function executeAction(command, deps) {
 	const { recentActions } = deps;
-	const signature = actionSignature(command);
+	// A read is remembered per person: whether a channel may be read is a question about who asked, and
+	// the owner's reading of #staff handed back from the cache to a guest asking half a minute later is
+	// #staff read to the guest.
+	const base = actionSignature(command);
+	const signature = base && command.type === 'read' ? `${base}:${deps.currentSpeakerId?.() ?? '-'}` : base;
 	const cached = recentActions?.recall(signature);
 	if (cached) return { ...cached, reused: true };
 

@@ -52,11 +52,17 @@ function makeDeps({ owner = false, permissions = ALL_PERMISSIONS, messages = nul
 			]);
 	const pinned = pins ? pins(sent) : [];
 	const held = new Set(permissions);
+	// `permissions` are the bot's own. Everybody else may see the channel and read it, so reading its pins
+	// is nobody's privilege here and the refusals under test are the bot's.
+	const open = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory];
 	const channel = {
 		id: '10',
 		name: 'chat',
 		type: ChannelType.GuildText,
-		permissionsFor: () => ({ has: (flag) => [...held].some((flagName) => PermissionFlagsBits[flagName] === flag) }),
+		permissionsFor: (subject) =>
+			subject?.id === SELF
+				? { has: (flag) => [...held].some((flagName) => PermissionFlagsBits[flagName] === flag) }
+				: { has: (flag) => open.includes(flag) },
 		send: async (payload) => (sent.push({ send: payload }), { id: 'poll-message' }),
 		messages: {
 			fetch: async (options) => {

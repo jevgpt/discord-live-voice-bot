@@ -250,6 +250,32 @@ describe('who the model is told said a line', () => {
 		);
 	});
 
+	// A mixed "read the staff channel" is harmless only as far as the person asking may read it, and on a
+	// line two voices share, whose request it was is the one thing not known. The owner's authority goes
+	// only on a line that was the owner's alone.
+	it('runs a mixed line s harmless command for nobody in particular', async (t) => {
+		t.mock.timers.enable({ apis: ['setTimeout'] });
+		const room = makeRoomSession({ OWNER_PRIORITY: '0' });
+		room.voices('owner', 30);
+		room.voices(['owner', 'guest'], 40);
+		room.delta('read the general channel', 0, 1400);
+		t.mock.timers.tick(1300);
+		const item = room.commanded.at(-1);
+		assert.equal(item.id, 'owner');
+		assert.equal(item.mixed, true);
+		assert.equal(item.owner, false, 'the owner was not alone in it');
+
+		// The read is remembered per person asking; what it was remembered under says who that was.
+		const asked = [];
+		room.session.taskDeps = { ...room.session.taskDeps, recentActions: { recall: (signature) => (asked.push(signature), { speak: false, text: '', ok: true }), remember() {} } };
+		GuildSession.prototype.runVoiceCommand.call(room.session, item);
+		GuildSession.prototype.runVoiceCommand.call(room.session, { ...item, mixed: false, owner: true });
+		GuildSession.prototype.runVoiceCommand.call(room.session, { ...item, mixed: false, owner: false });
+		t.mock.timers.reset();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.deepEqual(asked, ['read:general:-', 'read:general:owner', 'read:general:-']);
+	});
+
 	it('runs nothing at all off a line nobody owns', (t) => {
 		t.mock.timers.enable({ apis: ['setTimeout'] });
 		const room = makeRoomSession({ OWNER_PRIORITY: '0' });

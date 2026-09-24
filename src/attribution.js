@@ -95,6 +95,55 @@ function patternFor(key, cache) {
 }
 const inflectionFor = () => patternFor('keywords.inflection', inflections);
 const negationFor = () => patternFor('keywords.negation', negations);
+const negativeWords = new Map();
+const negativeWordFor = () => patternFor('keywords.negative_word', negativeWords);
+
+// "Don't", "shouldn't", "can't": English glues its negative onto the word before it, and normalize() cuts
+// a short tail off at the apostrophe, so "shouldn't" became "shouldn" and "can't" became "can", which is
+// halfway to a yes. The negative is written out as a word of its own before anything else is done to the
+// text, and it survives as "not" wherever the words go. A piece of a streamed transcript can begin with
+// the "'t" of a word the previous piece ended ("didn" / "'t"), so a "'t" at the very start is one too.
+// Spelling, like the Turkish letters normalize() folds, so it applies whatever language the bot runs in.
+const CONTRACTED_NOT = [
+	[/\bcan['’]t\b/giu, 'can not'],
+	[/\bwon['’]t\b/giu, 'will not'],
+	[/\bshan['’]t\b/giu, 'shall not'],
+	[/n['’]t\b/giu, ' not'],
+	[/^\s*['’]t\b/iu, ' not'],
+];
+
+/** The words of a stretch of speech, as the gate and the confirmation compare them (see CONTRACTED_NOT). */
+export function spokenTokens(text) {
+	let value = String(text ?? '');
+	for (const [pattern, replacement] of CONTRACTED_NOT) value = value.replace(pattern, replacement);
+	return normalize(value).split(' ').filter(Boolean);
+}
+
+// Set phrases that hold a command word and are not a command: "kick off" is a start, "boot up" a
+// computer, "silence is golden" a saying. The locale lists them; a command word heard as part of one
+// does not count. Cached per language.
+const phraseLookalikeLists = new Map();
+function phraseLookalikesFor() {
+	const code = locale();
+	if (!phraseLookalikeLists.has(code)) {
+		const list = tRaw('keywords.phrase_lookalikes');
+		phraseLookalikeLists.set(code, Array.isArray(list) ? list.map((phrase) => normalize(phrase).split(' ').filter(Boolean)).filter((words) => words.length > 1) : []);
+	}
+	return phraseLookalikeLists.get(code);
+}
+
+/** Is the token at `index` part of one of the locale's set phrases (see phraseLookalikesFor)? */
+function inLookalikePhrase(tokens, index) {
+	for (const phrase of phraseLookalikesFor()) {
+		for (let at = 0; at < phrase.length; at++) {
+			if (phrase[at] !== tokens[index]) continue;
+			const start = index - at;
+			if (start < 0 || start + phrase.length > tokens.length) continue;
+			if (phrase.every((word, k) => tokens[start + k] === word)) return true;
+		}
+	}
+	return false;
+}
 
 // Words that begin with a keyword and are a different word: "banyo" is not "ban", "odak" is not "oda".
 // A prefix match cannot tell them apart, so the locale names them. Cached per language.
@@ -165,7 +214,9 @@ function matchesNeedle(token, needle, stem) {
 	// "Do not delete" must never read as "delete". In Turkish the negative is built by gluing -ma/-me
 	// straight onto the verb, so the negated word CONTAINS the positive one and a prefix match finds it:
 	// heard live, "pardon, silme" opened the gate and fifty more messages went. A word carrying the
-	// negative is not the command word, whichever way it was matched.
+	// negative is not the command word, whichever way it was matched. The locale's pattern also knows the
+	// negative after a verb made from a noun ("banlama", "kilitleme") and the verbal nouns that begin the
+	// same way and are not negative at all ("silmeni istiyorum": I want you to delete it).
 	if (tail) {
 		const negative = negationFor();
 		if (negative && negative.test(tail)) return false;
@@ -186,17 +237,29 @@ function containsPhrase(tokens, phrase) {
 /**
  * Does this stretch of speech say yes, say no, or neither? The two-step confirmation reads the owner's
  * answer with it. The word lists are the locale's (keywords.confirm_yes / confirm_no) and are matched the
- * way the gate matches its own words, so "yesterday" is not a yes and "banned" is not a no. A yes word
- * carrying the Turkish negative ("yapma", "onaylamiyorum") is a no, which is the whole reason a prefix
- * match could not be trusted here. Entries of more than one word ("go ahead") match as a phrase.
+ * way the gate matches its own words, so "yesterday" is not a yes and "banned" is not a no. Entries of
+ * more than one word ("go ahead", "leave it") match as a phrase.
+ *
+ * A no is looked for in every form it takes, because a yes word next to a no is not a yes, and in both
+ * languages the no is easily missed. English glues it onto the verb ("shouldn't", read as "should not"
+ * by spokenTokens). Turkish glues it onto whatever verb the answer is about: "tamam, banlama" is okay
+ * followed by "do not ban", and the ban is nowhere in the yes words, so the locale describes the shape
+ * of a negated verb (keywords.negative_word) and any word of that shape is a no. A yes word carrying the
+ * negative ("yapma", "onaylamiyorum") is one as well.
+ *
+ * `action` is the command words of the thing being asked about. A no word that is also one of them is
+ * the verb of the request, not a refusal of it: "yes, cancel it" to "should I cancel movie night?" is a
+ * yes, and "okay, cancel" to "should I ban Sam?" is not.
+ * @param {string} text
+ * @param {{ action?: string[] }} [options]
  * @returns {{ yes: boolean, no: boolean }}
  */
-export function readAnswer(text) {
-	const tokens = normalize(text).split(' ').filter(Boolean);
+export function readAnswer(text, { action = [] } = {}) {
+	const tokens = spokenTokens(text);
 	if (!tokens.length) return { yes: false, no: false };
-	const said = (entries) =>
+	const matches = (list, entries) =>
 		entries.some(({ needle, stem }) =>
-			needle.includes(' ') ? containsPhrase(tokens, needle.split(' ')) : tokens.some((token) => matchesNeedle(token, needle, stem)),
+			needle.includes(' ') ? containsPhrase(list, needle.split(' ')) : list.some((token) => matchesNeedle(token, needle, stem)),
 		);
 	const yesWords = parseKeywords(tRaw('keywords.confirm_yes'));
 	const negative = negationFor();
@@ -205,7 +268,14 @@ export function readAnswer(text) {
 		tokens.some((token) =>
 			yesWords.some(({ needle }) => token.length > needle.length && token.startsWith(needle) && negative.test(token.slice(needle.length))),
 		);
-	return { yes: said(yesWords), no: negatedYes || said(parseKeywords(tRaw('keywords.confirm_no'))) };
+	const negatedVerb = negativeWordFor();
+	const negatedWord = Boolean(negatedVerb) && tokens.some((token) => negatedVerb.test(token));
+	// The request's own verb is blanked out before the no words are looked for, so it can neither be one
+	// nor join the words around it into a phrase.
+	const actionWords = parseKeywords(action);
+	const rest = actionWords.length ? tokens.map((token) => (actionWords.some(({ needle, stem }) => matchesNeedle(token, needle, stem)) ? '' : token)) : tokens;
+	const refused = matches(rest, parseKeywords(tRaw('keywords.confirm_no')));
+	return { yes: matches(tokens, yesWords), no: negatedYes || negatedWord || refused };
 }
 
 export class SpeakerAttribution {
@@ -589,7 +659,7 @@ export class SpeakerAttribution {
 		// whose WORD it is. In a real overlap nobody can be named, so without this the refusal could not
 		// tell "somebody talked over you" from "you did not say it".
 		const ownerIn = typeof ownerOverride === 'boolean' ? ownerOverride : this.ownerId !== null && hit.ids.includes(this.ownerId);
-		const tokens = normalize(fragment).split(' ').filter(Boolean);
+		const tokens = spokenTokens(fragment);
 		// A delta is shorter than a word, so a word can arrive in two pieces: "edebilirs" then "in". Each
 		// piece used to become a word of its own, a keyword split that way was never matched, and the
 		// gate then walked past the owner's real command to an older word of somebody else's. A piece that
@@ -616,7 +686,7 @@ export class SpeakerAttribution {
 		}
 		for (const word of rest) this.words.push({ word, at, owner, id, sure, ownerIn, pos, seq });
 		this._pruneWords(at);
-		this._noteUtterance({ owner, id, sure, at, seq, startMs: pos, endMs: end, text: fragment, tokens, glue: glue && tokens.length ? tokens[0] : null });
+		this._noteUtterance({ owner, id, sure, at, seq, startMs: pos, endMs: end, text: fragment, tokens, glue: glue && tokens.length ? tokens[0] : null, whole: forced });
 		this.lastPiece = forced ? null : { raw, owner, id: id ?? null, endMs: end, at };
 		// Handed back so that the caller builds its line out of the SAME answer. Resolving the track
 		// again downstream is how two parts of the code ended up disagreeing about who was talking.
@@ -634,7 +704,7 @@ export class SpeakerAttribution {
 		};
 	}
 
-	_noteUtterance({ owner, id, sure = true, at, seq, startMs, endMs, text, tokens, glue = null }) {
+	_noteUtterance({ owner, id, sure = true, at, seq, startMs, endMs, text, tokens, glue = null, whole = false }) {
 		const last = this.utterances[this.utterances.length - 1];
 		// `sure` is part of the identity: a fragment that only leans towards somebody must not merge into
 		// a certain utterance and launder itself into a fact.
@@ -646,6 +716,7 @@ export class SpeakerAttribution {
 		if (close) {
 			last.at = at;
 			last.seq = seq;
+			last.whole = last.whole === true && whole === true;
 			if (endMs !== null) last.endMs = endMs;
 			last.text = `${last.text}${glue !== null ? '' : ' '}${text}`.slice(-this.maxText);
 			if (glue !== null && last.tokens.length) {
@@ -657,7 +728,9 @@ export class SpeakerAttribution {
 			if (last.tokens.length > 80) last.tokens.splice(0, last.tokens.length - 80);
 			return;
 		}
-		this.utterances.push({ owner, id: id ?? null, sure, at, seq, startMs, endMs, text, tokens: [...tokens], glued: glue !== null });
+		// `whole`: a line handed over complete with its speaker (the local path, one transcription per person
+		// and utterance), which starts a turn of its own; see requestSpeaker.
+		this.utterances.push({ owner, id: id ?? null, sure, at, seq, startMs, endMs, text, tokens: [...tokens], glued: glue !== null, whole: whole === true });
 		const cutoff = at - Math.max(this.transcriptWindowMs * 2, this.continuityMs);
 		let drop = 0;
 		while (drop < this.utterances.length - 1 && this.utterances[drop].at < cutoff) drop++;
@@ -746,6 +819,8 @@ export class SpeakerAttribution {
 		const prev = this.lastPiece;
 		if (!prev) return false;
 		if (!/^[\p{L}\p{N}]/u.test(raw) || !/[\p{L}\p{N}]$/u.test(prev.raw)) return false;
+		// "didn" then "n't": the rest of that word is a word of its own, "not" (see spokenTokens).
+		if (/^n['’]t\b/u.test(raw)) return false;
 		if (prev.owner !== owner || prev.id !== (id ?? null)) return false;
 		// Pieces of one word arrive together. A piece arriving much later is a new thing said, whatever the
 		// positions say: they touch when somebody goes straight on without a pause.
@@ -807,6 +882,7 @@ export class SpeakerAttribution {
 		const cut = this._resolveTurn(turn, now);
 		const needles = parseKeywords(keywords);
 		if (!needles.length) return null;
+		const heard = this.words.map((entry) => entry.word);
 		let sawOther = false; // did somebody else speak in the scanned range (before the turn)
 		for (let i = this.words.length - 1; i >= 0; i--) {
 			const entry = this.words[i];
@@ -817,6 +893,7 @@ export class SpeakerAttribution {
 			if (!entry.owner) sawOther = true;
 			for (const { word, needle, stem } of needles) {
 				if (!matchesNeedle(entry.word, needle, stem)) continue;
+				if (inLookalikePhrase(heard, i)) continue;
 				return {
 					owner: entry.owner,
 					id: entry.id,
@@ -857,6 +934,43 @@ export class SpeakerAttribution {
 			return { owner: utt.owner, id: utt.id, sure: utt.sure !== false, text: utt.text, at: utt.at, seq: utt.seq ?? 0, tokens: utt.tokens.length };
 		}
 		return null;
+	}
+
+	/**
+	 * Whose request a turn answers. The last line before the turn is where the request ends, and the lines
+	 * that ran into it (less than OWNER_SPEECH_GAP_MS apart, the pause ownerUtterance joins the owner's
+	 * words across) are the rest of it. It is one person's only when every line of that run carries the
+	 * same name: a guest asking and the owner saying "hmm" before the model answered is two people, and the
+	 * audio cannot tell whose request it was. `sure` and `owner` are true only when they are true of every
+	 * line of the run.
+	 * @returns {{ id: string|null, owner: boolean, sure: boolean, shared: boolean }|null} null when nothing was heard
+	 */
+	requestSpeaker({ windowMs = this.transcriptWindowMs, turn = undefined } = {}) {
+		const now = this.now();
+		const cut = this._resolveTurn(turn, now);
+		let run = null;
+		let first = null; // the earliest line of the run so far
+		for (let i = this.utterances.length - 1; i >= 0; i--) {
+			const utt = this.utterances[i];
+			if (now - utt.at > windowMs) break;
+			if (!this._beforeTurn(utt, cut)) continue;
+			if (utteranceWeight(utt) < 1) continue;
+			if (!run) {
+				run = { id: utt.id ?? null, owner: utt.owner === true, sure: utt.sure !== false, shared: false };
+				// A line handed over whole with its speaker (the local path) was a turn of its own: the request
+				// is that line, and whoever spoke a moment before it had a turn of their own too.
+				if (utt.whole === true) return run;
+				first = utt;
+				continue;
+			}
+			const gap = Number.isFinite(first.startMs) && Number.isFinite(utt.endMs) ? first.startMs - utt.endMs : first.at - utt.at;
+			if (gap > OWNER_SPEECH_GAP_MS) break;
+			if ((utt.id ?? null) !== run.id) return { id: null, owner: false, sure: false, shared: true };
+			if (utt.owner !== true) run.owner = false;
+			if (utt.sure === false) run.sure = false;
+			first = utt;
+		}
+		return run;
 	}
 
 	/**
@@ -972,7 +1086,7 @@ export class SpeakerAttribution {
 		const tokens = this.words.filter((entry) => entry.owner && now - entry.at <= windowMs).map((entry) => entry.word);
 		if (!tokens.length) return null;
 		for (const { word, needle, stem } of parseKeywords(words)) {
-			if (tokens.some((token) => matchesNeedle(token, needle, stem))) return word;
+			if (tokens.some((token, index) => matchesNeedle(token, needle, stem) && !inLookalikePhrase(tokens, index))) return word;
 		}
 		return null;
 	}

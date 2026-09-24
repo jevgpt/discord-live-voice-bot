@@ -15,10 +15,12 @@ import { listenersOf } from '../../src/tools/summary.js';
 // what must NOT come out: a moderator channel for a plain member, and anything from another server.
 
 const READ = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory];
+const JOIN = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect];
 
 /**
  * A server with #general (everyone reads it), #mods (the "mod" role only), #announcements (visible, but
- * its history is closed to @everyone) and a private thread under #general that only "insider" is in.
+ * its history is closed to @everyone) and a private thread under #general that only "insider" is in; and
+ * two voice channels, the lounge (anybody may join) and the staff room (the "mod" role only).
  */
 function makeGuild(id = 'alpha', name = 'Alpha') {
 	const guild = { id, name, roles: { everyone: { id: `${id}-everyone`, everyone: true } } };
@@ -41,7 +43,9 @@ function makeGuild(id = 'alpha', name = 'Alpha') {
 		type: ChannelType.PrivateThread,
 		members: { cache: new Map([['insider', {}]]) },
 	});
-	guild.channels = { cache: new Map([general, mods, announcements, thread].map((channel) => [channel.id, channel])) };
+	const lounge = text(`${id}-voice`, 'Lounge', () => JOIN, { type: ChannelType.GuildVoice });
+	const staffRoom = text(`${id}-staff-voice`, 'Staff room', ({ roles }) => (roles.includes('mod') ? JOIN : []), { type: ChannelType.GuildVoice });
+	guild.channels = { cache: new Map([general, mods, announcements, thread, lounge, staffRoom].map((channel) => [channel.id, channel])) };
 	return guild;
 }
 
@@ -51,7 +55,16 @@ function member(id, roles = [], { bot = false } = {}) {
 }
 
 const now = () => new Date().toISOString();
-const say = (guildLabel, text, extra = {}) => ({ kind: 'voice', direction: 'in', whoName: 'Jane', text, at: now(), meta: { guild: guildLabel }, ...extra });
+// A voice line as a session records it: the server's label, and the voice channel it was said in.
+const say = (guildLabel, text, extra = {}) => ({
+	kind: 'voice',
+	direction: 'in',
+	whoName: 'Jane',
+	text,
+	at: now(),
+	meta: { guild: guildLabel, channelId: `${guildLabel.toLowerCase()}-voice` },
+	...extra,
+});
 const wrote = (guildId, channelId, text) => ({
 	kind: 'channel',
 	direction: 'in',
@@ -156,6 +169,29 @@ describe('transcriptFromEvents / summarizeConversation: scoped', () => {
 		await summarizeConversation(deps, { events: events(), hours: 0, audience: { readers: [member('moderator', ['mod'])] } });
 		assert.ok(inputs[2].includes('ban the troll'));
 	});
+
+	// The bot's spoken readout of #mods is #mods by another road, and a staff voice room is a room too.
+	it('keeps a voice line only for people who could have been in its voice channel, and leaves the bot s own lines out', () => {
+		const guild = makeGuild();
+		const lines = [
+			say('Alpha', 'lounge chatter'),
+			say('Alpha', 'staff room plans', { meta: { guild: 'Alpha', channelId: 'alpha-staff-voice' } }),
+			say('Alpha', 'In #mods, Sam wrote: ban the troll quietly', { direction: 'out', whoName: 'bot' }),
+			say('Alpha', 'a line with no channel', { meta: { guild: 'Alpha' } }),
+		];
+		const scoped = (readers) => transcriptFromEvents(lines, { inGuild: guildScope(guild), canRead: channelFilterFor(guild, readers) }).text;
+		const plain = scoped([member('plain')]);
+		assert.ok(plain.includes('lounge chatter'), plain);
+		for (const hidden of ['staff room plans', 'ban the troll', 'a line with no channel']) assert.ok(!plain.includes(hidden), hidden);
+		const moderator = scoped([member('moderator', ['mod'])]);
+		assert.ok(moderator.includes('staff room plans'));
+		assert.ok(!moderator.includes('ban the troll'), 'the bot s own lines are out for anybody not trusted with everything');
+		const everything = transcriptFromEvents(lines, { inGuild: guildScope(guild) }).text;
+		assert.ok(everything.includes('ban the troll') && everything.includes('staff room plans'));
+		// A voice channel is judged by joining it, not by reading its history.
+		assert.equal(channelFilterFor(guild, [member('plain')])('alpha-voice', { voice: true }), true);
+		assert.equal(channelFilterFor(guild, [member('plain')])('alpha-staff-voice', { voice: true }), false);
+	});
 });
 
 describe('summarize_conversation (voice tool): the room it is spoken to', () => {
@@ -225,7 +261,12 @@ describe('summarize_conversation (voice tool): the room it is spoken to', () => 
 
 		// What src/index.js logs for a channel message, and what each session records for voice.
 		alpha.record({ kind: 'voice', direction: 'in', who: 'plain', text: 'alpha voice line' });
+		alpha.record({ kind: 'voice', direction: 'out', whoName: 'bot', text: 'In #mods Sam wrote: kick the spammer' });
 		beta.record({ kind: 'voice', direction: 'in', who: 'x', text: 'beta voice line' });
+		// The session stamps a voice line with its server and the voice channel it was said in.
+		const stamped = activity.events.find((event) => event.text === 'alpha voice line');
+		assert.equal(stamped.meta.channelId, 'alpha-voice');
+		assert.equal(stamped.meta.guildId, 'alpha');
 		alpha.record({ kind: 'channel', direction: 'in', whoName: 'Sam', text: 'general hello', meta: { channel: '#general', channelId: 'alpha-general', guildId: 'alpha' } });
 		alpha.record({ kind: 'channel', direction: 'in', whoName: 'Sam', text: 'ban the troll quietly', meta: { channel: '#mods', channelId: 'alpha-mods', guildId: 'alpha' } });
 		beta.record({ kind: 'channel', direction: 'in', whoName: 'Kim', text: 'beta chatter', meta: { channel: '#general', channelId: 'beta-general', guildId: 'beta' } });
@@ -236,7 +277,7 @@ describe('summarize_conversation (voice tool): the room it is spoken to', () => 
 		await callTool('summarize_conversation', { hours: 1 }, deps);
 		assert.equal(inputs.length, 1);
 		assert.ok(inputs[0].includes('alpha voice line') && inputs[0].includes('general hello'), inputs[0]);
-		for (const hidden of ['ban the troll', 'beta voice line', 'beta chatter']) assert.ok(!inputs[0].includes(hidden), hidden);
+		for (const hidden of ['ban the troll', 'beta voice line', 'beta chatter', 'kick the spammer']) assert.ok(!inputs[0].includes(hidden), hidden);
 
 		// Alone in the room, the moderator does get the moderator channel.
 		deps.currentVoiceChannel = () => ({ members: new Map([[moderator.id, moderator]]) });

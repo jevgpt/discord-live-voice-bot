@@ -14,6 +14,7 @@ export default {
 	revoked_self: 'Kendimden {role} rolünü aldım.',
 	risky_role: '{role} rolünde {permissions} yetkisi var; böyle rolleri sesle vermiyorum. Discord üzerinden elle verilmesi gerekiyor.',
 	fuzzy_role_question: '"{name}" rolünü tam eşleştiremedim; en yakını {role}. {role} rolünü {who} kişisine vereyim mi?',
+	unheard_role_question: 'Söylediklerinde {role} adını duymadım. {role} rolünü {who} kişisine vereyim mi?',
 	log_risky_refused: '[araç] rol verme reddedildi: {role} rolünde {permissions} var',
 	// The permissions that keep a role from being handed out by voice, as Discord's settings name them.
 	risky_permission_names: {
@@ -27,6 +28,14 @@ export default {
 		ModerateMembers: 'Üyelere Zaman Aşımı Uygula',
 		MentionEveryone: '@everyone ve @here Etiketle',
 		ManageMessages: 'Mesajları Yönet',
+		MoveMembers: 'Üyeleri Taşı',
+		MuteMembers: 'Üyeleri Sustur',
+		DeafenMembers: 'Üyeleri Sağırlaştır',
+		ManageNicknames: 'Kullanıcı Adlarını Yönet',
+		ManageThreads: 'Alt Başlıkları Yönet',
+		ManageEvents: 'Etkinlikleri Yönet',
+		ManageGuildExpressions: 'İfadeleri Yönet',
+		ViewAuditLog: 'Denetim Kaydını Görüntüle',
 	},
 	update_failed: 'Rol işlemini yapamadım',
 	default_name: 'yeni-rol',

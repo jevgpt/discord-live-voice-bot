@@ -5,10 +5,11 @@ import { SpeakerAttribution } from '../../src/attribution.js';
 import { RecentActions } from '../../src/commands.js';
 import { loadConfig } from '../../src/config.js';
 import { GuildSession } from '../../src/guildsession.js';
+import { setLocale } from '../../src/i18n/index.js';
 import { MemoryStore } from '../../src/memory.js';
 import { ActivityLog } from '../../src/panel.js';
 import { callTool, resetDmLimiter } from '../../src/tools.js';
-import { canReadChannel, speakerOfTurn } from '../../src/tools/access.js';
+import { canReadChannel, roomMayRead, speakerOfTurn } from '../../src/tools/access.js';
 import { riskyPermissionsOf } from '../../src/tools/roles.js';
 import { ownerVoice } from '../owner-voice.js';
 
@@ -139,20 +140,62 @@ describe('speakerOfTurn: who the line behind a request belongs to', () => {
 		assert.equal(speakerOfTurn(attribution, turn, 'o'), 'g');
 	});
 
-	it('falls back to the speaking event only when there is no line to go on', () => {
-		assert.equal(speakerOfTurn(null, null, 'o'), 'o', 'no attribution at all');
+	// Discord's last speaking event used to stand in whenever there was no line to go on. It is whoever made
+	// a sound while the model worked, and whatever this names reads staff channels as that person.
+	it('names nobody, rather than the last sound Discord reported, when there is no line to go on', () => {
+		assert.equal(speakerOfTurn(null, null), null, 'no attribution at all');
 		const attribution = new SpeakerAttribution({ ownerId: 'o', now: () => 10_000 });
-		assert.equal(speakerOfTurn(attribution, null, 'g'), 'g', 'no turn pinned');
-		assert.equal(speakerOfTurn(attribution, attribution.markTurn(), 'g'), 'g', 'nothing heard before the turn');
+		assert.equal(speakerOfTurn(attribution, null), null, 'no turn pinned');
+		assert.equal(speakerOfTurn(attribution, attribution.markTurn()), null, 'nothing heard before the turn');
 		const lagging = { transcriptLagging: () => true, lastUtterance: () => ({ id: 'someone-earlier' }) };
-		assert.equal(speakerOfTurn(lagging, { at: 1 }, 'g'), 'g', 'the line that triggered the turn has not arrived yet');
+		assert.equal(speakerOfTurn(lagging, { at: 1 }), null, 'the line that triggered the turn has not arrived yet');
 	});
 
 	it('names nobody when the line itself could not be named, rather than guessing', () => {
 		const overlap = { transcriptLagging: () => false, lastUtterance: () => ({ id: null, owner: false, sure: false }) };
-		assert.equal(speakerOfTurn(overlap, { at: 1 }, 'o'), null);
+		assert.equal(speakerOfTurn(overlap, { at: 1 }), null);
 		const ownerOnly = { ownerId: 'o', transcriptLagging: () => false, lastUtterance: () => ({ id: null, owner: true }) };
-		assert.equal(speakerOfTurn(ownerOnly, { at: 1 }, 'g'), 'o', 'a line that is the owner s carries the owner s id');
+		assert.equal(speakerOfTurn(ownerOnly, { at: 1 }), 'o', 'a line that is the owner s carries the owner s id');
+		const leaning = { ownerId: 'o', transcriptLagging: () => false, lastUtterance: () => ({ id: 'g', owner: false, sure: false }) };
+		assert.equal(speakerOfTurn(leaning, { at: 1 }), null, 'a line that only leans towards somebody names nobody');
+	});
+
+	it('does not put the owner s name on a line a guest talked over', () => {
+		const a = new SpeakerAttribution({ ownerId: 'o' });
+		// 400 ms of the owner alone, then 400 ms of a guest talking over them.
+		for (let i = 0; i < 20; i++) a.onFrame({ active: ['o'], present: ['o'], sent: true });
+		for (let i = 0; i < 20; i++) a.onFrame({ active: ['g', 'o'], present: ['g', 'o'], sent: true });
+		const heard = a.noteTranscript('read the mod chat to me', { startMs: 0, endMs: 800 });
+		assert.equal(heard.id, 'o', 'the line still leans towards the owner');
+		assert.equal(heard.sure, false);
+		assert.equal(speakerOfTurn(a, a.markTurn()), null);
+	});
+
+	it('names nobody when a guest asks and the owner makes a sound before the model answers', () => {
+		const a = new SpeakerAttribution({ ownerId: 'o' });
+		for (let i = 0; i < 50; i++) a.onFrame({ active: ['g'], present: ['g'], sent: true });
+		a.noteTranscript('read the mod chat to me', { startMs: 0, endMs: 1000 });
+		for (let i = 0; i < 15; i++) a.onFrame({ priority: true, active: ['o'], present: ['o'], sent: true });
+		a.noteTranscript(' hmm', { startMs: 1000, endMs: 1300 });
+		assert.equal(speakerOfTurn(a, a.markTurn()), null);
+		// The owner asking on their own is still the owner.
+		const alone = new SpeakerAttribution({ ownerId: 'o' });
+		for (let i = 0; i < 50; i++) alone.onFrame({ priority: true, active: ['o'], present: ['o'], sent: true });
+		alone.noteTranscript('read the mod chat to me', { startMs: 0, endMs: 1000 });
+		assert.equal(speakerOfTurn(alone, alone.markTurn()), 'o');
+	});
+
+	it('takes a line the local path handed over whole as a turn of its own', () => {
+		// One transcription per person and utterance, each starting its own turn: the guest's line a moment
+		// earlier had a turn of its own and is not part of the owner's request.
+		let clock = 10_000;
+		const a = new SpeakerAttribution({ ownerId: 'o', now: () => clock });
+		a.noteTranscript('what time is it', { owner: false, id: 'g' });
+		const guestTurn = a.markTurn();
+		clock += 1000;
+		a.noteTranscript('read the mod chat to me', { owner: true, id: 'o' });
+		assert.equal(speakerOfTurn(a, a.markTurn()), 'o');
+		assert.equal(speakerOfTurn(a, guestTurn), 'g');
 	});
 });
 
@@ -222,10 +265,23 @@ describe('a session names the person whose line asked, not the last sound Discor
 		assert.equal(memory.notesFor('owner').length, 1, "the owner's notes are still there");
 	});
 
-	it('still uses the speaking event when no turn has been pinned', () => {
+	it('names nobody when no turn has been pinned, whoever Discord last heard', () => {
 		const { session } = makeSession();
-		session.lastSpeakerId = 'guest';
-		assert.equal(session.deps().currentSpeakerId(), 'guest');
+		session.lastSpeakerId = 'owner';
+		assert.equal(session.deps().currentSpeakerId(), null);
+		assert.equal(session.deps().currentSpeakerName(), null);
+	});
+
+	it('does not read the staff channel for a guest because the owner coughed while the model worked', async () => {
+		const { session } = makeSession();
+		const turn = guestAsks(session, 'read the staff channel to me');
+		session.lastSpeakerId = 'owner';
+		const deps = { ...session.deps(), currentTurn: () => turn };
+		assert.equal(deps.currentSpeakerId(), 'guest');
+		// The transcript of the request is not in yet: nobody, not the cough.
+		session.attribution.onFrame({ priority: false, active: ['guest'] });
+		const lagging = { ...session.deps(), currentTurn: () => ({ at: Date.now(), audioMs: 10_000 }) };
+		assert.equal(lagging.currentSpeakerId(), null);
 	});
 });
 
@@ -289,12 +345,81 @@ describe('read_messages: the person asking has to be able to read the channel', 
 		assert.equal(owner.read.length, 1);
 	});
 
-	it('leaves a slash command to the check commands.js already made', async () => {
-		const { deps, read } = makeDeps({ speaker: 'g' });
-		deps.fromSlashCommand = true;
-		const result = await callTool('read_messages', { channel: 'staff', all: true }, deps);
-		assert.equal(result.ok, true, result.spoken);
-		assert.deepEqual(read, ['staff']);
+	// A slash command is judged by the Discord account that ran it (src/index.js hands that person over as
+	// the one asking). Being allowed to run /read is not being allowed into every channel.
+	it('reads for a slash command what the person who ran it may read', async () => {
+		const admin = makeDeps({ speaker: 'a' });
+		admin.deps.fromSlashCommand = true;
+		assert.equal((await callTool('read_messages', { channel: 'staff', all: true }, admin.deps)).ok, true);
+		assert.deepEqual(admin.read, ['staff']);
+
+		// Manage Server lets a member run /read; it does not open #staff to them.
+		const manager = makeDeps({ speaker: 'g' });
+		manager.members.get('g').permissions = { has: (flag) => flag === PermissionFlagsBits.ManageGuild };
+		manager.deps.fromSlashCommand = true;
+		const refused = await callTool('read_messages', { channel: 'staff', all: true }, manager.deps);
+		assert.equal(refused.denied, true, refused.spoken);
+		assert.deepEqual(manager.read, []);
+		assert.equal((await callTool('read_messages', { channel: 'general', all: true }, manager.deps)).ok, true);
+		assert.equal((await callTool('read_messages', { dm: 'Olga' }, manager.deps)).denied, true, 'nor the private conversations');
+	});
+
+	it('knows whether everybody in the voice channel may read what is about to be said out loud', async () => {
+		const { deps, guild, members } = makeDeps({ speaker: 'o' });
+		const staff = guild.channels.cache.get('c2');
+		const general = guild.channels.cache.get('c1');
+		deps.currentVoiceChannel = () => ({ members: new Map([['o', members.get('o')], ['a', members.get('a')]]) });
+		assert.equal(await roomMayRead(deps, staff), true);
+		deps.currentVoiceChannel = () => ({ members: new Map([['o', members.get('o')], ['g', members.get('g')]]) });
+		assert.equal(await roomMayRead(deps, staff), false, 'a guest is listening');
+		assert.equal(await roomMayRead(deps, general), true);
+		deps.currentVoiceChannel = () => null;
+		assert.equal(await roomMayRead(deps, staff), true, 'nobody is listening');
+	});
+});
+
+describe('list_pins: a channel s pins are its messages', () => {
+	function withPins(deps, guild) {
+		const pinned = { id: 'p1', content: 'Plan: ban Sam tomorrow', author: { username: 'mod1' }, member: null };
+		for (const channel of guild.channels.cache.values()) {
+			channel.messages.fetchPins = async () => ({ items: [{ message: pinned, pinnedAt: new Date() }], hasMore: false });
+			// The bot itself sees every channel here; what is under test is the person asking.
+			const theirs = channel.permissionsFor;
+			channel.permissionsFor = (subject) => (subject?.id === 'bot' ? { has: () => true } : theirs(subject));
+		}
+		return pinned;
+	}
+
+	it('refuses a guest the pins of a channel they cannot read, and lists the ones they can', async () => {
+		const { deps, guild } = makeDeps({ speaker: 'g' });
+		withPins(deps, guild);
+		const refused = await callTool('list_pins', { channel: 'staff' }, deps);
+		assert.equal(refused.denied, true, refused.spoken);
+		assert.doesNotMatch(refused.spoken, /ban Sam/);
+		const allowed = await callTool('list_pins', { channel: 'general' }, deps);
+		assert.equal(allowed.ok, true, allowed.spoken);
+		const owner = makeDeps({ speaker: 'o' });
+		withPins(owner.deps, owner.guild);
+		assert.equal((await callTool('list_pins', { channel: 'staff' }, owner.deps)).ok, true);
+	});
+
+	it('refuses the pins of a private thread to somebody who is not in it', async () => {
+		const { deps, guild } = makeDeps({ speaker: 'g' });
+		// A private thread answers with its parent's permissions, which the guest has.
+		const thread = {
+			id: 't1',
+			name: 'secret-thread',
+			type: ChannelType.PrivateThread,
+			permissionsFor: () => ({ has: (flag) => READ.includes(flag) }),
+			members: { cache: new Map([['a', {}]]) },
+			messages: { fetch: async () => new Map() },
+		};
+		guild.channels.cache.set(thread.id, thread);
+		withPins(deps, guild);
+		const refused = await callTool('list_pins', { channel: 'secret-thread' }, deps);
+		assert.equal(refused.denied, true, refused.spoken);
+		assert.equal(await canReadChannel(deps, thread, 'g'), false);
+		assert.equal(await canReadChannel(deps, thread, 'a'), true, 'a member of the thread reads it');
 	});
 });
 
@@ -463,6 +588,20 @@ describe('edit_message and delete_messages: the bot s own posts are the owner s'
 		assert.equal(result.ok, true, result.spoken);
 		assert.deepEqual(sent, [{ deleted: 'm1' }]);
 	});
+
+	// "Delete Zed's last three" with no Zed on the server went on without the filter: the last three
+	// messages of anybody, under a question that no longer named whose they were.
+	it('refuses when the person whose messages should go cannot be found', async () => {
+		const { deps, sent } = makeDeps({ speaker: 'o', gate: true });
+		const voice = ownerVoice(deps);
+		const result = await callTool('delete_messages', { channel: 'general', from: 'Zed', count: 3 }, deps);
+		assert.equal(result.ok, false);
+		assert.equal(result.needs_confirmation, undefined, 'nothing to ask about');
+		assert.match(result.spoken, /Zed/);
+		voice.says('yes');
+		assert.equal((await callTool('delete_messages', { channel: 'general', from: 'Zed', count: 3, confirm: true }, deps)).ok, false);
+		assert.deepEqual(sent, []);
+	});
 });
 
 describe('switch_character: held to the standard of /character', () => {
@@ -533,6 +672,93 @@ describe('grant_role: no keys to the server by voice', () => {
 		const done = await callTool('grant_role', { member: 'Gus', role: 'chill', confirm: true }, fuzzy.deps);
 		assert.equal(done.ok, true, done.spoken);
 		assert.deepEqual(fuzzy.sent, [{ roleAdded: 'chillz', to: 'g' }]);
+	});
+
+	// The role argument is the model's own writing: the owner says "chill", the model writes the exact
+	// name of the closest role, and "approximately" was judged against what the model wrote.
+	it('asks when the owner did not say the role s name, whatever the model wrote', async () => {
+		const said = (text) => () => ({ text, at: 1, seq: 1, sure: true });
+		const unsaid = makeDeps({ speaker: 'o', gate: true });
+		unsaid.deps.ownerUtterance = said('give Gus the chill role');
+		const asked = await callTool('grant_role', { member: 'Gus', role: 'chillz' }, unsaid.deps);
+		assert.equal(asked.needs_confirmation, true, asked.spoken);
+		assert.match(asked.spoken, /did not hear the name chillz/);
+		assert.deepEqual(unsaid.sent, []);
+
+		const named = makeDeps({ speaker: 'o', gate: true });
+		named.deps.ownerUtterance = said('give Gus the chillz role');
+		assert.equal((await callTool('grant_role', { member: 'Gus', role: 'chill' }, named.deps)).ok, true, 'the owner said it, so it is not a guess');
+		assert.deepEqual(named.sent, [{ roleAdded: 'chillz', to: 'g' }]);
+
+		// Turkish glues the case ending on: "chillz rolünü", "chillzi ver" still name the role.
+		setLocale('tr');
+		try {
+			const turkish = makeDeps({ speaker: 'o', gate: true });
+			turkish.deps.ownerUtterance = said('Gus a chillzi ver');
+			assert.equal((await callTool('grant_role', { member: 'Gus', role: 'chillz' }, turkish.deps)).ok, true);
+		} finally {
+			setLocale('en');
+		}
+	});
+
+	it('counts moderating voice, threads, events, nicknames and expressions and the audit log as keys too', () => {
+		const voiceMod = {
+			permissions: new PermissionsBitField([
+				PermissionFlagsBits.MoveMembers,
+				PermissionFlagsBits.MuteMembers,
+				PermissionFlagsBits.DeafenMembers,
+				PermissionFlagsBits.ManageNicknames,
+				PermissionFlagsBits.ManageThreads,
+				PermissionFlagsBits.ManageEvents,
+				PermissionFlagsBits.ManageGuildExpressions,
+				PermissionFlagsBits.ViewAuditLog,
+			]),
+		};
+		assert.deepEqual(riskyPermissionsOf(voiceMod), [
+			'MoveMembers',
+			'MuteMembers',
+			'DeafenMembers',
+			'ManageNicknames',
+			'ManageThreads',
+			'ManageEvents',
+			'ManageGuildExpressions',
+			'ViewAuditLog',
+		]);
+	});
+});
+
+describe('set_channel_permission: no moderator powers by voice, in a channel either', () => {
+	function withOverwrites(deps, guild) {
+		const edits = [];
+		for (const channel of guild.channels.cache.values()) {
+			channel.permissionOverwrites = { edit: async (target, patch) => edits.push({ target: target.id ?? target, patch }) };
+			// The bot holds every permission here; what is under test is what it will hand out by voice.
+			const theirs = channel.permissionsFor;
+			channel.permissionsFor = (subject) => (subject?.id === 'bot' ? { has: () => true } : theirs(subject));
+		}
+		return edits;
+	}
+
+	it('refuses to give a person or a role Manage Messages, Move Members, Mention @everyone...', async () => {
+		for (const allow of [['manage messages'], ['manage channels'], ['mention everyone'], ['move members'], ['mute'], ['ManageMessages']]) {
+			const { deps, guild } = makeDeps({ speaker: 'o', gate: true });
+			const edits = withOverwrites(deps, guild);
+			const result = await callTool('set_channel_permission', { channel: 'general', target: 'Gus', target_type: 'member', allow }, deps);
+			assert.equal(result.ok, false, `${allow}: ${result.spoken}`);
+			assert.equal(result.denied, true, String(allow));
+			assert.match(result.spoken, /by voice/);
+			assert.deepEqual(edits, [], `${allow} was not given`);
+		}
+	});
+
+	it('still takes them away, and still gives the ordinary ones', async () => {
+		const { deps, guild } = makeDeps({ speaker: 'o', gate: true });
+		const edits = withOverwrites(deps, guild);
+		const taken = await callTool('set_channel_permission', { channel: 'general', target: 'Gus', target_type: 'member', deny: ['manage messages'] }, deps);
+		assert.equal(taken.ok, true, taken.spoken);
+		const given = await callTool('set_channel_permission', { channel: 'general', target: 'Gus', target_type: 'member', allow: ['write', 'view'] }, deps);
+		assert.equal(given.ok, true, given.spoken);
+		assert.equal(edits.length, 2);
 	});
 });
 

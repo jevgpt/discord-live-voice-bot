@@ -23,6 +23,12 @@ import { P, defineTool } from './registry.js';
  * spoken confirmation proves what was heard, but both rest on the same audio: if that audio can be
  * fooled once it can be fooled twice, and what is lost here is the server itself. Giving such a role
  * takes a click in Discord, where the person doing it is who they say they are.
+ *
+ * Moderating voice (moving, muting, deafening people), renaming them, managing threads, events and the
+ * server's emojis and stickers, and reading the audit log are the powers of a moderator role too, and a
+ * "voice mod" role carrying only those used to go out like any other. The same list stands in front of
+ * a channel permission given to a person or a role (set_channel_permission), which is the other way to
+ * hand these out: Manage Messages in one channel is the moderator's delete button there.
  */
 export const RISKY_ROLE_PERMISSIONS = [
 	'Administrator',
@@ -35,7 +41,21 @@ export const RISKY_ROLE_PERMISSIONS = [
 	'ModerateMembers',
 	'MentionEveryone',
 	'ManageMessages',
+	'MoveMembers',
+	'MuteMembers',
+	'DeafenMembers',
+	'ManageNicknames',
+	'ManageThreads',
+	'ManageEvents',
+	'ManageGuildExpressions',
+	'ViewAuditLog',
 ];
+
+/** The flags of this list (PermissionFlagsBits keys) that are on the risky list, in the list's order. */
+export function riskyFlagsOf(flags) {
+	const given = new Set(flags ?? []);
+	return RISKY_ROLE_PERMISSIONS.filter((flag) => given.has(flag));
+}
 
 /** The risky permissions this role carries, by flag name (none when it carries no permission data). */
 export function riskyPermissionsOf(role) {
@@ -52,9 +72,33 @@ export function riskyPermissionsOf(role) {
 }
 
 /** The risky permissions as they are said out loud. */
-function riskyLabels(flags) {
+export function riskyLabels(flags) {
 	const names = tRaw('tools.roles.risky_permission_names') ?? {};
 	return flags.map((flag) => names[flag] ?? flag).join(', ');
+}
+
+/**
+ * Did the owner name this role in their own words? A role found only approximately is asked about, and
+ * "approximately" used to be judged against `args.role`, which the model writes: the owner says "give
+ * Ali mod", the model writes "Moderator", and the question was never put. So the role's name is looked
+ * for in what the owner actually said in this request, word by word. In a language that glues its case
+ * endings on (the locale has no word_forms) the last word may carry one ("moderatoru ver"); elsewhere
+ * only a plural "s", so a transcript's "chillz" is still a guess at "Chill". Without a record of speech
+ * (no attribution, a test) the argument is all there is.
+ */
+function roleNamedByOwner(deps, role, asked) {
+	const wanted = normalize(role?.name ?? '').split(' ').filter(Boolean);
+	if (!wanted.length) return false;
+	if (typeof deps.ownerUtterance !== 'function') return normalize(role.name) === normalize(asked);
+	const opts = typeof deps.currentTurn === 'function' ? { turn: deps.currentTurn() ?? null } : {};
+	const said = normalize(deps.ownerUtterance(opts)?.text ?? '').split(' ').filter(Boolean);
+	const suffixing = !tRaw('keywords.word_forms');
+	const last = (heard, word) => heard === word || heard === `${word}s` || (suffixing && heard.startsWith(word));
+	for (let start = 0; start + wanted.length <= said.length; start++) {
+		const fits = wanted.every((word, k) => (k === wanted.length - 1 ? last(said[start + k], word) : said[start + k] === word));
+		if (fits) return true;
+	}
+	return false;
 }
 
 async function grantOrRevoke(args, deps, { name }) {
@@ -100,13 +144,19 @@ async function grantOrRevoke(args, deps, { name }) {
 	}
 	// A role that only matched approximately ("mod" for "Moderator", a transcript's "chillz" for "Chill")
 	// is a guess at what the owner meant, and a wrong role is access the member keeps until somebody
-	// notices. The role that was found is named out loud, and the grant waits for a yes.
-	if (granting && normalize(role.name) !== normalize(args.role)) {
+	// notices. The role that was found is named out loud, and the grant waits for a yes, unless the owner
+	// said its name themselves (roleNamedByOwner).
+	if (granting && !roleNamedByOwner(deps, role, args.role)) {
+		// The model may have written the role's exact name for a word the owner said differently; then
+		// there is no "closest match" to talk about, only a name the owner did not say.
+		const exact = normalize(role.name) === normalize(args.role);
 		const decision = checkConfirmation(deps, {
 			key: name,
 			target: `${member.id}:${role.id}`,
 			confirm: args.confirm,
-			question: t('tools.roles.fuzzy_role_question', { name: String(args.role ?? ''), role: role.name, who }),
+			question: exact
+				? t('tools.roles.unheard_role_question', { role: role.name, who })
+				: t('tools.roles.fuzzy_role_question', { name: String(args.role ?? ''), role: role.name, who }),
 		});
 		if (decision.ask) return askConfirmation(decision.ask, { member: who, role: role.name, fuzzy: true });
 	}

@@ -43,7 +43,26 @@ export default {
 	// -mek/-mak (the infinitive) begin the same way and are not negatives, so they are excluded. Before
 	// -iyor the negative loses its vowel ("silmiyorum", "onaylamiyorum"), so -miyor/-muyor is one too;
 	// -mis (the reported past, "silmis") is not.
-	negation: { pattern: '^m(?:[ae](?![lk])|[iu]yor)', flags: 'u' },
+	// A verb made from a noun takes -la/-le before the negative: "banlama" and "yasaklama" are "ban" and
+	// "yasak" with "do not" glued on through it, and a prefix match on the noun read them as the command.
+	// The verbal noun is built with the same -ma/-me and is not a negative at all: "silmeni istiyorum" (I
+	// want you to delete it), "silmen lazim", "silmesini", "silmeyi". Its possessive and case endings
+	// (-n, -ni, -niz, -si, -sini, -yi, -ye...) are let through; the negative forms that begin the same way
+	// ("silmesin", "silmeyin", "silmem") are not among them. A bare "silme" can be either, and stays a no.
+	negation: {
+		pattern: '^(?:l[ae])?m(?:[ae](?![lk])(?!(?:n(?:[iu](?:z(?:[iu]|[ea])?|n)?|[ea]|d[ea]n)?|s[iu](?:n(?:[iu]|[ea]|d[ea]n))?|y(?:[iu]|[ea]))$)|[iu]yor)',
+		flags: 'u',
+	},
+	// The shape of a whole word that is a negated verb, whatever the verb: "silme", "banlama", "yapmayin",
+	// "yapmasan", "olmaz", "yapmadi", "yapmayacagim", "yapmamalisin", "onaylamiyorum". An answer can say
+	// no with the verb it is about ("tamam, banlama": okay, do not ban), and that verb is in no word list,
+	// so a word of this shape is a no in the owner's answer. A noun that happens to end the same way
+	// ("sinema") reads as a no too, which only ever costs a question asked again.
+	negative_word: {
+		pattern:
+			'^[a-z]{2,}m(?:[ae](?:y[iu]n(?:[iu]z)?|s[ae]n(?:[ae]|[iu]z[ae])?|s[iu]n(?:l[ae]r)?|y[ae]l[iu]m|z(?:s[iu]n(?:[iu]z)?|[iu]z|l[ae]r)?|d[iu](?:m|n|k|n[iu]z|l[ae]r)?|y[ae]c[ae][kg][a-z]*|m[ae]l[iu][a-z]*)?|[iu]yor[a-z]*)$',
+		flags: 'u',
+	},
 	inflection: {
 		pattern:
 			'^(?:[ea]bil|[iu]ver)?(?:(?:s[ea]n(?:[ea]|[iu]z[ea])?|s[iu]n(?:[iu]z)?|[iu]n(?:[iu]z)?|[ea]lim|[ea]yim|[ea]c[ea]k|[iu]yor|[eaiu]r|[dt][iu])(?:m|n|k|z|[iu]m|[iu]z|s[iu]n(?:[iu]z)?|l[ea]r)?)?$',
@@ -66,6 +85,9 @@ export default {
 		'sesli', 'seslen',
 		'cikartma', 'tamamen', 'tamamla', 'hayirli', 'aslan',
 	],
+	// Set phrases that hold a command word and ask for nothing (see the English table). The prefix match
+	// and the look-alikes above already cover what Turkish has of these.
+	phrase_lookalikes: [],
 	// Owner-gate keywords: for an admin tool to run, the owner must have said one of these words.
 	// An entry of three letters or more matches as a prefix ("ban" also matches "banla"); an entry
 	// written as "=word" is a stem and matches only itself plus the inflections above. Everyday words
@@ -119,15 +141,20 @@ export default {
 
 	// The owner's answer to a two-step confirmation ("Sam'i banlayayim mi?"). A yes counts only when the
 	// owner's words since the question hold one of these and none of the no words. A yes word with the
-	// negative glued on ("yapma", "onaylamiyorum") is read as a no (see negation above). "onayliyor" is
-	// listed on its own because the a of "onayla" drops before -iyor. "iptal" is not a no word here: it is
-	// the verb of an action being confirmed ("evet, iptal et" to "etkinligi iptal edeyim mi?"), and a bare
-	// "iptal" already does nothing, because nothing acts without a yes.
+	// negative glued on ("yapma", "onaylamiyorum") is read as a no, and so is any negated verb at all
+	// (negative_word above): in "tamam, banlama" the no is on the verb, not on the yes. "degil" says no
+	// to the word before it ("kesinlikle degil"), and "kalsin" (let it stay) is a no to changing it.
+	// "onayliyor" is listed on its own because the a of "onayla" drops before -iyor. "iptal" and "unut"
+	// are no words except when they are the verb of the thing being asked about: "evet, iptal et" to
+	// "etkinligi iptal edeyim mi?" is a yes, because the question's own command words are not read as a no.
 	confirm_yes: [
 		'=evet', '=onay', 'onayla', 'onayliyor', 'tamam', '=olur', '=yap', 'aynen', 'kesinlikle', '=tabii', '=tabi',
 		'elbette', '=peki',
 	],
-	confirm_no: ['hayir', '=yok', 'vazgec', '=dur', 'bekle', 'olmaz', '=etme', 'istemiyorum', '=istemem', '=sakin', 'asla'],
+	confirm_no: [
+		'hayir', '=yok', 'vazgec', '=dur', 'bekle', 'olmaz', '=etme', 'istemiyorum', '=istemem', '=sakin', 'asla',
+		'degil', 'kalsin', 'iptal', 'unut', 'bosver', 'bos ver',
+	],
 
 	// Mention resolution: names that mean the whole channel rather than one member.
 	everyone_mention_words: ['everyone', 'herkes', 'everyone.', 'tümü', 'tumu'],

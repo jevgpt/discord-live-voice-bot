@@ -21,7 +21,7 @@ import { tools as serverTools } from './server.js';
 import { tools as videoTools } from './video.js';
 import { tools as identityTools } from './identity.js';
 import { tools as imageTools } from './images.js';
-import { needsCallContext, noteUntrustedRead, ownerGate, settleSpokenAnswer } from './helpers.js';
+import { needsCallContext, noteActionWords, noteUntrustedRead, ownerGate, settleSpokenAnswer } from './helpers.js';
 import { t } from '../i18n/index.js';
 
 // Tools whose output is other people's words: what was written in a channel (read_messages goes through
@@ -29,7 +29,8 @@ import { t } from '../i18n/index.js';
 // and summaries of what was said. Any of it can be phrased as an order, and the model reads it in the
 // middle of a request. Their output goes back as quoted material under a notice that says so (see
 // toolOutput), and once one of them has run in a turn, every owner-only tool in the rest of that turn
-// asks the owner out loud first (see untrustedGate in helpers.js). Kept in one list rather than on each
+// asks the owner out loud first (see untrustedGate in helpers.js), and so does posting anything in the
+// bot's name and reading what @everyone cannot (askAfterUntrustedRead). Kept in one list rather than on each
 // definition so the whole set can be read in one place; a name here that no module defines stops the
 // start-up below, so a renamed tool cannot silently lose the flag.
 const UNTRUSTED_OUTPUT = new Set([
@@ -68,6 +69,9 @@ for (const list of [
 	for (const tool of list) {
 		if (REGISTRY.has(tool.name)) throw new Error(`tool defined twice: ${tool.name}`);
 		REGISTRY.set(tool.name, tool);
+		// The owner's answer to a question about this tool is read knowing its command words: "yes, cancel
+		// it" is a yes to cancelling an event and a no to anything else (see readAnswer).
+		if (tool.gate?.keywords) noteActionWords(tool.name, tool.gate.keywords);
 	}
 }
 for (const name of UNTRUSTED_OUTPUT) {
@@ -79,11 +83,12 @@ export function toolDefinitions() {
 	return [...REGISTRY.values()].map((tool) => tool.definition);
 }
 
-/** Tool name -> { gated, keywords, untrusted } (for tests/documentation). */
+/** Tool name -> { gated, asks, keywords, untrusted } (for tests/documentation). */
 export function toolMeta() {
 	return [...REGISTRY.values()].map((tool) => ({
 		name: tool.name,
 		gated: Boolean(tool.gate),
+		asks: Boolean(tool.asks),
 		keywords: tool.gate?.keywords ?? null,
 		untrusted: UNTRUSTED_OUTPUT.has(tool.name),
 	}));

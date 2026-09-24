@@ -2,7 +2,7 @@
 
 import { t, tList } from '../i18n/index.js';
 import { requesterId, requesterIsOwner } from './access.js';
-import { WORDS, displayName, findMember, ownerGate } from './helpers.js';
+import { WORDS, askAfterUntrustedRead, displayName, findMember, ownerGate } from './helpers.js';
 import { P, defineTool } from './registry.js';
 
 /** Memory is not wired up (.env: MEMORY=0); every memory tool answers the same way. */
@@ -28,6 +28,8 @@ export const tools = [
 		description:
 			'Saves a short note to keep in mind about a person (e.g. "their cat is called Smokey", "exam on Friday"). If member is empty, the current speaker.',
 		parameters: P.obj({ member: P.str('Person name (empty = the current speaker)'), note: P.str('Short note') }, ['note']),
+		// A note about somebody else goes through the owner gate, which can ask the owner first.
+		asks: true,
 		async handler(args, deps, { name }) {
 			if (!deps.memory) return noMemory();
 			const target = await targetOf(deps, args.member);
@@ -65,7 +67,9 @@ export const tools = [
 			member: P.str('Person name (empty = the current speaker)'),
 			search: P.str('Word or phrase to look for across the saved notes; an empty string returns the most recent notes'),
 		}),
-		async handler(args, deps) {
+		// Other people's notes, after other people's words were read in the same turn, wait for a yes.
+		asks: true,
+		async handler(args, deps, { name }) {
 			if (!deps.memory) return noMemory();
 			// Notes are written about people who never hear them read back ("exam on Friday", "does not get
 			// on with Ali"). The owner may look through all of them; anybody else only through their own,
@@ -74,6 +78,12 @@ export const tools = [
 			const owner = requesterIsOwner(deps);
 			if (args.search !== undefined && args.search !== null) {
 				if (!owner && !speakerId) return { ok: false, spoken: t('tools.memory.recall_unknown_speaker') };
+				// The owner's search runs through everybody's notes. After other people's words were read in
+				// this turn, that is not done on the strength of a message asking for it (askAfterUntrustedRead).
+				if (owner) {
+					const asked = askAfterUntrustedRead(deps, name);
+					if (asked) return asked;
+				}
 				const hits = deps.memory.search(String(args.search), owner ? {} : { userId: speakerId });
 				if (!hits.length) {
 					return { ok: true, spoken: t('tools.memory.search_empty', { query: String(args.search) }), data: { notes: [] } };
@@ -86,6 +96,10 @@ export const tools = [
 			if (!owner && target.id !== speakerId) {
 				deps.log?.(t('tools.memory.log_recall_refused', { who: target.name ?? target.id }));
 				return { ok: false, denied: true, spoken: t('tools.memory.recall_own_only') };
+			}
+			if (target.id !== speakerId) {
+				const asked = askAfterUntrustedRead(deps, name);
+				if (asked) return asked;
 			}
 			const notes = deps.memory.notesFor(target.id);
 			if (!notes.length) {
@@ -114,6 +128,8 @@ export const tools = [
 			{ member: P.str('Person name (empty = the current speaker)'), note: P.str('Part of the note to delete; "all" = every note') },
 			['note'],
 		),
+		// Somebody else's notes go through the owner gate, which can ask the owner first.
+		asks: true,
 		async handler(args, deps, { name }) {
 			if (!deps.memory) return noMemory();
 			const target = await targetOf(deps, args.member);
