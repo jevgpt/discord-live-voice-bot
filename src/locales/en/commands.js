@@ -62,7 +62,7 @@ export default {
 		},
 		summary: {
 			name: 'summary',
-			description: 'Summary of the recent conversations',
+			description: 'Summary of the recent conversations here, from the channels you can read',
 			options: { hours: { name: 'hours', description: 'How many hours back (default 3)' } },
 		},
 		recording: {
@@ -93,6 +93,9 @@ export default {
 	// The command came from a server the bot is not set up for (it is not in VOICE_TARGETS, or it was
 	// left for good); /join is the way back in.
 	no_guild_session: 'I am not set up for this server. Bring me into a voice channel with `/join` first.',
+	// /join in a server outside GUILD_ID/VOICE_TARGETS: a new session there is on the owner's keys, so
+	// only the owner and ADMIN_USER_IDS may start one.
+	join_unconfigured_denied: 'I am not set up for this server, and only my owner can bring me into a new one.',
 
 	log_registered: 'Slash commands registered.',
 	log_register_failed:
@@ -100,6 +103,7 @@ export default {
 	log_interaction_error: 'Interaction error ({command}): {error}',
 	error_generic: 'Something went wrong: {error}',
 	gate_denied_activity: '{command}: denied (not allowed)',
+	gate_unconfigured_activity: 'join in {guild}: denied (not a configured server; only the owner or ADMIN_USER_IDS may start a session there)',
 
 	modal_new_title: 'New character',
 	modal_edit_title: 'Edit: {name}',
@@ -178,6 +182,7 @@ export default {
 	ok: 'Done.',
 	failed: 'That did not work.',
 	summary_unavailable: 'The summary feature is not part of this setup.',
+	summary_guild_only: 'Ask for the summary inside the server: it covers the channels you can read there.',
 	record_status:
 		'Recording is currently {state}. (While it is off, voice transcripts and message texts are not written to the panel log; no summary can be made.)',
 	record_state_on: 'ON',

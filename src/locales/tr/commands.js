@@ -60,7 +60,7 @@ export default {
 		},
 		summary: {
 			name: 'ozet',
-			description: 'Son konuşmaların özeti',
+			description: 'Buradaki son konuşmaların özeti, okuyabildiğin kanallardan',
 			options: { hours: { name: 'saat', description: 'Kaç saat geriye (varsayılan 3)' } },
 		},
 		recording: {
@@ -91,6 +91,9 @@ export default {
 	// The command came from a server the bot is not set up for (it is not in VOICE_TARGETS, or it was
 	// left for good); /join is the way back in.
 	no_guild_session: 'Bu sunucu için ayarlı değilim. Önce `/katil` ile bir sesli kanala çağır.',
+	// /join in a server outside GUILD_ID/VOICE_TARGETS: a new session there is on the owner's keys, so
+	// only the owner and ADMIN_USER_IDS may start one.
+	join_unconfigured_denied: 'Bu sunucu için ayarlı değilim; beni yeni bir sunucuya yalnızca sahibim getirebilir.',
 
 	log_registered: 'Slash komutları kaydedildi.',
 	log_register_failed:
@@ -98,6 +101,7 @@ export default {
 	log_interaction_error: 'Etkileşim hatası ({command}): {error}',
 	error_generic: 'Bir hata oldu: {error}',
 	gate_denied_activity: '{command}: reddedildi (yetkisiz)',
+	gate_unconfigured_activity: '{guild} sunucusunda katılma: reddedildi (ayarlı bir sunucu değil; orada oturumu yalnızca sahip ya da ADMIN_USER_IDS açabilir)',
 
 	modal_new_title: 'Yeni karakter',
 	modal_edit_title: 'Düzenle: {name}',
@@ -176,6 +180,7 @@ export default {
 	ok: 'Tamam.',
 	failed: 'Olmadı.',
 	summary_unavailable: 'Özet özelliği bu kurulumda yok.',
+	summary_guild_only: 'Özeti sunucunun içinden iste: orada okuyabildiğin kanalları kapsar.',
 	record_status:
 		'Kayıt şu an {state}. (Kapalıyken ses dökümleri ve mesaj metinleri panel günlüğüne yazılmaz; özet çıkarılamaz.)',
 	record_state_on: 'AÇIK',

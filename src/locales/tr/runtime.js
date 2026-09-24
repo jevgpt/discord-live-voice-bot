@@ -188,6 +188,9 @@ export default {
 	live_cap_reached: '"{guild}" için GPT-Live açılmadı: {max} sunucu zaten oturum tutuyor (MAX_LIVE_SESSIONS).',
 	live_cap_reason: 'sıra bekliyor (en fazla {max} sunucu)',
 	session_dropped: '"{guild}" oturumu kapatıldı ve bırakıldı (kalıcı ayrılma).',
+	// A join asked for a session in a server outside GUILD_ID/VOICE_TARGETS without the owner's word.
+	session_start_refused: '"{guild}" için oturum kurulmadı: ayarlı bir sunucu değil ve bunu sahip istemedi.',
+	session_start_refused_reason: 'bu sunucu için ayarlı değilim ve beni yeni bir sunucuya yalnızca sahibim getirebilir',
 	live_paused: 'GPT-Live oturumu kapatıldı ({reason})',
 	live_paused_log: 'GPT-Live oturumu kapatıldı ({reason}).',
 	idle_close: 'Uzun süredir konuşan yok; GPT-Live oturumu kapatılıyor (ücret durur).',

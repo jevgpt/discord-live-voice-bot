@@ -18,7 +18,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client, Events, GatewayIntentBits, Partials } from 'discord.js';
 import { OpenAI } from 'openai';
-import { handleInteraction, RecentActions, registerCommands } from './commands.js';
+import { handleInteraction, mayStartSession, RecentActions, registerCommands } from './commands.js';
 import { loadConfig } from './config.js';
 import { maskSecret, updateEnvFile } from './envfile.js';
 import { GuildSession } from './guildsession.js';
@@ -292,12 +292,22 @@ function nameForUser(userId) {
  * Every join goes through here: /join, the join_voice tool and a rejoin after a permanent leave. A
  * channel in a server with no session gets that session built around it (start() does the join), so a
  * new server can be picked up without a restart.
+ *
+ * Building one costs a realtime connection on the owner's keys and a MAX_LIVE_SESSIONS slot, so outside
+ * cfg.targets it happens only when `requesterId` is the owner or in ADMIN_USER_IDS (mayStartSession).
+ * /join passes who asked; the tools pass nobody. They can only name channels of their own session's
+ * server, so they reach this branch only once that session has been dropped (left for good), and then a
+ * voice in the room must not be able to bring it back in a server nobody configured.
  */
-async function joinChannel(channel) {
+async function joinChannel(channel, { requesterId = null } = {}) {
 	const guildId = channel?.guildId ?? channel?.guild?.id ?? null;
 	const existing = sessionFor(guildId);
 	if (existing) return existing.joinVoice(channel);
 	if (guildId) {
+		if (!mayStartSession({ cfg, guildId, userId: requesterId })) {
+			log(t('runtime.session_start_refused', { guild: channel?.guild?.name ?? guildId }));
+			throw new Error(t('runtime.session_start_refused_reason'));
+		}
 		await ensureSession(guildId, channel.id);
 		return undefined;
 	}
@@ -357,7 +367,7 @@ function buildContext(session) {
 		// Events from an interaction are tagged with the guild they belong to, like the session's own.
 		activity: (event) => (session ? session.activity.push(event) : activity.push(event)),
 		callTool: (name, args) => callTool(name, args, session.deps()),
-		joinVoice: (channel) => joinChannel(channel),
+		joinVoice: (channel, options) => joinChannel(channel, options),
 		leaveVoice: (options) => session?.leaveVoice(options),
 		// /status reports every server, this one first.
 		sessions: () => sessionSnapshots(session),
@@ -463,7 +473,11 @@ client.on(Events.MessageCreate, (message) => {
 	// Guild events are tagged with their server; a DM has none to tag.
 	const push = session ? (event) => session.record(event) : record;
 	if (message.member) session?.rememberMember(message.member);
-	const where = isDm ? null : { channel: `#${message.channel?.name ?? '?'}` };
+	// The ids are for src/summary.js: the log holds every channel of every server, and a summary may only
+	// quote the server it is asked in and the channels its audience can read. The name is for the panel.
+	const where = isDm
+		? null
+		: { channel: `#${message.channel?.name ?? '?'}`, channelId: message.channelId ?? message.channel?.id ?? null, guildId: message.guild.id };
 	if (!message.author?.bot) {
 		const text = String(message.content ?? '').trim() || (message.attachments?.size ? t('runtime.image_placeholder') : '');
 		if (text) {

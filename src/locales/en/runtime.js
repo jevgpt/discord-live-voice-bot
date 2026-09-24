@@ -188,6 +188,9 @@ export default {
 	live_cap_reached: 'GPT-Live is not opened for "{guild}": {max} servers already hold a session (MAX_LIVE_SESSIONS).',
 	live_cap_reason: 'waiting for a slot ({max} servers at most)',
 	session_dropped: 'The session of "{guild}" was closed and dropped (left for good).',
+	// A join asked for a session in a server outside GUILD_ID/VOICE_TARGETS without the owner's word.
+	session_start_refused: 'No session was built for "{guild}": it is not a configured server, and the owner did not ask for it.',
+	session_start_refused_reason: 'this server is not set up, and only my owner can bring me into a new one',
 	live_paused: 'The GPT-Live session was closed ({reason})',
 	live_paused_log: 'The GPT-Live session was closed ({reason}).',
 	idle_close: 'Nobody has spoken for a long time; closing the GPT-Live session (billing stops).',

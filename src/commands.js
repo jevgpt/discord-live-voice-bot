@@ -5,7 +5,9 @@
 //   "New character" modal: name, prompt (long text), voice (optional)
 // Permissions: changing/deleting a character, sending a message, reading a channel, leaving and the
 //   recording switch are limited to the owner / ADMIN_USER_IDS / ADMIN_ROLE_IDS / members with the
-//   "Manage Server" permission (src/auth.js).
+//   "Manage Server" permission (src/auth.js). /join in a server outside GUILD_ID/VOICE_TARGETS builds a
+//   new session there, so it takes the owner or ADMIN_USER_IDS (mayStartSession). /summary covers only
+//   the channels the member could read themselves, unless they pass the gate above.
 // Voice commands (picked up from what is said in the channel) -- the phrasings themselves live in
 //   src/locales/<code>/grammar.js, so every language brings its own:
 //   "switch to the <name> character"     -> change character (the live session is rebuilt)
@@ -283,6 +285,61 @@ async function denyUnlessPrivileged(interaction, ctx) {
 	return true;
 }
 
+/** Is this one of the servers the bot was set up for: the GUILD_ID pair or a VOICE_TARGETS entry? */
+export function isConfiguredGuild(cfg, guildId) {
+	if (!guildId) return false;
+	const id = String(guildId);
+	if (cfg?.guildId && String(cfg.guildId) === id) return true;
+	return Array.isArray(cfg?.targets) && cfg.targets.some((target) => target?.guildId && String(target.guildId) === id);
+}
+
+/**
+ * May `userId` make the bot build a session for this server? A configured server keeps the rule it always
+ * had: anybody who can reach /join there. Any other server gets one only from the owner or ADMIN_USER_IDS.
+ * A new session is a realtime connection billed to the owner's API keys, one of the MAX_LIVE_SESSIONS
+ * slots (a stranger filling them silences the owner's own server) and the tools that come with it; and
+ * whoever invited a public bot into their own server holds Manage Server and every role there, so the
+ * rest of isPrivileged() proves nothing about a foreign server.
+ */
+export function mayStartSession({ cfg, guildId, userId }) {
+	if (isConfiguredGuild(cfg, guildId)) return true;
+	const id = userId ? String(userId) : null;
+	if (!id) return false;
+	if (cfg?.ownerId && id === String(cfg.ownerId)) return true;
+	return Array.isArray(cfg?.adminUserIds) && cfg.adminUserIds.includes(id);
+}
+
+/**
+ * /join in a server that has no session builds one (see mayStartSession); this answers everybody else.
+ * A server that already has a session is not asked about: moving the bot there is what /join always did.
+ */
+async function denyUnlessMayStartSession(interaction, ctx) {
+	if (ctx.hasSession?.() !== false) return false;
+	if (mayStartSession({ cfg: ctx.config, guildId: interaction.guildId, userId: interaction.user?.id })) return false;
+	const guild = interaction.guild?.name ?? interaction.guildId ?? '?';
+	ctx.activity?.({
+		kind: 'gate',
+		who: interaction.user?.id ?? null,
+		whoName: interaction.member?.displayName ?? interaction.user?.username ?? null,
+		text: t('commands.gate_unconfigured_activity', { guild }),
+		meta: { result: 'denied', guild },
+	});
+	await interaction.reply({ content: t('commands.join_unconfigured_denied'), flags: MessageFlags.Ephemeral }).catch(() => {});
+	return true;
+}
+
+/**
+ * Who a written summary is for (see summarizeConversation in src/summary.js). The log it is made from
+ * holds every text channel of the server, so a member gets the channels they could read themselves; the
+ * people the bot already trusts with /read get all of them. It is this server only either way. A DM has
+ * no server to judge a member by, so there it is null: the command answers that it needs a server.
+ */
+export function summaryAudience(interaction, cfg) {
+	if (interactionPrivileged(interaction, cfg)) return { everything: true };
+	if (!interaction.guildId || !interaction.member) return null;
+	return { readers: [interaction.member] };
+}
+
 async function handleAutocomplete(interaction, ctx) {
 	const focused = interaction.options.getFocused(true);
 	const needle = normalize(focused.value ?? '');
@@ -301,7 +358,9 @@ async function joinFromInteraction(interaction, ctx, chosen) {
 	}
 	await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 	try {
-		await ctx.joinVoice(chosen);
+		// Who asked travels with the join: the registry builds a session for an unconfigured server only
+		// on the owner's word, and a join without a requester is taken as nobody's.
+		await ctx.joinVoice(chosen, { requesterId: interaction.user?.id ?? null });
 		await interaction.editReply({ content: t('commands.joined', { channel: chosen.name }) });
 	} catch (err) {
 		await interaction.editReply({ content: t('commands.join_failed', { error: err.message }) });
@@ -311,6 +370,7 @@ async function joinFromInteraction(interaction, ctx, chosen) {
 async function handleCommand(interaction, ctx) {
 	switch (interaction.commandName) {
 		case 'join': {
+			if (await denyUnlessMayStartSession(interaction, ctx)) return;
 			const chosen = interaction.options.getChannel('channel') ?? interaction.member?.voice?.channel ?? null;
 			await joinFromInteraction(interaction, ctx, chosen);
 			return;
@@ -446,12 +506,17 @@ async function handleCommand(interaction, ctx) {
 		}
 		case 'summary': {
 			const hours = interaction.options.getInteger('hours') ?? 3;
+			const audience = summaryAudience(interaction, ctx.config);
+			if (!audience) {
+				await interaction.reply({ content: t('commands.summary_guild_only'), flags: MessageFlags.Ephemeral });
+				return;
+			}
 			await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 			if (typeof ctx.summarize !== 'function') {
 				await interaction.editReply({ content: t('commands.summary_unavailable') });
 				return;
 			}
-			const { summary } = await ctx.summarize({ hours, spoken: false });
+			const { summary } = await ctx.summarize({ hours, spoken: false, audience });
 			await interaction.editReply({ content: summary.slice(0, 1900) });
 			return;
 		}
