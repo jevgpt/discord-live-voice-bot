@@ -20,12 +20,12 @@
   "author": "serefsiz",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/534552454653495A/discord-live-voice-bot.git"
+    "url": "git+https://github.com/jevgpt/discord-live-voice-bot.git"
   },
   "bugs": {
-    "url": "https://github.com/534552454653495A/discord-live-voice-bot/issues"
+    "url": "https://github.com/jevgpt/discord-live-voice-bot/issues"
   },
-  "homepage": "https://github.com/534552454653495A/discord-live-voice-bot#readme",
+  "homepage": "https://github.com/jevgpt/discord-live-voice-bot#readme",
   "type": "module",
   "engines": {
     "node": ">=22.12"
