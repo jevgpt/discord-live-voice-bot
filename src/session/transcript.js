@@ -19,6 +19,7 @@
 import { executeAction } from '../agent.js';
 import { buildRuns, canEndAfter, runCandidates, runEnd, runSpan, runText } from '../runs.js';
 import { parseVoiceCommand } from '../commands.js';
+import { speakerPath } from '../speakerpath.js';
 import { t } from '../i18n/index.js';
 import { normalize, safeContext, stripSpokenPrefix } from '../text.js';
 import {
@@ -83,7 +84,23 @@ export const transcriptMethods = {
 		// nothing, because the window already starts where the last one ended.
 		let from = startMs;
 		const straddles = Number.isFinite(buf.lastEnd) && Number.isFinite(from) && Number.isFinite(endMs) && from < buf.lastEnd && endMs > buf.lastEnd;
+		// A fragment that has got no further than the last one brings no audio of its own: two pieces the far
+		// end sent from the same point of the stream ("şarkı" then "yı"), or one reported a little behind.
+		// Its window used to fall back to the whole utterance so far, so it was judged on everything said
+		// since the utterance began. Caught by the benchmark (bench/, the overlap rooms): a guest's "ban"
+		// sent that way, in an utterance the owner had held alone for four fifths of, came back as the
+		// owner's word and opened the gate. It is judged on the stretch the last fragment covered, which is
+		// the audio the far end had just heard when it sent both; its own end stays where it was reported.
+		const repeats =
+			!straddles && Number.isFinite(buf.lastEnd) && Number.isFinite(buf.lastFrom) && Number.isFinite(from) && Number.isFinite(endMs) && from < buf.lastEnd && endMs <= buf.lastEnd;
+		let judgedEnd = endMs;
 		if (straddles) from = buf.lastEnd;
+		if (repeats) {
+			from = buf.lastFrom;
+			judgedEnd = buf.lastEnd;
+		} else if (Number.isFinite(from)) {
+			buf.lastFrom = from;
+		}
 		if (Number.isFinite(endMs) && (!Number.isFinite(buf.lastEnd) || endMs > buf.lastEnd)) buf.lastEnd = endMs;
 		if (speaker === 'user') this.noteWindowShape(straddles);
 		let part = { text, startMs: from, endMs, id: null, sure: false, owner: false, confidence: 'unsure', ids: [] };
@@ -91,15 +108,31 @@ export const transcriptMethods = {
 			// ONE resolution per delta, made where the audio track lives and then reused for the record, for
 			// the model's context and for the run. Resolving it again downstream is how two parts of the code
 			// ended up naming two different people for the same words.
-			const hit = this.attribution.noteTranscript(text, { startMs: from, endMs });
+			const hit = this.attribution.noteTranscript(text, { startMs: from, endMs: judgedEnd });
 			this.health.fragment(hit);
 			this.health.driftNow(drift, this.attribution.driftRate);
-			this.trace?.delta({ audio: this.attribution.audioMs, rawStart, rawEnd, start: from, end: endMs, drift, text, hit });
+			this.trace?.delta({ audio: this.attribution.audioMs, rawStart, rawEnd, start: from, end: judgedEnd, drift, text, hit });
 			this.lastUserDeltaAt = Date.now();
 			// The reply gate asks its question as soon as the pieces stop for a moment (see judgeEarly).
 			if (this.earlyJudgeTimer) clearTimeout(this.earlyJudgeTimer);
 			this.earlyJudgeTimer = setTimeout(() => this.judgeEarly(), JEV_SETTLE_MS);
-			if (hit) part = { text, startMs: from, endMs, id: hit.id, sure: hit.sure, owner: hit.owner === true, confidence: hit.confidence, ids: hit.ids };
+			// The evidence travels with the part (reason, every candidate's share, the fragment's number), so the
+			// line pass can weigh a fragment against its neighbours without looking the audio up a second time.
+			if (hit) {
+				part = {
+					text,
+					startMs: from,
+					endMs,
+					id: hit.id,
+					sure: hit.sure,
+					owner: hit.owner === true,
+					confidence: hit.confidence,
+					ids: hit.ids,
+					reason: hit.reason,
+					ranked: hit.ranked,
+					seq: hit.seq,
+				};
+			}
 			// From the audio position to the wall clock: when did the user actually stop speaking?
 			const lag = Number.isFinite(endMs) ? Math.max(0, this.attribution.audioMs - endMs) : 0;
 			this.latency.userSpeechEnd(Date.now() - lag);
@@ -208,10 +241,15 @@ export const transcriptMethods = {
 			return;
 		}
 
+		// ATTRIBUTION=hmm reads the speakers of the whole flush as one path (src/speakerpath.js) before the
+		// line is cut; vote keeps every fragment's own answer. Either way the gate never sees this: it reads
+		// the attribution's record, which was written fragment by fragment in onTranscript.
+		const path = cfg.attribution === 'hmm';
+		const labelled = path ? speakerPath(parts, { ownerId: this.attribution.ownerId }) : parts;
 		const lines = [];
-		for (const run of buildRuns(parts)) {
+		for (const run of buildRuns(labelled)) {
 			const line = runText(run);
-			if (line) lines.push({ line, ...this.resolveLine(run), endMs: runEnd(run) });
+			if (line) lines.push({ line, ...this.resolveLine(run, { path }), endMs: runEnd(run) });
 		}
 		if (!lines.length) return;
 
@@ -261,8 +299,33 @@ export const transcriptMethods = {
 	 * still counted as talking. Judging the line by its worst delta therefore condemned nearly every line
 	 * in a busy channel, which is how a session ended up running no voice commands at all. Over the whole
 	 * stretch the same audio reads clearly: one voice holding nine tenths of it is one voice.
+	 *
+	 * With `path` (ATTRIBUTION=hmm) the run was cut along the speaker path, and the path's name for it is
+	 * the line's name. The span the path draws can hold more of a neighbour's audio than the run's own, and
+	 * named from the span it put the owner's name on lines that were not the owner's: 5 in 5,643 on the
+	 * benchmark, against 3 named by the path. The audio still has its say in `mixed` -- a span that does
+	 * not agree with the path is not one person's -- and in `owner`, which is the gate's own test over the
+	 * span and nothing else.
 	 */
-	resolveLine(run) {
+	resolveLine(run, { path = false } = {}) {
+		const decided = this.resolveLineByAudio(run);
+		if (!path) return decided;
+		const owner = this.attribution.ownerId;
+		if (run.id !== null) {
+			// A fragment the path gave a name its own audio did not (see speakerPath) is inference, and a line
+			// holding one is told as one that may hold somebody else's words: the path is a better guess
+			// than the vote at the edge of a turn, and still a guess.
+			const inferred = run.parts.some((part) => part.path === 'neighbours');
+			return { ...decided, id: run.id, mixed: decided.mixed || inferred || decided.id !== run.id, owner: decided.owner && run.id === owner };
+		}
+		// The path found nobody here. The span may still name a guest, as it would without the path; it may
+		// not name the owner, because the owner's name on a line comes from the path or not at all.
+		if (owner !== null && decided.id === owner) return { ...decided, id: null, mixed: true, owner: false };
+		return decided;
+	},
+
+	/** The line's owner as the audio under its whole span says it (see resolveLine). */
+	resolveLineByAudio(run) {
 		const span = runSpan(run);
 		const hit = span ? this.attribution.resolveSpeaker(span[0], span[1]) : null;
 		// Still happening in the field and I will not guess at it a third time. When a line turns out to

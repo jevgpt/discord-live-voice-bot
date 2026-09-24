@@ -383,6 +383,11 @@ function readConfig(env) {
 		agc: bool(env.AGC, true),
 		// A talk-spurt is read from this many frames in (a frame's margin against a late packet); 1 = read at once.
 		primeFrames: num(env.PRIME_FRAMES, 2, { min: 1, max: 5 }),
+		// Who a transcript line belongs to: hmm reads the speakers of a flush as one path (src/speakerpath.js),
+		// vote decides every fragment by its own audio. The owner gate is the same under both. hmm is the
+		// default because the benchmark (npm run bench) names more lines right and puts the owner's name on
+		// far fewer of somebody else's fragments with it, and on none more in any of its rooms.
+		attribution: oneOf(env.ATTRIBUTION, ['hmm', 'vote'], 'hmm'),
 		// Give the model silent context about who is speaking (name, owner or not, memory notes); off means it cannot tell people apart.
 		announceSpeaker: bool(env.ANNOUNCE_SPEAKER, true),
 		transcripts: bool(env.TRANSCRIPTS, true),

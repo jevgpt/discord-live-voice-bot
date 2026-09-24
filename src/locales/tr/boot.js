@@ -21,6 +21,9 @@ export default {
 	tools_client: 'Araçlar: istemci delegasyonu — yalnızca regex sesli komutlar; RESEARCH_MODEL ayarlarsan tüm araçlar açılır.',
 
 	owner_priority: 'Sahip önceliği açık: {owner} konuşurken yalnızca onun sesi işleniyor.',
+	attribution_path:
+		'Konuşmacı ataması: her satırda tek bir konuşmacı yolu (ATTRIBUTION=hmm); sıranın kenarındaki bir parça, kendi sesi aksini söylemedikçe komşularıyla gider.',
+	attribution_vote: 'Konuşmacı ataması: her parça kendi sesine göre (ATTRIBUTION=vote).',
 	no_owner_id: 'OWNER_ID ayarlı değil: sesli yönetici araçları (ban/rol/kanal/ayar) kapalı; slash yetkisi ManageGuild ile.',
 
 	music_on: 'Müzik açık: ses %{volume}, konuşurken %{duck}{folder}.',

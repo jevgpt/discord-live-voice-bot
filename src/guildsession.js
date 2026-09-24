@@ -166,7 +166,7 @@ export class GuildSession {
 		this.health = new SessionHealth();
 		this.healthTimer = setInterval(() => this.reportHealth(t('runtime.health_why_periodic', { minutes: HEALTH_EVERY_MS / 60_000 })), HEALTH_EVERY_MS);
 		this.healthTimer.unref?.();
-		this.trace = cfg.trace ? new SessionTrace({ dir: 'data/traces', text: cfg.recordTranscripts !== false, owner: cfg.ownerId ?? null, log: (line) => this.log(line) }) : null;
+		this.trace = cfg.trace ? new SessionTrace({ dir: 'data/traces', text: cfg.recordTranscripts !== false, owner: cfg.ownerId ?? null, attribution: cfg.attribution ?? null, log: (line) => this.log(line) }) : null;
 		if (this.trace) this.log(t('runtime.log_trace_started', { file: this.trace.file }));
 		this.audioTrace = cfg.traceAudio ? new AudioTrace({ dir: 'data/traces', log: (line) => this.log(line) }) : null;
 		if (this.audioTrace) this.log(t('runtime.log_trace_audio', { file: this.audioTrace.file }));

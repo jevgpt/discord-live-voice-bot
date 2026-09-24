@@ -32,10 +32,11 @@
   },
   "scripts": {
     "start": "node --env-file=.env src/index.js",
-    "lint": "oxlint --deny-warnings src test scripts",
+    "lint": "oxlint --deny-warnings src test scripts bench",
     "test": "node --test \"test/unit/*.test.js\" && node test/selftest.js",
     "test:unit": "node --test \"test/unit/*.test.js\"",
     "selftest": "node test/selftest.js",
+    "bench": "node bench/attribution.mjs",
     "check": "npm run lint && npm run check:locales && npm test",
     "ids": "node --env-file=.env scripts/ids.mjs",
     "roles-check": "node --env-file=.env scripts/roles-check.mjs",

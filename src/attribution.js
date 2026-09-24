@@ -563,6 +563,9 @@ export class SpeakerAttribution {
 			share: top.share,
 			speakers: ranked.length,
 			ids: ranked.map((entry) => entry.id),
+			// Every candidate's numbers, not just the headline: the line pass (src/speakerpath.js) weighs a
+			// runner-up against the neighbours of the fragment, and it has to weigh the same audio this did.
+			ranked: ranked.map(({ id, solo, share }) => ({ id, solo, share })),
 			heardMs,
 		};
 	}
@@ -701,6 +704,8 @@ export class SpeakerAttribution {
 			share: hit.share,
 			speakers: hit.speakers,
 			ids: hit.ids,
+			ranked: hit.ranked ?? [],
+			seq,
 		};
 	}
 

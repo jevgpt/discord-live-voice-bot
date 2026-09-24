@@ -118,6 +118,16 @@ describe('config.js: fixed choices', () => {
 		assert.match(warningFor(wrong, 'TOOLS_BACKEND'), /auto, responses, client/);
 		assert.match(warningFor(wrong, 'LOCAL_BRAIN_RESPOND'), /auto, addressed, always/);
 	});
+
+	it('reads ATTRIBUTION as hmm or vote, hmm by default, and reports anything else', () => {
+		assert.equal(loadConfig(baseEnv).attribution, 'hmm');
+		const vote = loadConfig({ ...baseEnv, ATTRIBUTION: 'Vote' });
+		assert.equal(vote.attribution, 'vote');
+		assert.deepEqual(vote.warnings, []);
+		const wrong = loadConfig({ ...baseEnv, ATTRIBUTION: 'viterbi' });
+		assert.equal(wrong.attribution, 'hmm', 'a value it cannot read keeps the default');
+		assert.match(warningFor(wrong, 'ATTRIBUTION'), /hmm, vote/);
+	});
 });
 
 describe('config.js: numbers', () => {

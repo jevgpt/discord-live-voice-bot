@@ -618,6 +618,7 @@ client.once(Events.ClientReady, async () => {
 		log(t('boot.text_generation', { provider: provider.describe() }));
 		log(cfg.useResponsesDelegation ? t('boot.tools_backend', { model: cfg.researchModel, count: toolDefinitions().length }) : t('boot.tools_client'));
 		if (cfg.ownerPriority && cfg.ownerId) log(t('boot.owner_priority', { owner: cfg.ownerId }));
+		log(t(cfg.attribution === 'vote' ? 'boot.attribution_vote' : 'boot.attribution_path'));
 		if (!cfg.ownerId) log(t('boot.no_owner_id'));
 		if (primary?.music) {
 			log(
