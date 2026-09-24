@@ -421,6 +421,8 @@ Runtime settings changed by voice or from the panel (`brain`, `owner_priority`, 
 apply to the server they were changed in and last until a restart. `record` is the exception: it decides
 what the one shared log writes to disk, so it is process-wide.
 
+---
+
 ## Upgrading from 1.32
 
 Most of 1.33 is invisible until somebody tries something they should not. The parts you may notice:
@@ -446,7 +448,9 @@ Most of 1.33 is invisible until somebody tries something they should not. The pa
 ```
 src/
   index.js          configuration, shared services, the session registry, event routing
-  guildsession.js   everything that belongs to one server: audio, session, transcript, tools
+  guildsession.js   one server's session: its fields, wiring, voice channel and lifecycle
+  session/          the rest of that class, by concern: transcript, replygate (Jev), speakers,
+                    livelink (the realtime session), localvoice, settings, constants
   live.js           GPT-Live WebSocket session and tool dispatch
   liveslots.js      MAX_LIVE_SESSIONS: who holds a slot, who gets the next one
   audio.js          mixing, floor control, AGC, ring buffers
@@ -539,7 +543,9 @@ was audible, and positions on a clock that is not ours. In the order they are pl
   otherwise.
 - **Reply control at the protocol**, if the realtime API exposes it: the application starting the reply
   after the verdict, instead of holding and dropping audio.
-- **The session module in pieces**: transcript pipeline, reply gate and speakers as modules of their own.
+- **The session module in pieces** (done, first cut): the transcript pipeline, the reply gate, speakers,
+  the realtime link and local voice each live in `src/session/`, each file saying which fields it writes
+  and which it only reads. The next cut turns the fields several of them share into interfaces.
 
 ## Licence
 
