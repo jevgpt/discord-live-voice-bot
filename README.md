@@ -45,19 +45,23 @@ that can hurt is locked behind an owner gate that answers one narrow question: *
 - **Real-time voice conversation.** Discord's Opus is decoded straight to 24 kHz mono, mixed, and
   streamed to the model in 20 ms frames; the reply comes back the same way. From "somebody stopped
   talking" to "first audio out" is typically about a second.
-- **118 server tools.** Messages and DMs, members, roles, channels and their layout and permissions,
+- **124 server tools.** Messages and DMs, members, roles, channels and their layout and permissions,
   threads and forum posts, reactions, pins and polls, emoji and stickers, scheduled events,
   auto-moderation, webhooks, moderation, invites, the audit log, server settings, music with saved lists,
   reminders, drawing, video reading, notes and conversation summaries. 67 of them are the owner's alone;
   the rest check who is asking before they act in the bot's name.
-- **Its own music player.** yt-dlp + ffmpeg, search or direct link, a queue, and **ducking**: the music
-  drops while the bot speaks and comes back when it stops.
+- **Its own music player.** yt-dlp + ffmpeg, search or direct link, a queue that survives a restart,
+  loop, shuffle, seek, "play this next", and **ducking**: the music drops while the bot speaks and comes
+  back when it stops.
 - **Per-person memory.** "Remember that my cat is called Smoke" is stored for you, and handed to the model
   the next time you speak (as notes about you, not as orders).
 - **Knows who is talking.** One voice at a time: while somebody holds the floor only their audio is sent,
   the floor passes at a pause to whoever has waited longest, and the owner takes it at once. Every
-  transcript fragment is placed against a per-person record of who was audible when, so each line reaches
-  the model under its speaker's name.
+  transcript fragment is placed against a per-person record of who was audible when, and a line is read
+  as one path of speakers rather than a vote per fragment, so each line reaches the model under its
+  speaker's name. How well is measured, not guessed: `npm run bench` scores it on simulated rooms.
+- **Hears quiet people, ignores fans.** Voice detection is per person, against their own microphone's
+  noise floor, so a quiet voice counts and a desk fan does not.
 - **Knows what is for it.** With a Jev key every line is judged as it settles (said to the bot? a request,
   a question, banter, people talking among themselves?) and a reply to a line that was not for the bot
   never reaches the channel.
@@ -65,7 +69,8 @@ that can hurt is locked behind an owner gate that answers one narrow question: *
   over: Whisper for ears, any chat model for the brain, Chatterbox for the voice.
 - **Reports on itself.** Every five minutes and whenever a session closes: clock drift, how much of the
   transcript the audio could place, what the owner gate refused and why, what Jev decided, slow tools,
-  and the audio path's own health. A flight recorder and a replay script turn a bad evening into a test.
+  and the audio path's own health, live on a dashboard with an hour of history. A flight recorder and a
+  replay script turn a bad evening into a test.
 - **Several servers at once**, each with its own conversation, model session, audio path, music queue and
   owner gate, under a cap you set.
 - **English and Turkish.** Every string a human sees lives in `src/locales/`; `BOT_LANGUAGE` picks one.
@@ -130,6 +135,11 @@ the active locale, so they work even without the tool backend:
 | --- | --- |
 | "play Rammstein Puppe" | Plays or queues a track |
 | "stop the music", "pause", "resume", "skip the song", "turn the music down", "what's playing" | Music control |
+| "play Puppe next" / "bundan sonra Puppe çal" | Puts it at the front of the queue |
+| "loop this song", "repeat the queue", "stop repeating" / "şarkıyı tekrarla", "tekrarı kapat" | Loops a track or the whole queue |
+| "shuffle" / "karıştır" | Shuffles what is waiting; the current track keeps playing |
+| "go to 1:30", "skip ahead 30 seconds", "start the song over" / "30 saniye ileri sar", "başa sar" | Seeks within the track |
+| "move 3 to 1", "remove 3 from the queue", "clear the queue" / "3'ü 1'e taşı", "sırayı temizle" | Queue editing |
 | "write hello in the general channel" | Posts a message |
 | "read the general channel" / "what's written in general" | Reads recent messages (channels *you* can read) |
 | "join the lounge channel" / "leave the channel" | Moves between voice channels |
@@ -235,6 +245,50 @@ and the model is told so instead of being handed a guess. Two things the transcr
 first: a word can arrive in pieces ("edebilirs" then "in"), and the transcript's clock runs about 1.3%
 ahead of the audio. The offset is fitted continuously from the upper envelope of where fragments land and
 taken off every position before it is looked up.
+
+**One path, not a vote.** Each fragment used to be decided by its own audio alone, and the edge of a turn
+is where that goes wrong: the last word of one person lands half in the next person's audio. A line is now
+read as one sticky path of speakers (a small Viterbi pass, `ATTRIBUTION=hmm`), so a boundary fragment takes
+its speaker from its neighbours unless its own audio clearly says otherwise. The path is allowed to take
+the owner's name off a fragment and never to put it on one, and the owner gate does not read the path at
+all: it reads the per-fragment record, as before.
+
+**Hearing who is talking at all.** "Is this person speaking" used to be one bar for every microphone (a
+peak of 400), which a quiet voice sat under and a desk fan sat over. Each person is now judged against
+their own microphone (`VAD=adaptive`): the frame's energy in dB after a high-pass, against the quietest
+moment of their last 1.6 seconds, 6 dB above it to start and 5 dB to keep going, never below -55 dBFS. A
+sound that holds steady for 300 ms becomes the new floor, which is how a fan stops being a person, and a
+frame whose peak towers 15 dB over its average is a click, not a word. The health report shows each
+person's floor and bar.
+
+**Measuring it.** Both of the above are judged on numbers, not on a good evening:
+
+- `npm run bench` plays 14 kinds of simulated room (clean handovers, a monologue taken over, the owner
+  cutting in, two voices summed, "evet" inside somebody else's turn, words in two pieces, late packets, the
+  1.3% clock, a transcript a second late, four people at once, guests saying the owner's commands) through
+  the real mixer, attribution, line pipeline and owner gate. Ground truth rides in the signs of each
+  packet's samples, so even audio released late after a handover is scored exactly.
+- `npm run bench:vad` runs generated voices at -18 to -48 dBFS over fans, hum, rumble, typing and music.
+
+| Attribution (112 rooms, 13,155 fragments) | vote | hmm |
+| --- | --- | --- |
+| fragments right | 98.3% | 98.3% |
+| lines wrong | 0.4% | 0.3% |
+| owner's name on somebody else's fragments / lines | 22 / 3 | 6 / 0 |
+| guest commands that opened the gate | 0 / 80 | 0 / 80 |
+
+| Voice detection (60 generated rooms) | peak (old) | adaptive |
+| --- | --- | --- |
+| quiet speaker at -42 dBFS, speech heard | 70.7% | 96.0% |
+| very quiet speaker at -48 dBFS | 45.1% | 85.5% |
+| fan, hum or music taken for speech | 52.8% | 1.7% |
+| words chopped in two | 1,122 | 487 |
+| a silent guest's fan holding the floor | 97.8% of the time | 0.4% |
+| cost per 20 ms tick, ten people | 33 µs | 59 µs |
+
+The rooms are simulated, so they compare the two ways fairly rather than promise a number for your
+server; `TRACE=1` in a real room is the real check, and `scripts/replay-trace.mjs --mode both` runs a real
+recording through both.
 
 **The reply.** The realtime model starts answering on its own about a second after somebody stops. With Jev
 the line is judged as soon as its pieces stop arriving; if the bot has not started speaking yet its audio
@@ -351,16 +405,27 @@ transcript comes back wrong, that file settles whether the far end misheard or t
 
 ## Admin panel
 
-`http://127.0.0.1:8787`: a live activity log with DMs and channel replies, voice transcripts, tool
-calls, gate decisions, latency, music and memory, plus a JSONL export. `/healthz` returns a status object
-and `/metrics` exposes Prometheus counters. The OpenAI and DeepSeek keys can be entered here; they are
+`http://127.0.0.1:8787` opens on a **dashboard**: a card per server (session state, who holds the floor,
+who is in voice, what is playing, the day's quota) and the last hour of that server in small charts:
+response time, session state, transcript drift, how much of the transcript the audio placed, gate
+decisions, Jev's verdicts and latency, tool latency, the audio loop's lateness and dropped frames. The
+history lives in memory only, ten-second slots for an hour, about 50 KB per server.
+
+The **Gate audit** tab lists every decision the owner gate took: the tool, who asked, allowed or refused,
+and why ("not the owner", "somebody spoke after", "waiting for a spoken yes", "untrusted read in this
+turn", "risky role refused"). The **Activity** tab has DMs and channel replies, voice transcripts, tool
+calls, music and memory, filters by kind, server and text, holds still while you read and exports exactly
+what is on screen as JSONL. The page updates over `/api/stream` (Server-Sent Events) and falls back to
+polling; it loads nothing from the network, works on a phone and follows the system's light or dark
+theme. `/healthz` returns a status object and `/metrics` exposes Prometheus counters, per server. The OpenAI and DeepSeek keys can be entered here; they are
 written into `.env` (after a backup of the old file) and never shown back in full.
 
 By default it binds to loopback only and checks the Host header against DNS rebinding. To reach it from
 elsewhere (a container, another machine) set `PANEL_HOST` and **`PANEL_TOKEN`**. Beyond loopback the
 panel refuses to start without a token. Visit `/login?token=…` once for a cookie (paste the token as it
 is; only `&`, `#` and `%` need percent-encoding), or send `Authorization: Bearer …`. Behind a reverse
-proxy, add the name it forwards to `PANEL_ALLOWED_HOSTS`.
+proxy, add the name it forwards to `PANEL_ALLOWED_HOSTS`. Every endpoint, the stream included, sits behind
+the same Host check and token, and with `RECORD_TRANSCRIPTS=0` none of them hands out anybody's words.
 
 `PANEL=0` turns it off; `RECORD_TRANSCRIPTS=0` keeps message and transcript text out of
 `data/activity.jsonl` entirely.
@@ -379,8 +444,8 @@ by it) under `tini`, which reaps the ffmpeg and yt-dlp children of a skipped tra
 through the same checksum-verified downloader the bot uses; pin it with
 `--build-arg YTDLP_VERSION=2026.08.19` for an image that builds the same way twice. The `HEALTHCHECK`
 (`node src/healthcheck.js`) asks `/healthz`, reading `PANEL`, `PANEL_PORT` and `PANEL_TOKEN` exactly the
-way the bot does, and passes when the panel is off. The panel's key form cannot rewrite `/app/.env` in a container, so keys belong in the
-`--env-file`. To open the panel from the host:
+way the bot does, and passes when the panel is off. The panel's key form cannot rewrite `/app/.env` in a
+container, so keys belong in the `--env-file`. To open the panel from the host:
 
 ```bash
 docker run --env-file .env -e PANEL_HOST=0.0.0.0 -e PANEL_TOKEN=<16+ characters> \
@@ -406,6 +471,8 @@ Every option lives in `.env` and is documented in [`.env.example`](.env.example)
 | `OWNER_PRIORITY` | `1` | While the owner speaks, only their audio is sent |
 | `AGC` | `1` | Per-speaker loudness towards −20 dBFS (+18 / −6 dB at most) |
 | `PRIME_FRAMES` | `2` | A talk-spurt is sent from this frame on, a margin against a late packet |
+| `VAD` | `adaptive` | Voice detection per person against their own noise floor; `peak` is the old single bar |
+| `ATTRIBUTION` | `hmm` | A line's speakers read as one path; `vote` decides every fragment on its own |
 | `RESEARCH_MODEL` | *(empty)* | Enables the full tool set and web search through the Responses API |
 | `BRAIN_MODE` | `auto` | `auto` falls back to the local brain, `local` always, `live` never |
 | `MUSIC_VOLUME` / `MUSIC_DUCK_VOLUME` | `35` / `12` | Music level, and its level while the bot speaks |
@@ -440,6 +507,10 @@ Most of 1.33 is invisible until somebody tries something they should not. The pa
 - A value the bot cannot read is reported at boot, and a switch it cannot read keeps its default instead
   of turning on.
 - The container runs as `node` (uid 1000): a mounted `data/` has to be writable by it.
+- Voice detection is per person now (`VAD=adaptive`) and lines are read as one path of speakers
+  (`ATTRIBUTION=hmm`). Both have the old behaviour one setting away: `VAD=peak`, `ATTRIBUTION=vote`.
+- The music queue, loop mode and volume are kept in `data/music-queues.json` and come back paused after a
+  restart. "Stop the music" still clears the queue.
 
 ---
 
@@ -457,22 +528,28 @@ src/
   bridge.js         the 20 ms send/receive loop
   voice.js          voice connection, receivers, packet-loss concealment, rejoin logic
   attribution.js    who said what, command words, spoken answers (the basis of the owner gate)
+  speakerpath.js    the Viterbi pass that reads a line's speakers as one path
   runs.js           transcript pieces -> one line per speaker
+  replay.js         the transcript pipeline without a session (benchmark and trace replay)
   jev.js            typed judgments (Jev)          health.js   the session's report on itself
   trace.js          flight recorder + replay (scripts/replay-trace.mjs)
   commands.js       slash commands and spoken-command grammar
-  music.js          yt-dlp + ffmpeg player with ducking
+  music.js          yt-dlp + ffmpeg player: queue, loop, shuffle, seek, ducking
+  queuestore.js     the music queue kept across restarts
   ytdlp.js          the checksum-verified yt-dlp download
   quota.js          the daily realtime budget, per-session usage
   summary.js        conversation summaries, scoped to a server and a readership
   localbrain.js     offline chat loop              localstt.js  offline ears
-  panel.js          admin panel                    memory.js    per-person notes
+  panel.js          admin panel: routes, auth, the live stream
+  panelpage.js      the dashboard page itself      metrics.js   an hour of history per server
+  memory.js         per-person notes
   config.js         .env parsing and the warnings it prints at boot
   healthcheck.js    the container's health check, reading the panel settings like the bot
-  tools/            the 118 model-callable tools (access.js: who is asking)
+  tools/            the 124 model-callable tools (access.js: who is asking)
   locales/          en and tr string bundles       i18n/        locale lookup
 tools/              Chatterbox server and install scripts
 test/               unit tests plus a full offline self-test
+bench/              simulated rooms for the attribution and the voice detector
 scripts/            locale checker, trace replay, id and role helpers
 ```
 
@@ -483,10 +560,16 @@ scripts/            locale checker, trace replay, id and role helpers
 ```bash
 npm run lint          # oxlint, warnings are errors
 npm run check:locales # both bundles hold the same keys; every key the code uses exists
-npm run test:unit     # node:test, ~660 tests
+npm run test:unit     # node:test, ~880 tests
 npm run selftest      # end-to-end offline test with a mocked realtime server
 npm run check         # all of the above, which is what CI runs on Node 22 and 24
+npm run bench         # attribution on simulated rooms, vote against hmm (--json for machines)
+npm run bench:vad     # the voice detector on generated voices and noise, peak against adaptive
 ```
+
+A change to how the bot decides who said what should come with its `npm run bench` table, before and
+after. The benchmark is not in `npm test` (it takes a few seconds per mode), but a small slice of it is,
+so it cannot quietly rot.
 
 The self-test runs the real audio path, the tool registry, the owner gate and a mock realtime server
 without touching the network, so it is safe to run anywhere, including on a train.
@@ -521,6 +604,14 @@ Every one of them is a test now.
   retry strategy.
 - **The 20 ms loop had a twin.** It never ticked; it only woke up and got counted, like a colleague who
   attends every meeting.
+- **A guest's "ban" could come back as the owner's word.** Only in a summed room, only when the far end sent
+  two pieces from the same point of the stream, 1 time in 80. Nobody would have found that by ear; the
+  benchmark found it on its first run.
+- **In the detector's test rooms, a desk fan was the most talkative member of the server.** It held the
+  floor 97.8% of the time. It has since been asked to wait its turn like everybody else.
+- **`/music stop` had never worked.** Every subcommand read the `query` option only `play` has, and Discord
+  throws on a missing required option. Saying "stop the music" worked all along, which may be why nobody
+  noticed.
 
 ---
 
@@ -536,11 +627,13 @@ was audible, and positions on a clock that is not ours. In the order they are pl
   supply, other people's words quoted instead of obeyed, and tools that check who is asking.
 - **The transcript's clock, settled**: the send rate is now measured against the wall clock; if it is
   exact, the ~1.3% drift is the far end's alone and the model of it stays.
-- **Per-person adaptive voice detection**: energy in dB against a tracked noise floor per person instead
-  of one absolute threshold for every microphone. A quiet speaker is a speaker; a fan is not.
-- **Fragment assignment as inference**: a sticky hidden-Markov path over a line's fragments instead of a
-  per-fragment vote, so a boundary fragment takes its speaker from its neighbours unless the audio says
-  otherwise.
+- **Per-person adaptive voice detection** (done): energy in dB against a tracked noise floor per person
+  instead of one absolute threshold for every microphone. A quiet speaker is a speaker; a fan is not.
+- **Fragment assignment as inference** (done): a sticky Viterbi path over a line's fragments instead of a
+  per-fragment vote, measured on simulated rooms before it was made the default.
+- **Owner cut-ins**: the benchmark shows about one owner command in ten refused when it is said right on a
+  guest's last syllable, because the owner is not alone for 80% of the word. The gate is right to be
+  strict; the floor handover can be quicker.
 - **Reply control at the protocol**, if the realtime API exposes it: the application starting the reply
   after the verdict, instead of holding and dropping audio.
 - **The session module in pieces** (done, first cut): the transcript pipeline, the reply gate, speakers,
