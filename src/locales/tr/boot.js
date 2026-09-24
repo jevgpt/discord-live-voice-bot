@@ -4,6 +4,8 @@
 // and the start-up summary written once the Discord client is ready.
 export default {
 	config_failed: 'Ayarlar okunamadı: {error}',
+	// One line per setting that was not read as written (config.warn_*); the bot starts regardless.
+	config_warning: 'Ayarlar: {warning}',
 
 	panel_history: 'Panel geçmişi yüklendi: {count} olay (data/activity.jsonl).',
 	joined_channel: '"{channel}" kanalına katıldım. Konuşulanlar dinleniyor.',

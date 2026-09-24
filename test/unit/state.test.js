@@ -11,9 +11,9 @@ import { CharacterStore } from '../../src/store.js';
 import { SpeakerAttribution } from '../../src/attribution.js';
 import { createTextProvider, providerFromDeps } from '../../src/provider.js';
 
-// Where the locale really decides what happens, the test switches it: config.js reads its on/off
-// words out of the bundle, and the owner-gate keyword table is language data too, so those two tests
-// call setLocale('tr') and put it back afterwards.
+// Where the locale really decides what happens, the test switches it: the owner-gate keyword table is
+// language data, so those tests call setLocale('tr') and put it back afterwards. config.js accepts the
+// on/off words of every language whatever the locale, and its test checks that under both.
 // MemoryStore and SpeakerAttribution match through normalize() (src/text.js), which folds Turkish
 // letters whatever the interface language is; the Turkish fixtures there are deliberate input.
 
@@ -77,7 +77,7 @@ describe('config.js', () => {
 		assert.equal(loadConfig({ ...baseEnv, MAX_LIVE_SESSIONS: '2.7' }).maxLiveSessions, 2);
 		assert.equal(loadConfig({ ...baseEnv, MAX_LIVE_SESSIONS: 'abc' }).maxLiveSessions, 2);
 	});
-	it('understands the Turkish spelling of "off" under the Turkish locale', () => {
+	it('understands the Turkish spelling of "off" whatever the locale', () => {
 		setLocale('tr');
 		try {
 			const cfg = loadConfig({ ...baseEnv, RECORD_TRANSCRIPTS: 'kapalı', MEMORY: 'hayır' });
@@ -86,7 +86,7 @@ describe('config.js', () => {
 		} finally {
 			setLocale('en');
 		}
-		assert.equal(loadConfig({ ...baseEnv, RECORD_TRANSCRIPTS: 'kapalı' }).recordTranscripts, true, 'the English bundle does not know that word');
+		assert.equal(loadConfig({ ...baseEnv, RECORD_TRANSCRIPTS: 'kapalı' }).recordTranscripts, false, 'the same .env means the same thing in English');
 	});
 });
 

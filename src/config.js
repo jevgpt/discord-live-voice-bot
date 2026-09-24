@@ -1,6 +1,9 @@
-// Environment-backed configuration. Fails loudly instead of half-working.
+// Environment-backed configuration. Fails loudly instead of half-working: a missing required variable
+// stops the start, and a value that cannot be read as written keeps its default and is reported (see
+// report() below), so a typo in .env is visible instead of silently meaning something else.
 
-import { t, tList } from './i18n/index.js';
+import { FALLBACK_LOCALE, SUPPORTED_LOCALES, resolveLocale, t, tList } from './i18n/index.js';
+import { normalize } from './text.js';
 
 /** Fallback persona of the assistant: the lines are joined with spaces, exactly as they were written. */
 function DEFAULT_INSTRUCTIONS() {
@@ -21,20 +24,127 @@ export function cleanEnvValue(value) {
 	return text;
 }
 
+// ---------------------------------------------------------------- warnings
+
+// What one loadConfig() call found wrong with the values it was given. Nothing here throws; the list is
+// handed back on the configuration (a non-enumerable `warnings`) and index.js prints it once at start.
+//
+// The helpers below are handed a value, not a variable name (`bool(env.PANEL, true)`), so that every
+// line of the configuration reads the same way and a newly added line is checked without being written
+// differently. The name is recovered from the read itself: loadConfig() reads the environment through a
+// view that notes each variable as it is read, and a helper with something to report names the most
+// recent read that produced its value, which is the argument it was just called with.
+let parsing = null;
+
+function report(value, key, params = {}) {
+	if (!parsing) return;
+	const name = parsing.reads.findLast(([, read]) => read === value)?.[0] ?? '?';
+	const text = t(key, { key: name, value: cleanEnvValue(value), ...params });
+	if (!parsing.warnings.includes(text)) parsing.warnings.push(text);
+}
+
+// ---------------------------------------------------------------- values
+
+// Spellings of on and off, and of "leave this field out". Every bundled language contributes its words
+// and all of them are accepted whatever BOT_LANGUAGE says, so switching the interface language never
+// changes what an existing .env means: "kapalı" is off in an English session and "off" in a Turkish one.
+// A word is compared as written (lower-cased) and folded (normalize() drops the Turkish letters, so
+// "KAPALI", "kapali" and "kapalı" are the same word).
+function spellings(key) {
+	const words = SUPPORTED_LOCALES.flatMap((code) => tList(key, null, code)).map((word) => String(word));
+	return new Set(words.flatMap((word) => [word.toLowerCase(), normalize(word)]).filter(Boolean));
+}
+const ON_WORDS = spellings('config.on_words');
+const OFF_WORDS = spellings('config.off_words');
+const NONE_WORDS = spellings('config.none_words');
+
+function spelled(words, text) {
+	return words.has(text.toLowerCase()) || words.has(normalize(text));
+}
+
+/** true / false for a recognised on/off spelling, null for anything else. */
+function onOff(text) {
+	if (spelled(ON_WORDS, text)) return true;
+	if (spelled(OFF_WORDS, text)) return false;
+	return null;
+}
+
+/** On/off setting. A value that is neither ("of", "maybe") keeps the default and is reported. */
 function bool(value, fallback = false) {
 	const text = cleanEnvValue(value);
 	if (!text) return fallback;
-	// The spellings that mean "off" come from the locale, so a translated .env keeps working.
-	return !new RegExp(`^(?:${tList('config.off_words').join('|')})$`, 'i').test(text);
+	const parsed = onOff(text);
+	if (parsed !== null) return parsed;
+	report(value, 'config.warn_bool', { fallback: t(fallback ? 'boot.on' : 'boot.off') });
+	return fallback;
 }
 
-/** Numeric setting: empty/invalid falls back to the default (no NaN leaks), with an optional range. */
+/**
+ * Numeric setting: empty falls back to the default (no NaN leaks), with an optional range. A value that
+ * is not a number keeps the default, and one outside the range is moved to its edge; both are reported.
+ */
 function num(value, fallback, { min = -Infinity, max = Infinity } = {}) {
 	const text = cleanEnvValue(value);
 	if (!text) return fallback;
 	const parsed = Number(text);
-	if (!Number.isFinite(parsed)) return fallback;
+	if (!Number.isFinite(parsed)) {
+		report(value, 'config.warn_number', { fallback });
+		return fallback;
+	}
+	if (parsed < min) report(value, 'config.warn_below', { limit: min });
+	if (parsed > max) report(value, 'config.warn_above', { limit: max });
 	return Math.min(max, Math.max(min, parsed));
+}
+
+/** One of a fixed set of words, case-insensitively; anything else keeps the default and is reported. */
+function oneOf(value, choices, fallback) {
+	const text = cleanEnvValue(value).toLowerCase();
+	if (!text) return fallback;
+	if (choices.includes(text)) return text;
+	report(value, 'config.warn_choice', { choices: choices.join(', '), fallback });
+	return fallback;
+}
+
+/**
+ * A privileged intent: "auto" asks the Developer Portal (index.js), an on/off spelling forces it. The
+ * value comes back as "auto", "on" or "off", which index.js reads the same in every language.
+ */
+function intent(value) {
+	const text = cleanEnvValue(value);
+	if (!text || text.toLowerCase() === 'auto') return 'auto';
+	const parsed = onOff(text);
+	if (parsed !== null) return parsed ? 'on' : 'off';
+	report(value, 'config.warn_intent');
+	return 'auto';
+}
+
+// A Discord ID (server, channel, user, role) is a snowflake: 17 to 20 digits. Anything else can never
+// match, and would otherwise only show up as a bot that quietly ignores somebody.
+const SNOWFLAKE = /^\d{17,20}$/u;
+
+/** One Discord ID, kept as written; reported when it cannot be one. */
+function id(value) {
+	const text = str(value);
+	if (text && !SNOWFLAKE.test(text)) report(value, 'config.warn_snowflake');
+	return text;
+}
+
+/** A comma-separated list of Discord IDs; every entry that cannot be one is reported. */
+function ids(value) {
+	const entries = list(value);
+	for (const entry of entries) {
+		if (!SNOWFLAKE.test(entry)) report(value, 'config.warn_snowflake', { value: entry });
+	}
+	return entries;
+}
+
+/** BOT_LANGUAGE -> the bundled locale it picks (the same rule src/i18n applies at import time). */
+function language(value) {
+	const text = cleanEnvValue(value);
+	if (!text) return FALLBACK_LOCALE;
+	const { code, known } = resolveLocale(text);
+	if (!known) report(value, 'config.warn_language', { supported: SUPPORTED_LOCALES.join(', '), fallback: code });
+	return code;
 }
 
 /** Comma-separated list. */
@@ -50,19 +160,29 @@ function list(value) {
  * VOICE_TARGETS adds more servers as a comma-separated list of "guildId:channelId" pairs.
  *
  * A guild that appears twice keeps its FIRST channel (one voice channel per server), and an entry
- * that is not a "guild:channel" pair is skipped. Nothing is logged from here: config.js either throws
- * in the "missing variable" style (a whole unusable configuration) or stays quiet, and one mistyped
- * extra target must not keep the primary server from booting.
+ * that is not a "guild:channel" pair is skipped. Neither throws: one mistyped extra target must not keep
+ * the primary server from booting. Both are reported instead, as is an ID that cannot be a Discord ID;
+ * repeating a pair exactly as it already stands changes nothing and says nothing.
  */
 function voiceTargets(value, primary) {
 	const targets = [primary];
-	const seen = new Set([primary.guildId]);
+	const channels = new Map([[primary.guildId, primary.channelId]]);
 	for (const entry of list(value)) {
 		const parts = entry.split(':').map((part) => part.trim());
-		if (parts.length !== 2 || !parts[0] || !parts[1]) continue;
+		if (parts.length !== 2 || !parts[0] || !parts[1]) {
+			report(value, 'config.warn_target_pair', { entry });
+			continue;
+		}
 		const [guildId, channelId] = parts;
-		if (seen.has(guildId)) continue;
-		seen.add(guildId);
+		if (channels.has(guildId)) {
+			const kept = channels.get(guildId);
+			if (kept !== channelId) report(value, 'config.warn_target_repeat', { entry, guild: guildId, channel: kept });
+			continue;
+		}
+		for (const part of parts) {
+			if (!SNOWFLAKE.test(part)) report(value, 'config.warn_snowflake', { value: part });
+		}
+		channels.set(guildId, channelId);
 		targets.push({ guildId, channelId });
 	}
 	return targets;
@@ -72,7 +192,7 @@ function voiceTargets(value, primary) {
 function effortValue(value, fallback) {
 	if (value === undefined || value === null) return fallback;
 	const text = cleanEnvValue(value);
-	if (!text || new RegExp(`^(?:${tList('config.none_words').join('|')})$`, 'i').test(text)) return null;
+	if (!text || spelled(NONE_WORDS, text)) return null;
 	return text;
 }
 
@@ -81,7 +201,31 @@ function str(value, fallback = null) {
 	return text || fallback;
 }
 
-export function loadConfig(env = process.env) {
+/**
+ * Reads the configuration from `source` (process.env by default). Throws only when a required variable
+ * is missing; every other problem is collected into `config.warnings`, a non-enumerable array of
+ * sentences in the active language, so the returned object keeps exactly the fields it always had.
+ */
+export function loadConfig(source = process.env) {
+	const reads = [];
+	const env = new Proxy(source, {
+		get(target, name) {
+			const value = Reflect.get(target, name);
+			if (typeof name === 'string') reads.push([name, value]);
+			return value;
+		},
+	});
+	parsing = { reads, warnings: [] };
+	try {
+		const config = readConfig(env);
+		Object.defineProperty(config, 'warnings', { value: parsing.warnings, enumerable: false });
+		return config;
+	} finally {
+		parsing = null;
+	}
+}
+
+function readConfig(env) {
 	const missing = ['DISCORD_TOKEN', 'GUILD_ID', 'CHANNEL_ID', 'OPENAI_API_KEY'].filter((key) => !str(env[key]));
 	if (missing.length) {
 		throw new Error(t(missing.length > 1 ? 'config.missing_env_many' : 'config.missing_env_one', { keys: missing.join(', ') }));
@@ -91,13 +235,15 @@ export function loadConfig(env = process.env) {
 	const researchModel = str(env.RESEARCH_MODEL) ?? str(env.DELEGATION_MODEL);
 	// Tool backend: auto = Responses (every tool + web search) when RESEARCH_MODEL/DELEGATION_MODEL is set,
 	// otherwise client-side delegation (regex voice commands only + DeepSeek/OpenAI research).
-	const toolsBackendRaw = str(env.TOOLS_BACKEND, 'auto').toLowerCase();
-	const toolsBackend = ['auto', 'responses', 'client'].includes(toolsBackendRaw) ? toolsBackendRaw : 'auto';
+	const toolsBackend = oneOf(env.TOOLS_BACKEND, ['auto', 'responses', 'client'], 'auto');
+	// The locale BOT_LANGUAGE picks, resolved exactly as src/i18n resolved it at import time. Other
+	// language settings default to it, so a Turkish bot speaks Turkish through Chatterbox as well.
+	const botLanguage = language(env.BOT_LANGUAGE);
 
 	const config = {
 		discordToken: str(env.DISCORD_TOKEN),
-		guildId: str(env.GUILD_ID),
-		channelId: str(env.CHANNEL_ID),
+		guildId: id(env.GUILD_ID),
+		channelId: id(env.CHANNEL_ID),
 		// Every server the bot serves, the primary pair first (see voiceTargets above).
 		targets: voiceTargets(env.VOICE_TARGETS, { guildId: str(env.GUILD_ID), channelId: str(env.CHANNEL_ID) }),
 		// Cost cap: how many guilds may hold an OPEN realtime session at the same time. The bill grows
@@ -106,8 +252,9 @@ export function loadConfig(env = process.env) {
 		maxLiveSessions: Math.floor(num(env.MAX_LIVE_SESSIONS, 2, { min: 1 })),
 		openaiApiKey: str(env.OPENAI_API_KEY),
 
-		// UI/voice language of the assistant: locale code from src/locales (default "en"; "tr" available).
-		language: str(env.BOT_LANGUAGE, 'en'),
+		// UI/voice language of the assistant: the locale code BOT_LANGUAGE resolved to (default "en";
+		// see SUPPORTED_LOCALES in src/i18n). An unknown value is reported and English is used.
+		language: botLanguage,
 		baseURL: str(env.OPENAI_BASE_URL) ?? undefined,
 		liveModel: str(env.LIVE_MODEL, 'gpt-live-1'),
 		liveVoice: str(env.LIVE_VOICE, 'marin'),
@@ -135,7 +282,8 @@ export function loadConfig(env = process.env) {
 		localTtsToken: str(env.LOCAL_TTS_TOKEN),
 		localTtsVoice: str(env.LOCAL_TTS_VOICE),
 		// "auto": guess the language of the text (tr/en/de/fr/es/it/pt/ru); any other value is a fixed language code.
-		localTtsLang: str(env.LOCAL_TTS_LANG, 'tr'),
+		// Unset, the voice speaks the bot's own language.
+		localTtsLang: str(env.LOCAL_TTS_LANG, botLanguage),
 		// Let the bot start the Chatterbox server itself (when needed, from .venv-chatterbox). LOCAL_TTS_PYTHON can point at the interpreter.
 		localTtsAutostart: bool(env.LOCAL_TTS_AUTOSTART, true),
 		localTtsPython: str(env.LOCAL_TTS_PYTHON),
@@ -144,13 +292,13 @@ export function loadConfig(env = process.env) {
 		// Local brain (voice chat without OpenAI): ears = whisper (/stt), brain = DeepSeek/OpenAI chat, mouth = Chatterbox.
 		// auto = switch to the local brain when GPT-Live reports a credit/key error and switch back once it recovers;
 		// local = always local; live = never switch.
-		brainMode: ['auto', 'local', 'live'].includes(str(env.BRAIN_MODE, 'auto').toLowerCase()) ? str(env.BRAIN_MODE, 'auto').toLowerCase() : 'auto',
+		brainMode: oneOf(env.BRAIN_MODE, ['auto', 'local', 'live'], 'auto'),
 		localSttUrl: str(env.LOCAL_STT_URL) ?? str(env.LOCAL_TTS_URL, 'http://127.0.0.1:8020'),
-		localSttLang: str(env.LOCAL_STT_LANG, 'tr'),
+		// A language code fixes what whisper listens for; "auto" (the default) lets it detect the language of
+		// every line, which is what LocalStt does with any value it does not pass on.
+		localSttLang: str(env.LOCAL_STT_LANG, 'auto'),
 		// Who the local brain answers: auto (name/single person/ongoing conversation/question), addressed (only when named), always
-		localBrainRespond: ['auto', 'addressed', 'always'].includes(str(env.LOCAL_BRAIN_RESPOND, 'auto').toLowerCase())
-			? str(env.LOCAL_BRAIN_RESPOND, 'auto').toLowerCase()
-			: 'auto',
+		localBrainRespond: oneOf(env.LOCAL_BRAIN_RESPOND, ['auto', 'addressed', 'always'], 'auto'),
 		// OpenAI model for written replies (DM / mention). With DeepSeek configured the text goes there,
 		// while images are still handled by this OpenAI model.
 		textModel: str(env.TEXT_MODEL) ?? str(env.DELEGATION_MODEL) ?? 'gpt-5.6-luna',
@@ -179,21 +327,22 @@ export function loadConfig(env = process.env) {
 		voiceEchoTextReplies: bool(env.VOICE_ECHO_TEXT_REPLIES, false),
 		greetText: str(env.GREET_TEXT),
 
-		soloUserId: str(env.SOLO_USER_ID),
-		textChannelId: str(env.TEXT_CHANNEL_ID),
+		soloUserId: id(env.SOLO_USER_ID),
+		textChannelId: id(env.TEXT_CHANNEL_ID),
 		readLimit: num(env.READ_LIMIT, 5, { min: 1, max: 10 }),
 		allowedBots: list(env.ALLOWED_BOTS),
 		botPrefix: str(env.BOT_PREFIX, '!'),
-		botCommandChannelId: str(env.BOT_COMMAND_CHANNEL),
-		messageContent: str(env.MESSAGE_CONTENT, 'auto'),
-		guildMembers: str(env.GUILD_MEMBERS, 'auto'),
-		presence: str(env.PRESENCE, 'auto'),
+		botCommandChannelId: id(env.BOT_COMMAND_CHANNEL),
+		// Privileged intents: "auto", "on" or "off" (see intent() above).
+		messageContent: intent(env.MESSAGE_CONTENT),
+		guildMembers: intent(env.GUILD_MEMBERS),
+		presence: intent(env.PRESENCE),
 
 		// Authorisation: owner (voice admin tools + everything), extra admin user/role ids (slash/panel).
 		// With OWNER_ID empty the voice admin tools are off; there is NO hard-coded default.
-		ownerId: str(env.OWNER_ID),
-		adminUserIds: list(env.ADMIN_USER_IDS),
-		adminRoleIds: list(env.ADMIN_ROLE_IDS),
+		ownerId: id(env.OWNER_ID),
+		adminUserIds: ids(env.ADMIN_USER_IDS),
+		adminRoleIds: ids(env.ADMIN_ROLE_IDS),
 		ownerPriority: bool(env.OWNER_PRIORITY, true),
 		// One voice at a time: while somebody holds the floor only their audio is sent (see SpeakerMixer).
 		floorControl: bool(env.FLOOR_CONTROL, true),

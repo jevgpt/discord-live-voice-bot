@@ -8,16 +8,22 @@
 import en from '../locales/en/index.js';
 import tr from '../locales/tr/index.js';
 
+// The one list of bundled languages. Everything else asks this module: src/config.js checks
+// BOT_LANGUAGE against it, and scripts/check-locales.mjs fails when a directory under src/locales is
+// not registered here (or a registered language has no directory).
 const BUNDLES = { en, tr };
 const FALLBACK = 'en';
 
-export const SUPPORTED_LOCALES = Object.keys(BUNDLES);
+export const SUPPORTED_LOCALES = Object.freeze(Object.keys(BUNDLES));
+export const FALLBACK_LOCALE = FALLBACK;
 
 let currentCode = FALLBACK;
 let currentBundle = BUNDLES[FALLBACK];
 
 // Picked up at import time so module-level constants are built in the right language even before
-// the configuration is parsed; setLocale() can still override it afterwards.
+// the configuration is parsed; setLocale() can still override it afterwards. An unknown value falls
+// back quietly here, because nothing can be printed in a language that is not chosen yet; src/config.js
+// resolves the same value the same way and reports it once the bot starts.
 initFromEnv();
 
 function initFromEnv() {
@@ -26,13 +32,25 @@ function initFromEnv() {
 }
 
 /**
+ * Which bundle a language code stands for, without selecting it. The language is the first run of
+ * letters, so "tr", "tr-TR", "tr_TR.UTF-8" and a quoted "tr" all name Turkish. `known` is false when
+ * nothing bundled matched and the fallback was taken instead.
+ * @returns {{ code: string, known: boolean }}
+ */
+export function resolveLocale(code) {
+	const raw = String(code ?? '').trim().toLowerCase();
+	if (BUNDLES[raw]) return { code: raw, known: true };
+	const language = raw.match(/[a-z]+/u)?.[0] ?? '';
+	if (BUNDLES[language]) return { code: language, known: true };
+	return { code: FALLBACK, known: false };
+}
+
+/**
  * Selects the active locale. Accepts "en", "tr", "tr-TR"; unknown codes fall back to English.
  * @returns {string} the code that ended up active
  */
 export function setLocale(code) {
-	const raw = String(code ?? '').trim().toLowerCase();
-	const short = raw.slice(0, 2);
-	const picked = BUNDLES[raw] ? raw : BUNDLES[short] ? short : FALLBACK;
+	const picked = resolveLocale(code).code;
 	currentCode = picked;
 	currentBundle = BUNDLES[picked];
 	return picked;
@@ -45,8 +63,7 @@ export function locale() {
 
 /** Is this locale bundled? */
 export function hasLocale(code) {
-	const raw = String(code ?? '').trim().toLowerCase();
-	return Boolean(BUNDLES[raw] ?? BUNDLES[raw.slice(0, 2)]);
+	return resolveLocale(code).known;
 }
 
 function lookup(bundle, key) {

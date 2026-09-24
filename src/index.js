@@ -50,6 +50,9 @@ try {
 	console.error(t('boot.config_failed', { error: err.message }));
 	process.exit(1);
 }
+// A value that was not read as written (a typo in an on/off word, an ID that cannot be one, a number
+// moved into its range) is said once, here, before anything acts on it.
+for (const warning of cfg.warnings ?? []) console.warn(t('boot.config_warning', { warning }));
 
 const stamp = () => new Date().toISOString().slice(11, 19);
 const log = (...args) => console.log(`[${stamp()}]`, ...args);

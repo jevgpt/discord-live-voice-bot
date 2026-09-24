@@ -4,6 +4,8 @@
 // and the start-up summary written once the Discord client is ready.
 export default {
 	config_failed: 'Could not read the settings: {error}',
+	// One line per setting that was not read as written (config.warn_*); the bot starts regardless.
+	config_warning: 'Settings: {warning}',
 
 	panel_history: 'Panel history loaded: {count} events (data/activity.jsonl).',
 	joined_channel: 'I joined the "{channel}" channel. Listening to what is said.',
