@@ -589,6 +589,38 @@ async function ownerAskedByJev(deps, tool, opts) {
 	return p >= JEV_GATE_P ? { percent, text: said.text } : null;
 }
 
+/**
+ * Who a gate decision was about, for the panel's gate audit: the person whose line the request came from
+ * when the audio can name them (see speakerOfTurn), nobody otherwise. Read after the decision and
+ * quietly: the audit never holds a decision up and never changes one.
+ */
+function askerOf(deps) {
+	try {
+		const id = typeof deps.currentSpeakerId === 'function' ? deps.currentSpeakerId() : null;
+		if (!id) return {};
+		const name = typeof deps.nameFor === 'function' ? deps.nameFor(String(id)) : null;
+		return { askerId: String(id), askerName: name ?? null };
+	} catch {
+		return {};
+	}
+}
+
+/**
+ * One gate decision on the activity log, in the shape the panel's gate audit reads: the tool, the result
+ * (allowed, denied, asked, confirmed, declined), a stable `code` a filter can hold on to while `reason` is
+ * worded in the active language, and who asked. Words somebody said go in `meta.text` and nowhere else:
+ * that is the field the log keeps out of the record while RECORD_TRANSCRIPTS is off, so a reason never
+ * quotes them.
+ */
+export function noteGate(deps, line, meta, asker = null) {
+	deps.activity?.({
+		kind: 'gate',
+		whoName: deps.personaName?.() ?? 'bot',
+		text: line,
+		meta: { ...meta, ...(asker ?? askerOf(deps)) },
+	});
+}
+
 export async function ownerGate(deps, keywords = null, tool = t('tools.helpers.gate_default_tool')) {
 	const denied = await voiceGate(deps, keywords, tool);
 	if (denied) return denied;
@@ -598,30 +630,27 @@ export async function ownerGate(deps, keywords = null, tool = t('tools.helpers.g
 
 /** The voice half of the gate: who said the command word (see the comment above JEV_GATE_P). */
 async function voiceGate(deps, keywords, tool) {
-	const deny = (spoken, reason) => {
-		deps.log?.(t('tools.helpers.log_gate_denied', { tool, reason }));
-		deps.activity?.({
-			kind: 'gate',
-			whoName: deps.personaName?.() ?? 'bot',
-			text: t('tools.helpers.gate_denied_activity', { tool, reason }),
-			meta: { tool, result: 'denied', reason },
-		});
+	// `logged` is the reason as the console gets it, which may quote what was said; the activity log and
+	// the panel get `reason`, which does not (see noteGate).
+	const deny = (spoken, reason, code, { said = null, logged = reason, asker = null } = {}) => {
+		deps.log?.(t('tools.helpers.log_gate_denied', { tool, reason: logged }));
+		noteGate(
+			deps,
+			t('tools.helpers.gate_denied_activity', { tool, reason }),
+			{ tool, result: 'denied', reason, code, ...(said ? { text: said } : {}) },
+			asker,
+		);
 		return { ok: false, spoken, denied: true };
 	};
-	const allow = (detail, meta = {}) => {
+	const allow = (detail, code, meta = {}) => {
 		const tail = deps.ownerTextTail?.() ?? '';
 		deps.log?.(t('tools.helpers.log_gate_allowed', { tool, detail, tail: tail ? t('tools.helpers.log_gate_tail', { text: tail }) : '' }));
-		deps.activity?.({
-			kind: 'gate',
-			whoName: deps.personaName?.() ?? 'bot',
-			text: t('tools.helpers.gate_allowed_activity', { tool, detail }),
-			meta: { tool, result: 'allowed', text: tail, ...meta },
-		});
+		noteGate(deps, t('tools.helpers.gate_allowed_activity', { tool, detail }), { tool, result: 'allowed', code, text: tail, ...meta });
 		return null;
 	};
 	const hasCommandSpeaker = typeof deps.commandSpeaker === 'function';
 	if (typeof deps.isOwnerActive !== 'function' && !hasCommandSpeaker) {
-		return deny(t('tools.helpers.gate_disabled'), t('tools.helpers.gate_reason_disabled'));
+		return deny(t('tools.helpers.gate_disabled'), t('tools.helpers.gate_reason_disabled'), 'disabled');
 	}
 	if (keywords?.length && hasCommandSpeaker) {
 		// The turn is PINNED to the moment the request arrived and resolved in one place: if the owner says
@@ -636,28 +665,29 @@ async function voiceGate(deps, keywords, tool) {
 			hit = deps.commandSpeaker(keywords, opts);
 			// Still waiting on the transcript of the utterance that triggered this turn: whatever we can
 			// see is from an EARLIER turn, so approving it would let a stale command authorise this one.
-			if (lagging()) return deny(t('tools.helpers.gate_transcript_missing'), t('tools.helpers.gate_reason_transcript_missing'));
+			if (lagging()) return deny(t('tools.helpers.gate_transcript_missing'), t('tools.helpers.gate_reason_transcript_missing'), 'transcript_missing');
 		}
 		// The keywords missed the owner's phrasing, or found the word in somebody else's mouth while the
 		// owner asked in other words (heard live: "sus" from a guest eight seconds earlier, then the
 		// owner's "konusmaya devam edebilirsin"). Jev reads the owner's own words before this refuses.
 		if (!hit || (!hit.owner && !hit.ownerOverlap)) {
 			const asked = await ownerAskedByJev(deps, tool, opts);
-			if (asked) return allow(t('tools.helpers.gate_detail_jev', { percent: asked.percent }), { jev: asked.percent, text: asked.text });
+			if (asked) return allow(t('tools.helpers.gate_detail_jev', { percent: asked.percent }), 'jev', { jev: asked.percent, text: asked.text });
 		}
 		if (!hit) {
-			return deny(t('tools.helpers.gate_not_heard'), t('tools.helpers.gate_reason_not_said'));
+			return deny(t('tools.helpers.gate_not_heard'), t('tools.helpers.gate_reason_not_said'), 'not_said');
 		}
 		if (!hit.owner) {
 			if (hit.ownerOverlap) {
 				// The owner did say the word, but somebody else's voice is in the same audio. The model
 				// transcribes the SUM of the voices in a frame, so nothing downstream can say whose word it
 				// was -- and this gate runs bans, kicks and deletions.
-				return deny(t('tools.helpers.gate_overlap'), t('tools.helpers.gate_reason_overlap'));
+				return deny(t('tools.helpers.gate_overlap'), t('tools.helpers.gate_reason_overlap'), 'overlap');
 			}
 			const who = hit.id && typeof deps.nameFor === 'function' ? deps.nameFor(hit.id) : null;
 			const reason = t('tools.helpers.gate_reason_not_owner') + (who ? t('tools.helpers.gate_reason_who', { who }) : '');
-			return deny(t('tools.helpers.gate_not_owner'), reason);
+			// The one who asked is the one who said the word, whatever the turn's own line says.
+			return deny(t('tools.helpers.gate_not_owner'), reason, 'not_owner', { asker: hit.id ? { askerId: String(hit.id), askerName: who } : null });
 		}
 		const last = typeof deps.lastUtterance === 'function' ? deps.lastUtterance(opts) : null;
 		// Compare by sequence when both sides carry one: transcript fragments can share a millisecond,
@@ -669,25 +699,26 @@ async function voiceGate(deps, keywords, tool) {
 		// bleed was cancelling the owner's own commands, which is exactly the owner being drowned out.
 		if (last && !last.owner && last.sure !== false && after) {
 			const who = last.id && typeof deps.nameFor === 'function' ? deps.nameFor(last.id) : t('tools.helpers.gate_someone_else');
-			return deny(
-				t('tools.helpers.gate_interrupted'),
-				t('tools.helpers.gate_reason_interrupted', { who, text: String(last.text).slice(0, 60) }),
-			);
+			const said = String(last.text).slice(0, 60);
+			return deny(t('tools.helpers.gate_interrupted'), t('tools.helpers.gate_reason_interrupted_by', { who }), 'interrupted', {
+				said,
+				logged: t('tools.helpers.gate_reason_interrupted', { who, text: said }),
+			});
 		}
-		return allow(t('tools.helpers.gate_detail_owner_said', { word: hit.word }), { matched: hit.word });
+		return allow(t('tools.helpers.gate_detail_owner_said', { word: hit.word }), 'owner_said', { matched: hit.word });
 	}
 	// Older path (a tool without keywords, or a setup without attribution): the last voice heard must be the owner's.
 	if (typeof deps.isOwnerActive !== 'function' || !deps.isOwnerActive()) {
-		return deny(t('tools.helpers.gate_owner_not_active'), t('tools.helpers.gate_reason_last_not_owner'));
+		return deny(t('tools.helpers.gate_owner_not_active'), t('tools.helpers.gate_reason_last_not_owner'), 'last_not_owner');
 	}
 	if (!keywords?.length || typeof deps.ownerSaidRecently !== 'function') {
-		return allow(t('tools.helpers.gate_detail_last_owner'));
+		return allow(t('tools.helpers.gate_detail_last_owner'), 'last_owner');
 	}
 	const matched = typeof deps.ownerMatch === 'function' ? deps.ownerMatch(keywords) : deps.ownerSaidRecently(keywords) ? keywords[0] : null;
 	if (!matched) {
-		return deny(t('tools.helpers.gate_unsure'), t('tools.helpers.gate_reason_not_said'));
+		return deny(t('tools.helpers.gate_unsure'), t('tools.helpers.gate_reason_not_said'), 'not_said');
 	}
-	return allow(t('tools.helpers.gate_detail_owner_word', { word: matched }), { matched });
+	return allow(t('tools.helpers.gate_detail_owner_word', { word: matched }), 'owner_word', { matched });
 }
 
 /** Is the owner gate open (quietly: no activity event, no waiting)? */
@@ -812,6 +843,8 @@ export function checkConfirmation(deps, { key, target, confirm, question }) {
 	const turn = turnOf(deps);
 	const ask = (text) => {
 		pending.set(key, { key, target, at: Date.now(), turn, mark: typeof deps.speechMark === 'function' ? deps.speechMark() : null });
+		// Why the question is put: the rule about other people's words, or the tool's own two steps.
+		noteQuestion(deps, key, 'asked', String(key).startsWith('untrusted:') ? 'untrusted_read' : 'awaiting_yes');
 		return { ask: text };
 	};
 	if (confirm !== true) return ask(question);
@@ -827,6 +860,7 @@ export function checkConfirmation(deps, { key, target, confirm, question }) {
 		// The answer arrived in the turn that asked the question: nobody has been heard since, so it is the
 		// model answering itself. The question stands as it was.
 		deps.log?.(t('tools.helpers.log_confirm_same_turn', { tool: key }));
+		noteQuestion(deps, key, 'asked', 'awaiting_yes');
 		return { ask: t('tools.helpers.confirm_unanswered', { question }) };
 	}
 	const { answer, text } = spokenAnswer(deps, previous, turn);
@@ -834,6 +868,7 @@ export function checkConfirmation(deps, { key, target, confirm, question }) {
 	if (answer === 'yes') {
 		pending.delete(key);
 		deps.log?.(t('tools.helpers.log_confirm_yes', { tool: key, text: said }));
+		noteQuestion(deps, key, 'confirmed', 'spoken_yes', said);
 		return { ok: true };
 	}
 	if (answer === 'no' || answer === 'unclear') {
@@ -843,10 +878,23 @@ export function checkConfirmation(deps, { key, target, confirm, question }) {
 		// treated the same. To ask again the model calls without confirm, and the owner hears the question.
 		pending.delete(key);
 		deps.log?.(t('tools.helpers.log_confirm_not_yes', { tool: key, text: said }));
+		noteQuestion(deps, key, 'declined', answer === 'no' ? 'declined' : 'unclear', said);
 		return { ask: t(answer === 'no' ? 'tools.helpers.confirm_declined' : 'tools.helpers.confirm_unclear', { question }), declined: true };
 	}
 	deps.log?.(t('tools.helpers.log_confirm_unanswered', { tool: key }));
+	noteQuestion(deps, key, 'asked', 'awaiting_yes');
 	return { ask: t('tools.helpers.confirm_unanswered', { question }) };
+}
+
+/**
+ * A question and its answer in the gate audit. The question itself is not written down: it reads out the
+ * call's arguments, and those can be a message somebody dictated. What the owner answered is `said`,
+ * which goes where the log can keep it out of the record (see noteGate).
+ */
+function noteQuestion(deps, key, result, code, said = null) {
+	const tool = String(key ?? '').replace(/^untrusted:/u, '');
+	const reason = t(`tools.helpers.gate_reason_${code}`);
+	noteGate(deps, t(`tools.helpers.gate_${result}_activity`, { tool, reason }), { tool, result, reason, code, ...(said ? { text: said } : {}) });
 }
 
 /**

@@ -11,6 +11,7 @@ import {
 	displayName,
 	failure,
 	findMember,
+	noteGate,
 	parseColor,
 	resolveRole,
 } from './helpers.js';
@@ -116,6 +117,9 @@ async function grantOrRevoke(args, deps, { name }) {
 		if (risky.length) {
 			const permissions = riskyLabels(risky);
 			deps.log?.(t('tools.roles.log_risky_refused', { role: role.name, permissions }));
+			// A refusal of its own, not the owner gate's, but the gate audit is where somebody looks for it.
+			const reason = t('tools.helpers.gate_reason_risky_role', { role: role.name, permissions });
+			noteGate(deps, t('tools.helpers.gate_denied_activity', { tool: name, reason }), { tool: name, result: 'denied', reason, code: 'risky_role' });
 			return { ok: false, denied: true, spoken: t('tools.roles.risky_role', { role: role.name, permissions }) };
 		}
 	}

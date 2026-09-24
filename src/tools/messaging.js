@@ -222,7 +222,7 @@ export const tools = [
 					kind: 'gate',
 					whoName: deps.personaName?.() ?? 'bot',
 					text: t('tools.messaging.everyone_denied_activity'),
-					meta: { tool: 'send_message', result: 'denied' },
+					meta: { tool: 'send_message', result: 'denied', code: 'everyone_ping' },
 				});
 			}
 			// A role tag reaches everybody who holds the role, which for a large role is @everyone under
@@ -238,7 +238,7 @@ export const tools = [
 						kind: 'gate',
 						whoName: deps.personaName?.() ?? 'bot',
 						text: t('tools.messaging.role_ping_denied_activity', { role }),
-						meta: { tool: 'send_message', result: 'denied' },
+						meta: { tool: 'send_message', result: 'denied', code: 'role_ping' },
 					});
 				}
 			}

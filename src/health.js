@@ -124,6 +124,38 @@ export class SessionHealth {
 		if (ids?.length) this.overlapFrames++;
 	}
 
+	/**
+	 * The running totals as they stand, for the panel's history and /metrics. The snapshot below is made
+	 * for reading (percentages, a median); a graph needs the raw counts, so it can tell what happened in
+	 * the last ten seconds from what happened all evening. Counts only: no reason, no words.
+	 */
+	totals() {
+		return {
+			fragmentsSure: this.fragments.sure,
+			fragmentsLeaning: this.fragments.leaning,
+			fragmentsUnsure: this.fragments.unsure,
+			fragmentsSilent: this.fragments.silent,
+			linesNamed: this.lines.named,
+			linesMixed: this.lines.mixed,
+			linesUnknown: this.lines.unknown,
+			gateAllowed: this.gate.allowed,
+			gateDenied: this.gate.denied,
+			jevCalls: this.jev.calls,
+			jevFailed: this.jev.failed,
+			jevBanter: this.jev.banter,
+			jevNotForBot: this.jev.notForBot,
+			jevSuppressed: this.jev.suppressed,
+			driftMs: this.drift.now,
+			driftMaxMs: this.drift.max,
+			overlapFrames: this.overlapFrames,
+		};
+	}
+
+	/** Jev's round-trip times, in order, with how many there have been: the history takes the new ones. */
+	jevTimes() {
+		return { list: this.jev.ms, total: this.jev.ms.length };
+	}
+
 	/** The numbers, for the panel and for tests. */
 	snapshot() {
 		const fragments = this.fragmentCount;

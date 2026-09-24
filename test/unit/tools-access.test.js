@@ -650,6 +650,18 @@ describe('grant_role: no keys to the server by voice', () => {
 		}
 	});
 
+	it('puts the refusal in the gate audit, with a code of its own', async () => {
+		const { deps } = makeDeps({ speaker: 'o', gate: true });
+		const events = [];
+		deps.activity = (event) => events.push(event);
+		await callTool('grant_role', { member: 'Gus', role: 'Boss' }, deps);
+		const refusal = events.find((event) => event.meta?.code === 'risky_role');
+		assert.equal(refusal?.kind, 'gate');
+		assert.equal(refusal.meta.tool, 'grant_role');
+		assert.equal(refusal.meta.result, 'denied');
+		assert.match(refusal.meta.reason, /Boss/u);
+	});
+
 	it('still takes a risky role away', async () => {
 		const { deps, sent } = makeDeps({ speaker: 'o', gate: true });
 		const result = await callTool('revoke_role', { member: 'Gus', role: 'Moderator' }, deps);

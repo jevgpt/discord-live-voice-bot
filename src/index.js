@@ -28,6 +28,7 @@ import { LocalServerManager, detectVenvPython, setSpeechToken } from './localser
 import { LocalStt } from './localstt.js';
 import { MemoryStore } from './memory.js';
 import { ReplyLimiter, handleMessage } from './messages.js';
+import { LIVE_STATE, MetricsHistory } from './metrics.js';
 import { ActivityLog, startPanel } from './panel.js';
 import { createTextProvider } from './provider.js';
 import { QueueStore } from './queuestore.js';
@@ -130,6 +131,9 @@ const localStt = new LocalStt({ url: cfg.localSttUrl, language: cfg.localSttLang
 let client = null;
 let panel = null;
 let shuttingDown = false;
+// The panel's last hour of every server, one row per ten seconds (src/metrics.js). Its memory is fixed
+// when it is made: about 52 KB per server, for at most 32 servers.
+const panelHistory = new MetricsHistory();
 
 // ---------------------------------------------------------------- keys
 
@@ -315,6 +319,163 @@ function describeSessionForPanel(entry) {
 			brain: entry.brain === 'local' ? t('runtime.panel_local') : 'GPT-Live',
 		}) + (entry.liveBlocked ? t('runtime.panel_status_guild_silent', { reason: entry.liveBlocked }) : '')
 	);
+}
+
+// ---------------------------------------------------------------- panel: servers, history, metrics
+//
+// What the panel's dashboard, its hour of history and /metrics read off the sessions. Everything here
+// only reads, and reads numbers and names: no transcript, no message, no reason with words in it.
+
+/** Where a server's realtime session stands, in the words the dashboard uses (see LIVE_STATE). */
+function liveStateOf(entry) {
+	if (entry.brain === 'local') return 'local';
+	if (entry.liveReady) return 'ready';
+	if (entry.liveOpen) return 'connecting';
+	if (entry.liveBlocked) return 'waiting';
+	if (entry.paused) return 'paused';
+	return 'off';
+}
+
+/** The people (not bots) in the voice channel the bot sits in on that server. */
+function voiceMembersOf(session) {
+	const channelId = session.voice?.channelId;
+	if (!channelId || !session.guild?.voiceStates) return [];
+	const people = [];
+	for (const state of session.guild.voiceStates.cache.values()) {
+		if (state.channelId !== channelId) continue;
+		const member = state.member ?? session.guild.members?.cache.get(state.id);
+		if (member?.user?.bot) continue;
+		people.push(member?.displayName ?? session.nameFor(state.id));
+	}
+	return people;
+}
+
+/** One server as its dashboard card shows it. */
+function guildCard(session) {
+	const status = session.status();
+	// Who the mixer is sending right now under floor control; nobody when the room is quiet.
+	const floorId = session.mixer?.floorId ?? null;
+	const people = voiceMembersOf(session);
+	const quotaStatus = quota.status();
+	return {
+		id: status.guildId,
+		name: status.guildName,
+		persona: status.personaName,
+		voiceConnected: status.voiceConnected,
+		voiceChannel: status.voiceChannelName,
+		brain: status.brain,
+		live: liveStateOf(status),
+		liveBlocked: status.liveBlocked,
+		floor: floorId ? session.nameFor(String(floorId)) : null,
+		people: people.slice(0, 24),
+		peopleCount: people.length,
+		music: status.music ? { playing: status.music.playing, text: status.music.text, volume: status.music.volume, queue: status.music.queue } : null,
+		quota: { enabled: quota.enabled, used: quotaStatus.used, limit: quotaStatus.limit },
+	};
+}
+
+/**
+ * One server's numbers as they stand, for the history (see MetricsHistory.record) and for /metrics:
+ * gauges, running totals, and the recent timing windows with how many were ever taken.
+ */
+function readingOf(session) {
+	const status = session.status();
+	const totals = session.health?.totals?.() ?? {};
+	const audio = session.audioStats?.() ?? {};
+	const bridge = session.voice?.bridge ?? null;
+	const placed = (totals.fragmentsSure ?? 0) + (totals.fragmentsLeaning ?? 0);
+	return {
+		name: status.guildName,
+		status,
+		totals,
+		audio,
+		gauges: {
+			live_state: LIVE_STATE[liveStateOf(status)] ?? LIVE_STATE.off,
+			drift_ms: totals.driftMs ?? 0,
+			quota_used_s: quota.status().used,
+			people: voiceMembersOf(session).length,
+		},
+		counters: {
+			gate_allowed: totals.gateAllowed ?? 0,
+			gate_refused: totals.gateDenied ?? 0,
+			jev_calls: totals.jevCalls ?? 0,
+			jev_not_for_bot: totals.jevNotForBot ?? 0,
+			jev_banter: totals.jevBanter ?? 0,
+			jev_failed: totals.jevFailed ?? 0,
+			fragments_placed: placed,
+			fragments: placed + (totals.fragmentsUnsure ?? 0),
+			loop_late_total_ms: bridge?.stats?.lateMsTotal ?? 0,
+			loop_wakes: bridge?.stats?.wakes ?? 0,
+			// Frames the output could not take, and frames a full input ring threw away.
+			dropped_frames: (bridge?.dropped ?? 0) + Math.round(audio.overflow ?? 0),
+		},
+		samples: {
+			response: session.latency?.recent?.('response') ?? { list: [], total: 0 },
+			tool: session.latency?.recent?.('tool') ?? { list: [], total: 0 },
+			jev: session.health?.jevTimes?.() ?? { list: [], total: 0 },
+		},
+	};
+}
+
+/** The p-th percentile of a timing window, the way the latency meter takes it; null when it is empty. */
+function percentileOf(list, q) {
+	if (!list?.length) return null;
+	const sorted = [...list].sort((a, b) => a - b);
+	return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))];
+}
+
+/**
+ * The per-server Prometheus families, one sample per server labelled with its id and name. The names
+ * the panel had before stay as they were (they describe the primary server); these are added beside them.
+ */
+function guildFamilies(readings) {
+	const families = {};
+	const add = (name, type, labels, value) => {
+		const family = (families[name] ??= { type, samples: [] });
+		family.samples.push({ labels, value });
+	};
+	for (const { id, reading } of readings) {
+		const guild = { guild: id, guild_name: reading.name ?? id };
+		const { totals, audio, status } = reading;
+		add('guild_live_state', 'gauge', guild, reading.gauges.live_state);
+		add('guild_voice_members', 'gauge', guild, reading.gauges.people);
+		add('guild_response_p50_ms', 'gauge', guild, status.latency?.responseP50 ?? 0);
+		add('guild_response_p90_ms', 'gauge', guild, status.latency?.responseP90 ?? 0);
+		add('guild_tool_p50_ms', 'gauge', guild, percentileOf(reading.samples.tool.list, 0.5) ?? 0);
+		add('guild_tool_p95_ms', 'gauge', guild, percentileOf(reading.samples.tool.list, 0.95) ?? 0);
+		add('gate_decisions_total', 'counter', { ...guild, result: 'allowed' }, totals.gateAllowed ?? 0);
+		add('gate_decisions_total', 'counter', { ...guild, result: 'denied' }, totals.gateDenied ?? 0);
+		add('jev_calls_total', 'counter', guild, totals.jevCalls ?? 0);
+		add('jev_failed_total', 'counter', guild, totals.jevFailed ?? 0);
+		add('jev_not_for_bot_total', 'counter', guild, totals.jevNotForBot ?? 0);
+		add('jev_banter_total', 'counter', guild, totals.jevBanter ?? 0);
+		add('jev_suppressed_total', 'counter', guild, totals.jevSuppressed ?? 0);
+		add('jev_median_ms', 'gauge', guild, percentileOf(reading.samples.jev.list, 0.5) ?? 0);
+		add('transcript_drift_ms', 'gauge', guild, totals.driftMs ?? 0);
+		add('transcript_drift_max_ms', 'gauge', guild, totals.driftMaxMs ?? 0);
+		for (const [placement, key] of [
+			['sure', 'fragmentsSure'],
+			['leaning', 'fragmentsLeaning'],
+			['unsure', 'fragmentsUnsure'],
+		]) {
+			add('fragments_total', 'counter', { ...guild, placement }, totals[key] ?? 0);
+		}
+		const fragments = reading.counters.fragments;
+		add('placed_fragment_ratio', 'gauge', guild, fragments ? reading.counters.fragments_placed / fragments : 0);
+		for (const [owner, key] of [
+			['named', 'linesNamed'],
+			['mixed', 'linesMixed'],
+			['unknown', 'linesUnknown'],
+		]) {
+			add('lines_total', 'counter', { ...guild, owner }, totals[key] ?? 0);
+		}
+		add('audio_loop_late_avg_ms', 'gauge', guild, audio.avgLateMs ?? 0);
+		add('audio_loop_late_max_ms', 'gauge', guild, audio.maxLateMs ?? 0);
+		add('audio_dropped_frames_total', 'counter', guild, reading.counters.dropped_frames);
+		add('audio_holes_total', 'counter', guild, audio.holes ?? 0);
+		add('audio_concealed_total', 'counter', guild, audio.concealed ?? 0);
+	}
+	return families;
 }
 
 /** A display name for a user id: the servers are asked in turn, since a speaker can be in any of them. */
@@ -662,6 +823,13 @@ client.once(Events.ClientReady, async () => {
 					applyKeys: (patch) => applyKeys(patch),
 					// Who is speaking can be someone in any of the servers, so every session gets asked.
 					nameFor: (userId) => nameForUser(userId),
+					// The dashboard: one card per server, the primary first, and an hour of each server's numbers.
+					guilds: () => {
+						const primary = primarySession();
+						return [...sessions.values()].sort((a, b) => (b === primary) - (a === primary)).map((session) => guildCard(session));
+					},
+					history: panelHistory,
+					sample: () => [...sessions.values()].filter((session) => session.guild?.id).map((session) => ({ id: session.guild.id, reading: readingOf(session) })),
 					state: () => {
 						const snapshots = sessionSnapshots(primarySession());
 						const snapshot = snapshots[0] ?? EMPTY_STATUS;
@@ -752,6 +920,10 @@ client.once(Events.ClientReady, async () => {
 							// Every metric name above keeps describing the primary target; these two are the whole fleet.
 							sessions_total: snapshots.length,
 							sessions_live: snapshots.filter((entry) => entry.liveOpen).length,
+							// And these, one sample per server, labelled with it.
+							...guildFamilies(
+								[...sessions.values()].filter((session) => session.guild?.id).map((session) => ({ id: session.guild.id, reading: readingOf(session) })),
+							),
 						};
 					},
 					health: () => {

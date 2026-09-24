@@ -12,6 +12,7 @@ import {
 	checkConfirmation,
 	displayName,
 	failure,
+	noteGate,
 	parsePermissions,
 	permissionLabels,
 	resolveAnyChannel,
@@ -317,6 +318,9 @@ export const tools = [
 			if (risky.length) {
 				const permissions = riskyLabels(risky);
 				deps.log?.(t('tools.channels.log_risky_permission_refused', { channel: channel.name, target: label, permissions }));
+				const reason = t('tools.helpers.gate_reason_risky_permission', { permissions });
+				const tool = 'set_channel_permission';
+				noteGate(deps, t('tools.helpers.gate_denied_activity', { tool, reason }), { tool, result: 'denied', reason, code: 'risky_permission' });
 				return { ok: false, denied: true, spoken: t('tools.channels.risky_permission', { permissions }) };
 			}
 			const touched = [...new Set([...allow.flags, ...deny.flags])];

@@ -79,6 +79,20 @@ export default {
 	gate_reason_who: ' ({who})',
 	gate_interrupted: 'Sahibin isteğinden sonra araya başkası girdi; emin olmak için sahip tekrar söylesin.',
 	gate_reason_interrupted: 'sahipten sonra {who} konuştu: "{text}"',
+	// The same, as the activity log and the panel's gate audit keep it: what was said goes to a field of
+	// its own, which is left out while recording is off, so this one never quotes it.
+	gate_reason_interrupted_by: 'sahipten sonra {who} konuştu',
+	// Two-step questions and the rules that refuse outright, as the gate audit shows them.
+	gate_asked_activity: '{tool}: önce sahibe soruldu ({reason})',
+	gate_confirmed_activity: '{tool}: onaylandı ({reason})',
+	gate_declined_activity: '{tool}: yapılmadı ({reason})',
+	gate_reason_awaiting_yes: 'sesli bir "evet" bekleniyor',
+	gate_reason_untrusted_read: 'bu turda başkalarının sözleri okundu',
+	gate_reason_spoken_yes: 'sahip sesli olarak evet dedi',
+	gate_reason_declined: 'sahip hayır dedi',
+	gate_reason_unclear: 'sahip hem evet hem hayır dedi',
+	gate_reason_risky_role: '{role} rolünde {permissions} var; bu sesle verilmez',
+	gate_reason_risky_permission: '{permissions} sesle verilmez',
 	gate_someone_else: 'başkası',
 	gate_detail_owner_said: 'komutu sahip söyledi ("{word}")',
 	gate_detail_jev: 'sahip başka kelimelerle istedi (Jev %{percent})',

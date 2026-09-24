@@ -79,6 +79,20 @@ export default {
 	gate_reason_who: ' ({who})',
 	gate_interrupted: 'Somebody else cut in after the owner asked; to be safe, the owner should say it again.',
 	gate_reason_interrupted: '{who} spoke after the owner: "{text}"',
+	// The same, as the activity log and the panel's gate audit keep it: what was said goes to a field of
+	// its own, which is left out while recording is off, so this one never quotes it.
+	gate_reason_interrupted_by: '{who} spoke after the owner',
+	// Two-step questions and the rules that refuse outright, as the gate audit shows them.
+	gate_asked_activity: '{tool}: asked the owner first ({reason})',
+	gate_confirmed_activity: '{tool}: confirmed ({reason})',
+	gate_declined_activity: '{tool}: not done ({reason})',
+	gate_reason_awaiting_yes: 'waiting for a spoken yes',
+	gate_reason_untrusted_read: "other people's words were read in this turn",
+	gate_reason_spoken_yes: 'the owner said yes out loud',
+	gate_reason_declined: 'the owner said no',
+	gate_reason_unclear: 'the owner said both yes and no',
+	gate_reason_risky_role: '{role} carries {permissions}, which is not handed out by voice',
+	gate_reason_risky_permission: '{permissions} is not handed out by voice',
 	gate_someone_else: 'someone else',
 	gate_detail_owner_said: 'the owner said the command ("{word}")',
 	gate_detail_jev: 'the owner asked in other words (Jev {percent}%)',

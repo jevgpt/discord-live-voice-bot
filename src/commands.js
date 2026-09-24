@@ -359,7 +359,7 @@ async function denyUnlessPrivileged(interaction, ctx) {
 		who: interaction.user?.id ?? null,
 		whoName: interaction.member?.displayName ?? interaction.user?.username ?? null,
 		text: t('commands.gate_denied_activity', { command: interaction.commandName ?? interaction.customId }),
-		meta: { result: 'denied' },
+		meta: { result: 'denied', code: 'not_privileged', command: interaction.commandName ?? interaction.customId ?? null },
 	});
 	await interaction.reply({ content: NOT_ALLOWED, flags: MessageFlags.Ephemeral }).catch(() => {});
 	return true;
@@ -402,7 +402,7 @@ async function denyUnlessMayStartSession(interaction, ctx) {
 		who: interaction.user?.id ?? null,
 		whoName: interaction.member?.displayName ?? interaction.user?.username ?? null,
 		text: t('commands.gate_unconfigured_activity', { guild }),
-		meta: { result: 'denied', guild },
+		meta: { result: 'denied', guild, code: 'unconfigured_server', command: interaction.commandName ?? null },
 	});
 	await interaction.reply({ content: t('commands.join_unconfigured_denied'), flags: MessageFlags.Ephemeral }).catch(() => {});
 	return true;
