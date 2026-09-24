@@ -1,6 +1,6 @@
 {
   "name": "discord-live-voice-bot",
-  "version": "1.32.0",
+  "version": "1.33.0",
   "description": "Discord voice bot that listens to a voice channel in real time, talks back, plays its own music and operates the server through its model-callable tools behind a voice-based owner gate.",
   "keywords": [
     "discord",
