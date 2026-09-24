@@ -38,7 +38,7 @@ import { SpeechSegmenter } from './localstt.js';
 import { LocalTts } from './localtts.js';
 import { MemberIndex } from './matcher.js';
 import { Ducker, MusicPlayer } from './music.js';
-import { stripDictationTail } from './text.js';
+import { formatClock, stripDictationTail } from './text.js';
 import { callTool, toolDefinitions, toolOutput } from './tools.js';
 import { VoiceSession } from './voice.js';
 import { toolDescription } from './tools/index.js';
@@ -70,6 +70,7 @@ export class GuildSession {
 		recentActions,
 		reminders,
 		savedTracks,
+		queueStore = null,
 		activity,
 		record,
 		provider,
@@ -104,6 +105,8 @@ export class GuildSession {
 		this.recentActions = recentActions;
 		this.reminders = reminders;
 		this.savedTracks = savedTracks;
+		// The music queues kept between runs (src/queuestore.js), one entry per server; null keeps nothing.
+		this.queueStore = queueStore;
 		// Which guild an event came from is stamped on HERE, once, instead of at every push() call site:
 		// the panel needs it to tell two servers apart, and a new call site cannot forget it.
 		const guildLabel = guild?.name ?? guild?.id ?? null;
@@ -187,9 +190,11 @@ export class GuildSession {
 					maxMinutes: cfg.musicMaxMinutes,
 					log,
 					// this.activity is the guild-tagged wrapper built above, not the process-wide log.
-					onTrackStart: (track) => {
+					onTrackStart: (track, { repeat = false } = {}) => {
 						// The track goes under the bot's name as well, so people see what is playing.
 						this.showPresence(track);
+						// A track on repeat starting over is not news: one "playing" line, not one per lap.
+						if (repeat) return;
 						this.activity.push({
 							kind: 'music',
 							whoName: track.requestedBy ?? null,
@@ -206,6 +211,7 @@ export class GuildSession {
 					},
 					onError: (track, message) =>
 						this.activity.push({ kind: 'music', text: t('runtime.music_failed', { title: track.title, error: message }) }),
+					onChange: () => this.saveMusicQueue(),
 				})
 			: null;
 		this.ducker = new Ducker({ duck: this.music ? this.music.duckRatio : 0.12, holdMs: cfg.musicDuckHoldMs, frameMs: FRAME_MS });
@@ -784,6 +790,8 @@ export class GuildSession {
 	 */
 	async start() {
 		const cfg = this.cfg;
+		// Before the join, so nothing the join sets off can write an empty player over the saved queue.
+		this.restoreMusicQueue();
 		if (this.channelId) {
 			const channel = await this.guild.channels.fetch(this.channelId).catch(() => null);
 			if (channel?.isVoiceBased()) {
@@ -823,6 +831,45 @@ export class GuildSession {
 	/** The per-guild dependencies handed to callTool / executeAction / the task runner. */
 	deps() {
 		return this.taskDeps;
+	}
+
+	// ---------------------------------------------------------------- saved music queue
+
+	/**
+	 * The player's word that something changed (MusicPlayer onChange): its snapshot replaces this guild's
+	 * entry and the file is written. The store coalesces a burst of these into one write.
+	 */
+	saveMusicQueue() {
+		const guildId = this.guild?.id;
+		if (!this.queueStore || !this.music || !guildId) return;
+		this.queueStore.put(String(guildId), this.music.snapshot());
+		this.queueStore.save().catch((err) => this.log(t('music.log_queue_save_failed', { error: err.message })));
+	}
+
+	/**
+	 * Takes this guild's saved queue back into the player, paused: after a restart nobody should be met by
+	 * music they did not just ask for. "Resume" carries on where it was; asking for any track plays that
+	 * one and keeps the restored queue behind it. What can no longer be played is dropped (restore()).
+	 */
+	restoreMusicQueue() {
+		const guildId = this.guild?.id;
+		if (!this.queueStore || !this.music || !guildId) return null;
+		const saved = this.queueStore.get(String(guildId));
+		if (!saved) return null;
+		const result = this.music.restore(saved);
+		if (result.current) {
+			this.log(
+				t('music.log_queue_restored', {
+					count: result.restored,
+					title: result.current.title,
+					position: formatClock(this.music.elapsed),
+					dropped: result.dropped,
+				}),
+			);
+		} else if (result.dropped) {
+			this.log(t('music.log_queue_restore_empty', { dropped: result.dropped }));
+		}
+		return result;
 	}
 
 	/** What /status and the panel read: one snapshot of this guild's session. */
@@ -892,6 +939,8 @@ export class GuildSession {
 		} catch {
 			/* ignore */
 		}
+		// stop() handed the queue its last snapshot (MusicPlayer.destroy); the process may exit right after this.
+		await this.queueStore?.flush().catch(() => {});
 		// Through retireLive, like every other close, so the slot stays counted until the socket is gone.
 		const session = this.live;
 		this.live = null;

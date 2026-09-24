@@ -12,6 +12,12 @@ export default {
 	log_skipped: 'music: skipped -> {title}',
 	log_stopped: 'music: stopped ({title})',
 	log_track_failed: 'music: could not play "{title}": {message}',
+	log_seek: 'music: {title}: {from} -> {to}',
+	log_resumed_at: 'music: carrying on -> {title} from {position}',
+	// --- the saved queue (src/queuestore.js), read back when a server's session starts
+	log_queue_save_failed: 'music: the queue could not be saved: {error}',
+	log_queue_restored: 'music: restored the saved queue ({count} tracks), paused on "{title}" at {position}; {dropped} dropped. "Resume" carries on.',
+	log_queue_restore_empty: 'music: none of the {dropped} tracks in the saved queue can be played any more; nothing restored',
 	// --- failure reasons; they are read out through the music tools
 	error_empty_query: 'I could not work out what to play',
 	error_no_results: 'no results found',
@@ -36,5 +42,10 @@ export default {
 	state_playing: 'Playing',
 	state_paused: 'Paused',
 	now_playing: '{state}: {title}{extra}.',
+	// How far into the track: with its length when it is known (links), without it when not (local files).
+	progress: '{elapsed} / {duration}',
+	progress_open: '{elapsed} in',
+	loop_suffix_track: ' This track is on repeat.',
+	loop_suffix_queue: ' The queue is on repeat.',
 	queue_suffix: ' {count} more in the queue.',
 };

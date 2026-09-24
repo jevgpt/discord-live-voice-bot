@@ -12,6 +12,12 @@ export default {
 	log_skipped: 'müzik: atlandı -> {title}',
 	log_stopped: 'müzik: durduruldu ({title})',
 	log_track_failed: 'müzik: "{title}" çalınamadı: {message}',
+	log_seek: 'müzik: {title}: {from} -> {to}',
+	log_resumed_at: 'müzik: devam -> {title}, {position} noktasından',
+	// --- the saved queue (src/queuestore.js), read back when a server's session starts
+	log_queue_save_failed: 'müzik: sıra kaydedilemedi: {error}',
+	log_queue_restored: 'müzik: kayıtlı sıra geri yüklendi ({count} parça), "{title}" {position} noktasında duraklatılmış bekliyor; {dropped} parça çıkarıldı. "Devam" denince sürer.',
+	log_queue_restore_empty: 'müzik: kayıtlı sıradaki {dropped} parçanın hiçbiri artık çalınamıyor; hiçbir şey geri yüklenmedi',
 	// --- failure reasons; they are read out through the music tools
 	error_empty_query: 'ne çalacağımı anlayamadım',
 	error_no_results: 'sonuç bulunamadı',
@@ -36,5 +42,10 @@ export default {
 	state_playing: 'Çalıyor',
 	state_paused: 'Duraklatıldı',
 	now_playing: '{state}: {title}{extra}.',
+	// How far into the track: with its length when it is known (links), without it when not (local files).
+	progress: '{elapsed} / {duration}',
+	progress_open: '{elapsed} geçti',
+	loop_suffix_track: ' Bu parça tekrarda.',
+	loop_suffix_queue: ' Sıra döngüde.',
 	queue_suffix: ' Sırada {count} parça var.',
 };

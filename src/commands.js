@@ -15,7 +15,8 @@
 //   "join the <channel> channel"         -> join a voice channel
 //   "leave the channel"                  -> leave the voice channel
 //   "play <song>", "stop/pause/resume the music", "skip the song", "turn the music down/up",
-//   "what's playing"
+//   "what's playing", and the queue: "play <song> next", "loop this song", "repeat the queue",
+//   "shuffle", "go to 1:30", "skip ahead 30 seconds", "move 3 to 1", "remove 3", "clear the queue"
 
 import {
 	ActionRowBuilder,
@@ -35,7 +36,7 @@ import { NOT_ALLOWED, interactionPrivileged } from './auth.js';
 import { t, tRaw } from './i18n/index.js';
 import enCommands from './locales/en/commands.js';
 import trCommands from './locales/tr/commands.js';
-import { findCharacter, findChannelByName, normalize, stripDictationTail } from './text.js';
+import { findCharacter, findChannelByName, normalize, parseClock, stripDictationTail } from './text.js';
 import { VOICES } from './voices.js';
 
 export { VOICES, findCharacter, findChannelByName, normalize, stripDictationTail };
@@ -53,6 +54,10 @@ const EN_SLASH = enCommands.slash;
 const TR_SLASH = trCommands.slash;
 
 const RECORD_STATES = ['on', 'off', 'status'];
+// The repeat modes /music loop offers; the same three the player knows (LOOP_MODES in src/music.js).
+const LOOP_CHOICES = ['off', 'track', 'queue'];
+// How many queued titles /music status lists under the now-playing line.
+const STATUS_QUEUE_LINES = 10;
 
 /** "music.subcommands.play.options.query" -> that entry of a locale's slash tree. */
 function slashEntry(tree, key) {
@@ -109,10 +114,16 @@ export function commandData() {
 		),
 		named(new SlashCommandBuilder(), 'status'),
 		named(new SlashCommandBuilder(), 'help'),
+		// Fourteen subcommands of the twenty-five Discord allows; none takes more than two options.
 		named(new SlashCommandBuilder(), 'music')
 			.addSubcommand((sub) =>
 				named(sub, 'music.subcommands.play').addStringOption((option) =>
 					named(option, 'music.subcommands.play.options.query').setRequired(true),
+				),
+			)
+			.addSubcommand((sub) =>
+				named(sub, 'music.subcommands.playnext').addStringOption((option) =>
+					named(option, 'music.subcommands.playnext.options.query').setRequired(true),
 				),
 			)
 			.addSubcommand((sub) => named(sub, 'music.subcommands.stop'))
@@ -124,7 +135,31 @@ export function commandData() {
 					named(option, 'music.subcommands.volume.options.percent').setRequired(true).setMinValue(0).setMaxValue(100),
 				),
 			)
-			.addSubcommand((sub) => named(sub, 'music.subcommands.status')),
+			.addSubcommand((sub) => named(sub, 'music.subcommands.status'))
+			.addSubcommand((sub) =>
+				named(sub, 'music.subcommands.seek').addStringOption((option) =>
+					named(option, 'music.subcommands.seek.options.position').setRequired(true).setMaxLength(12),
+				),
+			)
+			.addSubcommand((sub) =>
+				named(sub, 'music.subcommands.loop').addStringOption((option) =>
+					named(option, 'music.subcommands.loop.options.mode')
+						.setRequired(true)
+						.addChoices(...choicesFor('music.subcommands.loop.options.mode', LOOP_CHOICES)),
+				),
+			)
+			.addSubcommand((sub) => named(sub, 'music.subcommands.shuffle'))
+			.addSubcommand((sub) =>
+				named(sub, 'music.subcommands.move')
+					.addIntegerOption((option) => named(option, 'music.subcommands.move.options.from').setRequired(true).setMinValue(1))
+					.addIntegerOption((option) => named(option, 'music.subcommands.move.options.to').setRequired(true).setMinValue(1)),
+			)
+			.addSubcommand((sub) =>
+				named(sub, 'music.subcommands.remove').addIntegerOption((option) =>
+					named(option, 'music.subcommands.remove.options.position').setRequired(true).setMinValue(1),
+				),
+			)
+			.addSubcommand((sub) => named(sub, 'music.subcommands.clear')),
 		named(new SlashCommandBuilder(), 'summary').addIntegerOption((option) =>
 			named(option, 'summary.options.hours').setMinValue(1).setMaxValue(72),
 		),
@@ -239,6 +274,51 @@ export function panelView(store) {
 		),
 	);
 	return { embeds: [embed], components: rows };
+}
+
+// ---------------------------------------------------------------- /music
+
+/**
+ * /music <subcommand> -> [tool, args]. Every entry reads only its own options, and only when it is the
+ * one asked for: discord.js throws for a required option the interaction does not carry, and the table
+ * this replaced read /music play's query for every subcommand, so all of them but play failed.
+ */
+const MUSIC_SLASH = {
+	play: (options) => ['play_music', { query: options.getString('query', true) }],
+	playnext: (options) => ['play_next', { query: options.getString('query', true) }],
+	stop: () => ['stop_music', {}],
+	pause: () => ['pause_music', {}],
+	resume: () => ['resume_music', {}],
+	skip: () => ['skip_music', {}],
+	volume: (options) => ['set_music_volume', { percent: options.getInteger('percent', true) }],
+	status: () => ['music_status', {}],
+	// The text goes to the tool as typed: "1:30", "90", "+30" and "-10" are all read there (parseSeekTarget).
+	seek: (options) => ['seek_music', { to: options.getString('position', true) }],
+	loop: (options) => ['loop_music', { mode: options.getString('mode', true) }],
+	shuffle: () => ['shuffle_queue', {}],
+	move: (options) => ['move_in_queue', { from: options.getInteger('from', true), to: options.getInteger('to', true) }],
+	remove: (options) => ['remove_from_queue', { position: options.getInteger('position', true) }],
+	clear: () => ['clear_queue', {}],
+};
+
+/** The tool call behind a /music subcommand, or null for one this build does not know. */
+export function musicSlashCall(sub, options) {
+	const build = MUSIC_SLASH[sub];
+	return build ? build(options) : null;
+}
+
+/** The waiting tracks under /music status, numbered the way /music move and /music remove count them. */
+function musicQueueLines(queue) {
+	if (!Array.isArray(queue) || !queue.length) return '';
+	const lines = queue.slice(0, STATUS_QUEUE_LINES).map((track) =>
+		t('commands.music_queue_line', {
+			position: track.position,
+			title: track.title,
+			duration: track.durationText ? ` (${track.durationText})` : '',
+		}),
+	);
+	if (queue.length > STATUS_QUEUE_LINES) lines.push(t('commands.music_queue_more', { count: queue.length - STATUS_QUEUE_LINES }));
+	return `\n${t('commands.music_queue_header')}\n${lines.join('\n')}`;
 }
 
 // ---------------------------------------------------------------- interactions
@@ -500,23 +580,17 @@ async function handleCommand(interaction, ctx) {
 				return;
 			}
 			const sub = interaction.options.getSubcommand();
-			const map = {
-				play: ['play_music', { query: interaction.options.getString('query', true) }],
-				stop: ['stop_music', {}],
-				pause: ['pause_music', {}],
-				resume: ['resume_music', {}],
-				skip: ['skip_music', {}],
-				volume: ['set_music_volume', { percent: interaction.options.getInteger('percent', true) }],
-				status: ['music_status', {}],
-			};
-			const [tool, args] = map[sub] ?? [];
+			const [tool, args] = musicSlashCall(sub, interaction.options) ?? [];
 			if (!tool) {
 				await interaction.reply({ content: t('commands.music_unknown'), flags: MessageFlags.Ephemeral });
 				return;
 			}
 			await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 			const result = await ctx.callTool(tool, args, { userId: interaction.user?.id ?? null });
-			await interaction.editReply({ content: result.spoken ?? (result.ok ? t('commands.ok') : t('commands.failed')) });
+			let content = result.spoken ?? (result.ok ? t('commands.ok') : t('commands.failed'));
+			// Written, the queue can be shown with its positions, which is what /music move and remove take.
+			if (sub === 'status') content += musicQueueLines(result.data?.queue);
+			await interaction.editReply({ content: content.slice(0, 1900) });
 			return;
 		}
 		case 'summary': {
@@ -750,6 +824,7 @@ const JOIN_LEGACY = rx(JOIN.legacy);
 
 const MUSIC = tRaw('grammar.music');
 const MUSIC_PATTERNS = MUSIC.patterns.map((entry) => ({ action: entry.action, re: rx(entry) }));
+const MUSIC_STOP = MUSIC_PATTERNS.find((entry) => entry.action === 'stop')?.re ?? null;
 const VOLUME_SET = rx(MUSIC.volume_set);
 const VOLUME_REQUIRES = rx(MUSIC.volume_requires);
 const VOLUME_DOWN = rx(MUSIC.volume_down);
@@ -759,6 +834,18 @@ const SKIP_REQUIRES = rx(MUSIC.skip_requires);
 const PLAY_PATTERNS = MUSIC.play_patterns.map(rx);
 const QUERY_CLEANUP = MUSIC.query_cleanup.map(rx);
 const NOT_A_QUERY = new Set(MUSIC.not_a_query);
+// The queue and seek commands (loop, shuffle, clear, move, remove, seek, play next).
+const NUMBER_WORDS = new Map((MUSIC.number_words ?? []).map(([word, value]) => [normalize(word), value]));
+const TIME_UNITS = (MUSIC.time_units ?? []).map(([start, seconds]) => [normalize(start), seconds]);
+const LOOP_PATTERNS = (MUSIC.loop ?? []).map((entry) => ({ mode: entry.mode, re: rx(entry) }));
+const SHUFFLE = rx(MUSIC.shuffle);
+const CLEAR_QUEUE = rx(MUSIC.clear);
+const MOVE_PATTERNS = (MUSIC.move ?? []).map((entry) => ({ place: entry.place ?? null, re: rx(entry) }));
+const REMOVE_PATTERNS = (MUSIC.remove ?? []).map(rx);
+const SEEK_PATTERNS = (MUSIC.seek ?? []).map((entry) => ({ dir: entry.dir, re: rx(entry) }));
+const PLAY_NEXT_PATTERNS = (MUSIC.play_next ?? []).map(rx);
+// "Move it to the end": a place past any queue, which the player reads as the last one.
+const QUEUE_END = Number.MAX_SAFE_INTEGER;
 
 function escapeRegExp(value) {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -914,7 +1001,87 @@ function extractJoin(text, channels) {
 
 // ---------------------------------------------------------------- music commands
 
-/** Music command: { type:'music', action, query?, percent?, delta? } or null. */
+/** A captured play query, cleaned; null when what is left names nothing ("play something"). */
+function cleanQuery(raw) {
+	const query = QUERY_CLEANUP.reduce((value, cleanup) => value.replace(cleanup, ''), cleanMessage(raw)).trim();
+	return query.length < 3 || NOT_A_QUERY.has(normalize(query)) ? null : query;
+}
+
+/** "3", "three", "üç", "üçüncü" -> 3, through the locale's number words; null for anything else. */
+function spokenNumber(token) {
+	const text = normalize(token);
+	if (!text) return null;
+	if (/^\d+$/u.test(text)) return Number(text);
+	return NUMBER_WORDS.get(text) ?? null;
+}
+
+/** Seconds per unit for a spoken unit word, matched by how it starts ("seconds", "saniyeye"). */
+function unitSeconds(word) {
+	const text = normalize(word);
+	return TIME_UNITS.find(([start]) => text.startsWith(start))?.[1] ?? null;
+}
+
+/** The seconds a seek pattern captured: a clock time ("1:30"), or one or two amounts with their units. */
+function seekSeconds(groups) {
+	if (groups.stamp) return parseClock(groups.stamp);
+	let total = null;
+	for (const [amount, unit] of [
+		[groups.n1, groups.u1],
+		[groups.n2, groups.u2],
+	]) {
+		if (amount === undefined) continue;
+		const value = spokenNumber(amount);
+		const seconds = unitSeconds(unit);
+		if (value === null || seconds === null) return null;
+		total = (total ?? 0) + value * seconds;
+	}
+	return total;
+}
+
+/**
+ * The queue and seek commands. They are matched before the playback controls and the play requests,
+ * which would otherwise take them for something else: "skip ahead 30 seconds" is not a skip, and
+ * "play X next" is not a skip either (the word "next").
+ */
+function extractQueueCommand(line) {
+	for (const { mode, re } of LOOP_PATTERNS) {
+		if (re.test(line)) return { type: 'music', action: 'loop', mode };
+	}
+	if (SHUFFLE?.test(line)) return { type: 'music', action: 'shuffle' };
+	if (CLEAR_QUEUE?.test(line)) return { type: 'music', action: 'clear' };
+	for (const { place, re } of MOVE_PATTERNS) {
+		const groups = re.exec(line)?.groups;
+		if (!groups) continue;
+		const from = spokenNumber(groups.from);
+		const to = place === 'top' ? 1 : place === 'end' ? QUEUE_END : spokenNumber(groups.to);
+		if (from && to) return { type: 'music', action: 'move', from, to };
+	}
+	for (const re of REMOVE_PATTERNS) {
+		const position = spokenNumber(re.exec(line)?.groups?.pos);
+		if (position) return { type: 'music', action: 'remove', position };
+	}
+	for (const { dir, re } of SEEK_PATTERNS) {
+		const match = re.exec(line);
+		if (!match) continue;
+		if (dir === 'start') return { type: 'music', action: 'seek', to: 0 };
+		const seconds = seekSeconds(match.groups ?? {});
+		if (seconds === null) continue;
+		if (dir === 'to') return { type: 'music', action: 'seek', to: seconds };
+		return { type: 'music', action: 'seek', by: dir === 'back' ? -seconds : seconds };
+	}
+	for (const re of PLAY_NEXT_PATTERNS) {
+		const match = re.exec(line);
+		const query = match ? cleanQuery(match[1]) : null;
+		if (query) return { type: 'music', action: 'play', query, next: true };
+	}
+	return null;
+}
+
+/**
+ * Music command: { type:'music', action, ... } or null. Besides play (query, next?), volume (percent or
+ * delta) and the bare controls, the queue commands: loop (mode), shuffle, clear, move (from, to),
+ * remove (position) and seek (to, or by for a step).
+ */
 export function extractMusic(text) {
 	const line = String(text ?? '');
 	const setMatch = VOLUME_SET.exec(line);
@@ -926,16 +1093,19 @@ export function extractMusic(text) {
 	if (VOLUME_UP.test(line) && !VOLUME_UP_EXCLUDE.test(line)) {
 		return { type: 'music', action: 'volume', delta: 15 };
 	}
+	// Stop still comes first: it clears the queue as well, so "stop the music and clear the queue" asks
+	// for nothing that stopping does not do, and read as a clear it would leave the music playing.
+	if (MUSIC_STOP?.test(line)) return { type: 'music', action: 'stop' };
+	const queued = extractQueueCommand(line);
+	if (queued) return queued;
 	for (const { action, re } of MUSIC_PATTERNS) {
 		if (action === 'skip' && !SKIP_REQUIRES.test(line)) continue;
 		if (re.test(line)) return { type: 'music', action };
 	}
 	for (const re of PLAY_PATTERNS) {
 		const match = re.exec(line);
-		if (!match) continue;
-		const query = QUERY_CLEANUP.reduce((value, cleanup) => value.replace(cleanup, ''), cleanMessage(match[1])).trim();
-		if (query.length < 3 || NOT_A_QUERY.has(normalize(query))) continue;
-		return { type: 'music', action: 'play', query };
+		const query = match ? cleanQuery(match[1]) : null;
+		if (query) return { type: 'music', action: 'play', query };
 	}
 	return null;
 }
@@ -1027,12 +1197,19 @@ export function actionSignature(command, now = Date.now()) {
 			return `quiet:${command.value}:${Math.floor(now / 5000)}`;
 		case 'character':
 			return `character:${command.character?.id ?? command.name ?? '-'}`;
-		case 'music':
+		case 'music': {
 			// A play request is deduplicated for 30 s (the same request can arrive by two routes);
 			// skip/volume and friends only within a 5 s window, so that "skip, skip" skips two tracks.
-			return command.action === 'play'
-				? `music:play:${normalize(command.query ?? '')}`
-				: `music:${command.action}:${command.percent ?? command.delta ?? ''}:${Math.floor(now / 5000)}`;
+			// "Play X next" is its own request: said right after "play X", it moves X up rather than
+			// being answered from the first one's result.
+			if (command.action === 'play') return `music:play${command.next ? ':next' : ''}:${normalize(command.query ?? '')}`;
+			// Named, not just listed: a seek "to 90" and a seek "by 90" are different requests.
+			const detail = ['percent', 'delta', 'mode', 'from', 'to', 'by', 'position']
+				.filter((key) => command[key] !== undefined)
+				.map((key) => `${key}=${command[key]}`)
+				.join(',');
+			return `music:${command.action}:${detail}:${Math.floor(now / 5000)}`;
+		}
 		default:
 			return null;
 	}

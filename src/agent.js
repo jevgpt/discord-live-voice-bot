@@ -31,17 +31,41 @@ const MUSIC_TOOLS = {
 	skip: 'skip_music',
 	volume: 'set_music_volume',
 	status: 'music_status',
+	loop: 'loop_music',
+	shuffle: 'shuffle_queue',
+	clear: 'clear_queue',
+	move: 'move_in_queue',
+	remove: 'remove_from_queue',
+	seek: 'seek_music',
 };
+
+/**
+ * "Turn the music down" carries a step, not a level, and set_music_volume takes a level: the step is
+ * applied to the volume the player has now. Handing the tool the missing percent made it answer that it
+ * could not work out the volume, every time.
+ */
+function steppedVolume(delta, deps) {
+	const now = Number(deps?.music?.volume);
+	if (!Number.isFinite(now) || !Number.isFinite(delta)) return undefined;
+	return Math.max(0, Math.min(100, Math.round(now * 100 + delta)));
+}
 
 /** Command -> tool name and arguments. */
 export function toolCallFor(command, deps) {
 	if (!command) return null;
 	if (command.type === 'music') {
-		const name = MUSIC_TOOLS[command.action];
+		const name = command.action === 'play' && command.next ? 'play_next' : MUSIC_TOOLS[command.action];
 		if (!name) return null;
 		const args = {};
 		if (command.action === 'play') args.query = command.query;
-		if (command.action === 'volume') args.percent = command.percent;
+		if (command.action === 'volume') args.percent = command.percent ?? steppedVolume(command.delta, deps);
+		if (command.action === 'loop') args.mode = command.mode;
+		if (command.action === 'move') Object.assign(args, { from: command.from, to: command.to });
+		if (command.action === 'remove') args.position = command.position;
+		if (command.action === 'seek') {
+			if (command.by !== undefined) args.by = command.by;
+			else args.to = command.to;
+		}
 		return { name, args };
 	}
 	const name = TOOL_FOR_COMMAND[command.type];

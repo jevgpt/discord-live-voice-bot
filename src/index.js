@@ -30,6 +30,7 @@ import { MemoryStore } from './memory.js';
 import { ReplyLimiter, handleMessage } from './messages.js';
 import { ActivityLog, startPanel } from './panel.js';
 import { createTextProvider } from './provider.js';
+import { QueueStore } from './queuestore.js';
 import { DailyQuota } from './quota.js';
 import { ChannelReader } from './reader.js';
 import { ReminderStore } from './reminders.js';
@@ -67,6 +68,10 @@ const quota = await new DailyQuota({ limitSeconds: cfg.dailyLiveSeconds, file: p
 const reminders = await new ReminderStore(path.join(dataDir, 'reminders.json'), { log }).load();
 // Saved tracks: one list per person, to be played again by name later.
 const savedTracks = await new SavedTracks(path.join(dataDir, 'saved-tracks.json'), { log }).load();
+// Music queues, one per server, kept across restarts and taken back (paused) when that server's session
+// starts. It holds tracks, not speech, so it is written whatever RECORD_TRANSCRIPTS says (see
+// MusicPlayer.snapshot for what is deliberately left out).
+const queueStore = cfg.musicEnabled ? await new QueueStore(path.join(dataDir, 'music-queues.json'), { log }).load() : null;
 const recentActions = new RecentActions();
 const reader = new ChannelReader({ defaultLimit: cfg.readLimit });
 const replyLimiter = new ReplyLimiter({ perMinute: 6 });
@@ -217,6 +222,7 @@ async function ensureSession(guildId, channelId = null) {
 		recentActions,
 		reminders,
 		savedTracks,
+		queueStore,
 		activity,
 		record,
 		provider,
