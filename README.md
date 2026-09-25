@@ -263,19 +263,33 @@ person's floor and bar.
 
 **Measuring it.** Both of the above are judged on numbers, not on a good evening:
 
-- `npm run bench` plays 14 kinds of simulated room (clean handovers, a monologue taken over, the owner
+- `npm run bench` plays 17 kinds of simulated room (clean handovers, a monologue taken over, the owner
   cutting in, two voices summed, "evet" inside somebody else's turn, words in two pieces, late packets, the
   1.3% clock, a transcript a second late, four people at once, guests saying the owner's commands) through
-  the real mixer, attribution, line pipeline and owner gate. Ground truth rides in the signs of each
+  the real mixer, attribution, line pipeline and owner gate. Three of them are attacks on the gate: a guest
+  talking just above a fan in their own microphone, a guest murmuring commands in a quiet room, and a
+  guest's word timed to be reported at the owner's position. Ground truth rides in the signs of each
   packet's samples, so even audio released late after a handover is scored exactly.
 - `npm run bench:vad` runs generated voices at -18 to -48 dBFS over fans, hum, rumble, typing and music.
 
-| Attribution (112 rooms, 13,155 fragments) | vote | hmm |
+| Attribution, the 14 everyday rooms (13,155 fragments) | vote | hmm |
 | --- | --- | --- |
-| fragments right | 98.3% | 98.3% |
+| fragments right | 98.3% | 98.4% |
 | lines wrong | 0.4% | 0.3% |
-| owner's name on somebody else's fragments / lines | 22 / 3 | 6 / 0 |
+| owner's name on somebody else's fragments / lines | 18 / 3 | 5 / 0 |
+| the owner's commands that went through | 52 / 53 | 52 / 53 |
 | guest commands that opened the gate | 0 / 80 | 0 / 80 |
+
+| Guest commands that opened the gate, attack rooms | peak, before | peak, now | adaptive, before | adaptive, now |
+| --- | --- | --- | --- | --- |
+| talking just above a fan in their own mic | 0 / 32 | 0 / 32 | 5 / 32 | 0 / 32 |
+| murmuring at -57 to -51 dBFS | 39 / 64 | 0 / 64 | 1 / 64 | 0 / 64 |
+| a word timed onto the owner's position | 3 / 96 | 0 / 96 | 1 / 96 | 0 / 96 |
+
+The attack rooms cost the owner something: a command said straight after a guest's word is refused as
+interrupted a little more often there (30 of 32 before, 27 of 32 now) and has to be said again. That is the
+direction the gate is meant to err in. In the timed room the path also reads lines worse than the vote
+(16% wrong against 8%), which is why the gate never reads the path.
 
 | Voice detection (60 generated rooms) | peak (old) | adaptive |
 | --- | --- | --- |
@@ -607,6 +621,10 @@ Every one of them is a test now.
 - **A guest's "ban" could come back as the owner's word.** Only in a summed room, only when the far end sent
   two pieces from the same point of the stream, 1 time in 80. Nobody would have found that by ear; the
   benchmark found it on its first run.
+- **The quietest way to get somebody banned was to murmur.** Under the old peak bar, a guest saying "ban"
+  at -55 dBFS in a quiet room was invisible to the mixer, so the only voice it could see was the owner's:
+  39 of 64 murmured commands went through in the benchmark. A second hostile read found it after the first
+  benchmark had cheerfully reported zero; it only reported zero because it had never tried whispering.
 - **In the detector's test rooms, a desk fan was the most talkative member of the server.** It held the
   floor 97.8% of the time. It has since been asked to wait its turn like everybody else.
 - **`/music stop` had never worked.** Every subcommand read the `query` option only `play` has, and Discord
