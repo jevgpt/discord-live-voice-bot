@@ -301,6 +301,10 @@ export class SpeakerAttribution {
 		this.audioMs = 0;
 		this.track = []; // the last ~2 min: { startMs, endMs, owner, id } — audio position -> speaker
 		this.trackMs = trackMs;
+		// Where somebody other than the owner was in the SOUND, spoken or murmured or a fan: { startMs,
+		// endMs }, merged, over the same two minutes. The track above cannot answer that: it keeps the
+		// voices it could name, and two murmurs at once, or a murmur under a speaker, leave no name there.
+		this.othersTrack = [];
 		this.ownerAt = 0;
 		this.otherAt = 0;
 		this.ownerSeq = 0;
@@ -339,22 +343,6 @@ export class SpeakerAttribution {
 	onFrame({ priority = false, active = [], present = null, sent = true, frames = 1 } = {}) {
 		this.seq++;
 		const activeIds = active.map((id) => String(id));
-		const ownerInMix = !priority && this.ownerId ? activeIds.includes(this.ownerId) : false;
-		const othersInMix = activeIds.some((id) => id !== this.ownerId);
-		if (priority) {
-			this.ownerAt = this.now();
-			this.ownerSeq = this.seq;
-		} else {
-			if (ownerInMix) {
-				this.ownerAt = this.now();
-				this.ownerSeq = this.seq;
-			}
-			if (othersInMix) {
-				this.otherAt = this.now();
-				this.otherSeq = this.seq;
-			}
-		}
-		if (!sent) return;
 		// The mixer hands over EVERY simultaneous speaker, loudest first. Keeping only the loudest is what
 		// made two people at once look like one person, and put one person's sentence in another's mouth.
 		// On the priority path the mixer physically discarded everybody else's audio before the frame was
@@ -365,9 +353,57 @@ export class SpeakerAttribution {
 		// has to mean alone in the sound, or somebody can speak quietly and have their words land under
 		// another person's name, with that person's authority.
 		const presentIds = Array.isArray(present) ? present.map((id) => String(id)) : ids;
+		const ownerInMix = !priority && this.ownerId ? activeIds.includes(this.ownerId) : false;
+		// "Somebody else" is anybody else in the sound, not only somebody the detector called a speaker.
+		// Counting the speaking list alone was the hole: a guest with a fan in their microphone, speaking a
+		// command a few dB over it right after the owner stopped, is never speaking by the adaptive bar (the
+		// fan is their floor) and always present, so the frame-level test below saw nobody after the owner,
+		// and the guest's words went into the record as the owner's. Reproduced through the real mixer: a
+		// -40 dBFS fan and speech at -47 opened the gate under VAD=adaptive.
+		// On the priority path "the owner" is whoever the mixer gave priority, configured owner or not.
+		const own = priority ? (ids[0] ?? this.ownerId) : this.ownerId;
+		const othersInSound = (!priority && activeIds.some((id) => id !== own)) || presentIds.some((id) => id !== own);
+		if (priority) {
+			this.ownerAt = this.now();
+			this.ownerSeq = this.seq;
+		} else if (ownerInMix) {
+			this.ownerAt = this.now();
+			this.ownerSeq = this.seq;
+		}
+		if (othersInSound) {
+			this.otherAt = this.now();
+			this.otherSeq = this.seq;
+		}
+		if (!sent) return;
 		const span = Math.max(1, frames | 0) * this.frameMs; // two frames while a handover's backlog is paid back
 		this._track(this.audioMs, this.audioMs + span, ids, presentIds);
+		if (othersInSound) this._trackOthers(this.audioMs, this.audioMs + span);
 		this.audioMs += span;
+	}
+
+	/** Somebody other than the owner was in the sound over this stretch (see othersTrack). */
+	_trackOthers(startMs, endMs) {
+		const list = this.othersTrack;
+		const last = list[list.length - 1];
+		if (last && last.endMs === startMs) last.endMs = endMs;
+		else list.push({ startMs, endMs });
+		const cutoff = endMs - this.trackMs;
+		let drop = 0;
+		while (drop < list.length - 1 && list[drop].endMs < cutoff) drop++;
+		if (drop > 0) list.splice(0, drop);
+	}
+
+	/** Was anybody other than the owner in the sound anywhere in [from, to)? Sorted by endMs, like the track. */
+	_othersIn(from, to) {
+		const list = this.othersTrack;
+		let lo = 0;
+		let hi = list.length;
+		while (lo < hi) {
+			const mid = (lo + hi) >> 1;
+			if (list[mid].endMs <= from) lo = mid + 1;
+			else hi = mid;
+		}
+		return lo < list.length && list[lo].startMs < to;
 	}
 
 	_track(startMs, endMs, ids, presentIds = ids) {
@@ -601,6 +637,7 @@ export class SpeakerAttribution {
 		this.audioMs = 0;
 		this.epoch++;
 		this.track = [];
+		this.othersTrack = [];
 		for (const entry of this.words) entry.pos = null;
 		for (const utt of this.utterances) {
 			utt.startMs = null;
@@ -609,7 +646,7 @@ export class SpeakerAttribution {
 		this.turn = null;
 	}
 
-	/** Is the audio we are sending right now (the last ~1.5 s) the owner's, with nobody speaking after? */
+	/** Is the audio we are sending right now (the last ~1.5 s) the owner's, with nobody else in the sound after? */
 	ownerSpeakingNow() {
 		if (!this.ownerAt) return false;
 		if (this.now() - this.ownerAt > this.speakWindowMs) return false;
@@ -617,11 +654,37 @@ export class SpeakerAttribution {
 	}
 
 	/**
+	 * The owner's authority for words whose own audio says nothing about them: they sit in a pause
+	 * ('nearby'), on a murmur ('quiet'), or nowhere at all ('silence', or no position). That used to be
+	 * the frame-level test alone, and the frame-level test only knew about people the detector called
+	 * speakers; a guest murmuring a command, or speaking it just over their own fan, was nobody, and the
+	 * words were the owner's. Inference is allowed to carry the owner's authority only where there is
+	 * nothing to infer it against: the answer was drawn from nobody's audio but the owner's, the owner is
+	 * still the latest voice in the sound, and nobody else was in the sound at all around these words --
+	 * the neighbourhood resolveSpeaker looked in, or, with no position, the last speakWindowMs. When in
+	 * doubt, it is not the owner's word.
+	 */
+	_ownerAloneAround(startMs, endMs, hit) {
+		if ((hit.ids ?? []).some((id) => id !== this.ownerId)) return false;
+		if (!this.ownerSpeakingNow()) return false;
+		if (Number.isFinite(startMs)) {
+			const to = Number.isFinite(endMs) && endMs > startMs ? endMs : startMs;
+			return !this._othersIn(startMs - NEAR_MS, to + NEAR_MS);
+		}
+		return !this.otherAt || this.now() - this.otherAt > this.speakWindowMs;
+	}
+
+	/**
 	 * Attributes text coming from the Live transcript to its speaker. When `startMs/endMs` (the audio
 	 * position) is given the attribution follows the audio position; otherwise the arrival time is used
 	 * (fallback path). When `owner`/`id` is given (local STT: one fragment per user) it is used directly.
+	 *
+	 * `reportedMs` is the fragment's own window when the caller judged it on another stretch (onTranscript
+	 * does, for a fragment that got no further than the one before it): the name comes from the stretch,
+	 * and the owner's authority needs the owner alone under both by the gate's own test, and nobody else in
+	 * the sound anywhere in the stretch.
 	 */
-	noteTranscript(text, { startMs = null, endMs = null, owner: ownerOverride = null, id: idOverride = null } = {}) {
+	noteTranscript(text, { startMs = null, endMs = null, owner: ownerOverride = null, id: idOverride = null, reportedMs = null } = {}) {
 		const raw = String(text ?? '');
 		const fragment = raw.trim();
 		if (!fragment) return null;
@@ -645,15 +708,31 @@ export class SpeakerAttribution {
 		// Authority. Anything short of "the owner alone, for GATE_SOLO of the stretch" is two people's
 		// speech summed into one frame and must not count as the owner's word, however loud they were.
 		// This is the line that stops somebody riding on the owner's authority by talking at the same time.
-		const owner =
+		const direct = hit.reason === 'direct' && hit.ids.length > 0;
+		let owner =
 			typeof ownerOverride === 'boolean'
 				? ownerOverride
-				: hit.reason === 'direct' && hit.ids.length
+				: direct
 					// There was audio under these words. It either was the owner alone or it was not, and a
 					// tangled stretch answers "not" -- falling back to the frame-level test here would hand the
 					// owner's authority to an overlap, which is the whole thing this is guarding.
 					? hit.solo >= GATE_SOLO && hit.id === this.ownerId
-					: this.ownerSpeakingNow(); // inferred, or nothing at all: fall back on the frame-level test
+					: // Inferred, or nothing at all: only where nobody else was there to have said it.
+						!Array.isArray(reportedMs) && this._ownerAloneAround(startMs, endMs, hit);
+		// A fragment judged on another stretch than its own (see reportedMs) is the owner's only when both
+		// stretches were the owner's alone. Judged on the last stretch alone, a guest's word reported at the
+		// same point as the owner's previous one landed on the owner's audio: guest [0, 400) ms, owner
+		// [400, 1400), guest [1400, 1600), and the guest's " ban" came back as [0, 1590] after the owner's
+		// word at [450, 1590] -- the owner alone for 0.83 of that, and the gate opened.
+		//
+		// And alone for ALL of the stretch, not GATE_SOLO of it. Such a fragment was sent after the one before
+		// it, for audio up to the same point, so its words are at the end of the stretch -- which is exactly
+		// where somebody who speaks straight after the owner is, and exactly the fifth GATE_SOLO leaves to
+		// somebody else. Without this, the same guest with no word of their own before the owner's (owner
+		// [0, 1400), guest [1400, 1600), both reported as [0, 1590]) passed both tests at 0.88.
+		if (owner && !forced && Array.isArray(reportedMs)) {
+			owner = this.speakerAt(reportedMs[0], reportedMs[1]) === true && !this._othersIn(startMs, Number.isFinite(endMs) ? endMs : startMs);
+		}
 		// The name we are willing to put on it. 'leaning' is enough for a transcript line and never for
 		// the gate, which reads `owner` above and is the stricter test.
 		const id = hit.id ?? null;

@@ -58,6 +58,41 @@ describe('a fragment that brings no audio of its own', () => {
 		);
 		assert.equal(room.attribution.commandSpeaker(['ban'])?.owner, true);
 	});
+
+	// The same rule the other way round, found in review: a quick guest, owner, guest exchange, and the far
+	// end (whose end only moves forward) reporting the guest's last word at the end of the owner's. Judged
+	// on the last stretch alone, the guest's word sat on the owner's audio (0.83 of it) and opened the gate.
+	it('does not lend the owner s stretch to a guest s word reported at the same end', () => {
+		for (const mode of ['vote', 'hmm']) {
+			const room = pipeline(mode);
+			room.frames(['g'], 20); // 0 - 400 ms, the guest
+			room.frames([OWNER], 50, { priority: true }); // 400 - 1400 ms, the owner alone
+			room.frames(['g'], 10); // 1400 - 1600 ms, the guest again
+			room.delta(' hey', 450);
+			room.delta(' listen', 1590);
+			room.delta(' ban', 1590); // the guest's word, its end pushed to the owner's
+			const words = room.attribution.words.map((entry) => [entry.word, entry.owner]);
+			assert.deepEqual(words, [
+				['hey', false],
+				['listen', true],
+				['ban', false],
+			], mode);
+			assert.equal(room.attribution.commandSpeaker(['ban'])?.owner, false, `${mode}: the guest's "ban" is not the owner's word`);
+		}
+	});
+
+	it('nor when the owner began the utterance and holds 0.88 of both windows', () => {
+		// The owner's words alone for [0, 1400), the guest's for [1400, 1600): the fragment's own window and
+		// the last stretch are the same [0, 1590], and both pass the gate's 0.8. The words of a fragment sent
+		// that way are at the end of the stretch, which is where the guest is.
+		const room = pipeline('hmm');
+		room.frames([OWNER], 70, { priority: true });
+		room.frames(['g'], 10);
+		room.delta(' listen', 1590);
+		room.delta(' ban', 1590);
+		assert.equal(room.attribution.words.find((entry) => entry.word === 'listen')?.owner, true);
+		assert.equal(room.attribution.commandSpeaker(['ban'])?.owner, false);
+	});
 });
 
 describe('ATTRIBUTION: the vote against the path', () => {

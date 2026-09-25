@@ -228,16 +228,17 @@ function score(room, run) {
 
 /**
  * Every scenario (or the named ones), `reps` rooms each, seeds counted up from the scenario's own.
+ * `vad` runs every room with that voice detector instead of the one its scenario uses.
  * @returns {Promise<{ scenarios: Array<{ name: string, about: string, modes: Record<string, object> }>, overall: Record<string, object> }>}
  */
-export async function runBench({ reps = 8, only = null, modes = ['vote', 'hmm'], seed = 1, traceDir = null } = {}) {
+export async function runBench({ reps = 8, only = null, modes = ['vote', 'hmm'], seed = 1, traceDir = null, vad = null } = {}) {
 	const scenarios = [];
 	const overall = Object.fromEntries(modes.map((mode) => [mode, emptyScore()]));
 	for (const [index, scenario] of SCENARIOS.entries()) {
 		if (only && !only.includes(scenario.name)) continue;
 		const totals = Object.fromEntries(modes.map((mode) => [mode, emptyScore()]));
 		for (let rep = 0; rep < reps; rep++) {
-			const room = buildRoom(scenario, seed * 100_003 + index * 1009 + rep);
+			const room = buildRoom(scenario, seed * 100_003 + index * 1009 + rep, { rep, vad });
 			const result = await runRoom(room, { modes, traceDir });
 			for (const mode of modes) addScore(totals[mode], result[mode].score);
 		}

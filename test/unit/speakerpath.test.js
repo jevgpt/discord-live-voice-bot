@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { performance } from 'node:perf_hooks';
 import { buildRuns, runText } from '../../src/runs.js';
 import { PATH_WEIGHTS, speakerPath } from '../../src/speakerpath.js';
 
@@ -162,5 +163,100 @@ describe('the speaker path and the owner', () => {
 		// Without these the property would hold of a path that never does anything.
 		assert.ok(relabelled > 500, `the path has to actually move fragments: ${relabelled}`);
 		assert.ok(ownerTaken > 50, `and take the owner s name off some: ${ownerTaken}`);
+	});
+
+	// The same property with `owner` as noteTranscript really sets it: the gate's test where the reason is
+	// 'direct', and the frame-level fallback -- a guess about whose turn it was -- anywhere else. Read as
+	// "the owner alone", the fallback put the owner's name on a fragment the vote gave a guest or nobody in
+	// 36,336 of 200,000 flushes like these (found in review). The vote is the only way the owner's name gets
+	// onto a fragment: strictly, not "or the owner flag".
+	it('never names the owner where the vote did not, whatever a murmur, a pause or silence set `owner` to', () => {
+		let seed = 7;
+		const rnd = () => {
+			seed = (Math.imul(seed, 1103515245) + 12345) >>> 0;
+			return (seed >>> 8) / 16_777_216;
+		};
+		const pick = (list) => list[Math.floor(rnd() * list.length)];
+		const people = [OWNER, 'a', 'b', 'c'];
+		const part = () => {
+			const kind = rnd();
+			const text = pick([' ban', 'la', ' Dave', ' ', 'dim,', ' evet', ' kick', 'in']);
+			if (kind < 0.1) return { text, id: null, sure: false, owner: false, confidence: 'unsure', ids: [] };
+			if (kind < 0.15) return { text, id: pick([OWNER, 'a', null]), owner: rnd() < 0.5, confidence: pick(['sure', 'leaning', 'unsure']), ids: [] };
+			const reason = pick(['direct', 'direct', 'direct', 'quiet', 'nearby', 'silence']);
+			const count = reason === 'silence' ? 0 : 1 + Math.floor(rnd() * 3);
+			const chosen = [...people].sort(() => rnd() - 0.5).slice(0, count);
+			let left = 1;
+			const ranked = chosen
+				.map((id) => {
+					const solo = rnd() * left;
+					left -= solo;
+					return { id, solo, share: Math.min(1, solo + rnd() * 0.5) };
+				})
+				.sort((x, y) => y.solo - x.solo);
+			const top = ranked[0];
+			let confidence = !top ? 'unsure' : top.solo >= 0.6 ? 'sure' : top.solo >= 0.25 ? 'leaning' : 'unsure';
+			if (reason !== 'direct' && confidence === 'sure') confidence = 'leaning';
+			let id = confidence === 'unsure' ? null : top.id;
+			// A hand-off names whichever voice is nearer the pause, the runner-up included.
+			if (reason === 'nearby' && ranked.length > 1 && rnd() < 0.3) {
+				id = ranked[1].id;
+				confidence = 'leaning';
+			}
+			const owner = reason === 'direct' && ranked.length ? top.solo >= 0.8 && id === OWNER : rnd() < 0.5;
+			return { text, id, sure: confidence === 'sure', owner, confidence, reason, ranked, ids: ranked.map((entry) => entry.id), seq: Math.floor(rnd() * 100) };
+		};
+		const voted = (p) => (p.confidence === 'unsure' || p.id === null || p.id === undefined ? null : String(p.id));
+		let fallbackOwners = 0;
+		for (let round = 0; round < 5000; round++) {
+			const parts = Array.from({ length: 2 + Math.floor(rnd() * 8) }, part);
+			const out = speakerPath(parts, { ownerId: OWNER });
+			for (let i = 0; i < parts.length; i++) {
+				if (parts[i].owner === true && parts[i].reason !== 'direct') fallbackOwners++;
+				if (voted(out[i]) === OWNER) assert.equal(voted(parts[i]), OWNER, `round ${round}, fragment ${i}: the path named the owner, the vote ${voted(parts[i])}`);
+				if (out[i] !== parts[i]) assert.ok(out[i].owner !== true && out[i].sure !== true, 'a name the path gave carries no authority');
+			}
+		}
+		assert.ok(fallbackOwners > 3000, `the flushes have to hold the fallback's owner flag: ${fallbackOwners}`);
+	});
+});
+
+describe('the speaker path at scale', () => {
+	/** A flush of `count` fragments in which every one of `people` is in every fragment's audio. */
+	const crowd = (count, people) => {
+		const ids = Array.from({ length: people }, (_, i) => `p${i}`);
+		return Array.from({ length: count }, (_, t) => {
+			const ranked = ids.map((id, j) => ({ id, solo: j === t % people ? 0.5 : 0.5 / people, share: 0.6 })).sort((x, y) => y.solo - x.solo || (x.id < y.id ? -1 : 1));
+			return { text: t % 3 ? 'ab' : ' cd', id: ids[t % people], confidence: 'leaning', sure: false, owner: false, reason: 'direct', ranked, ids: ranked.map((entry) => entry.id) };
+		});
+	};
+
+	it('keeps a flush at the fragment cap with fifty people far inside one audio tick', () => {
+		// Viterbi over everybody the flush heard was 35 ms here, on the event loop the 20 ms tick shares.
+		const parts = crowd(2000, 50);
+		for (let i = 0; i < 3; i++) speakerPath(parts, { ownerId: 'p0' });
+		const times = [];
+		for (let i = 0; i < 7; i++) {
+			const at = performance.now();
+			speakerPath(parts, { ownerId: 'p0' });
+			times.push(performance.now() - at);
+		}
+		times.sort((x, y) => x - y);
+		// Measured at about 1 ms; the bound leaves room for a slow machine and still catches the old cost.
+		assert.ok(times[3] < 12, `median over 2000 fragments and 50 people: ${times[3].toFixed(2)} ms`);
+	});
+
+	it('leaves a fragment the vote gave to somebody outside the few it weighs exactly as the vote had it', () => {
+		// Seven people; the last two are named once each and heard least, so the path runs over the other
+		// five and nobody, and passes their fragments through untouched.
+		const parts = [];
+		for (let i = 0; i < 20; i++) parts.push(frag(` w${i}`, { [['a', 'b', 'c', 'd', OWNER][i % 5]]: 0.9 }));
+		parts.push(frag(' once', { e: 0.3, a: 0.2 }));
+		parts.push(frag(' twice', { f: 0.3, b: 0.2 }));
+		for (let i = 0; i < 4; i++) parts.push(frag(` x${i}`, { a: 0.9 }));
+		const out = speakerPath(parts, { ownerId: OWNER });
+		assert.equal(out[20], parts[20]);
+		assert.equal(out[21], parts[21]);
+		assert.deepEqual(names(out).slice(20, 22), ['e', 'f']);
 	});
 });

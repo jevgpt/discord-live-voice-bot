@@ -186,7 +186,21 @@ const FLOOR_JITTER_FRAMES = 5;
 // for "there is real sound here". It stays this bar under the adaptive detector (VAD_TUNING): presence
 // is the attacker's question, and a bar that follows a person's own noise floor is one they can raise
 // with a noise of their own and then murmur under.
+//
+// And it is asked of what goes INTO the frame, after the gain, not of what the microphone sent. The frame
+// the model transcribes holds every voice times its AGC gain, and a peak bar on the way in let a voice
+// through twice over: a guest whose gain had been set to +18 dB by an earlier sentence could whisper at a
+// peak of 100 and go out at 800, "absent"; and a whisper has little peak for its energy, so one at -60
+// dBFS cleared a peak of 200 on 5 of its 35 frames and was nobody on the other 30. So a voice is also
+// present when its energy after the gain is PRESENCE_DB or more -- which is the adaptive detector's
+// digital silence (VAD_TUNING.silenceDb), not a level of speech. Any bar above that leaves a band the
+// transcriber can hear and the gate cannot: at -60 dBFS a whisper compressed to -63 was present on none of
+// its frames and a command in it opened the gate; at -80 a whisper at -78 in a -90 room is present on 9 of
+// its 35 frames (24 compressed) and the gate stays shut. What this costs is measured on npm run bench,
+// whose open microphones all carry their room above either bar: the owner's commands opened as before.
 const PRESENCE_PEAK = 200;
+const PRESENCE_DB = -80;
+const PRESENCE_RMS = 32768 * 10 ** (PRESENCE_DB / 20);
 // Floor control: one voice at a time. The model hears a SUM and cannot pull it apart, so two people at
 // once is the one thing every downstream step is worst at -- the transcript comes back garbled, the line
 // is nobody's, the gate refuses, the command is not run. The owner's priority path proves the cure: while
@@ -371,10 +385,14 @@ export class NoiseFloor {
 		return Math.max(this.floor + this.tuning.keepDb, this.tuning.minKeepDb);
 	}
 
-	/** Takes a frame, already judged against the floor as it stood, into the floor. */
+	/**
+	 * Takes a frame, already judged against the floor as it stood, into the floor. Returns true when the
+	 * steady check lifted the floor on this frame: the sound of the last 300 ms was a room, not a voice.
+	 */
 	track(db) {
 		const tuning = this.tuning;
-		if (!(db >= tuning.silenceDb)) return;
+		if (!(db >= tuning.silenceDb)) return false;
+		let lifted = false;
 		this.tracked++;
 		if (db < this.blockMin) this.blockMin = db;
 		if (++this.blockFill >= tuning.blockFrames) {
@@ -403,9 +421,11 @@ export class NoiseFloor {
 				this.blocks.fill(lo);
 				if (this.blockMin < lo) this.blockMin = lo;
 				floor = lo;
+				lifted = true;
 			}
 		}
 		this.floor = floor;
+		return lifted;
 	}
 }
 
@@ -426,6 +446,7 @@ export class SpeakerMixer {
 		bufferFrames = 50, // a second: only an event-loop stall fills it, and then it must hold what arrived
 		activityPeak = 50,
 		presencePeak = PRESENCE_PEAK,
+		presenceRms = PRESENCE_RMS,
 		speechPeak = SPEECH_PEAK,
 		onsetFrames = SPEECH_ONSET_FRAMES,
 		holdFrames = SPEECH_HOLD_FRAMES,
@@ -465,6 +486,7 @@ export class SpeakerMixer {
 		this.bufferSamples = frameSamples * bufferFrames;
 		this.activityPeak = activityPeak;
 		this.presencePeak = presencePeak;
+		this.presenceRms = presenceRms;
 		this.speechPeak = speechPeak;
 		this.onsetFrames = onsetFrames;
 		this.holdFrames = holdFrames;
@@ -510,7 +532,8 @@ export class SpeakerMixer {
 	 * The gain this speaker's frame goes out with. The level estimate moves only on frames that are speech
 	 * in their own right (see _note), so silence and breath do not drag it down and pump the gain up. Under
 	 * the peak bar a fan counted as speech here too: its -40 dBFS became the "voice" the gain was set for,
-	 * and it went out 18 dB louder. The adaptive detector gives the estimate nothing but talk-spurts.
+	 * and it went out 18 dB louder. The adaptive detector gives the estimate nothing but talk-spurts, and
+	 * takes back what the first 300 ms of a steady noise gave it before it was known for one (see _note).
 	 *
 	 * A tick with no frame of theirs still has a gain: the backlog of a handover drains after they stop
 	 * sending (see _emitFloor), and those frames are the tail of the same sentence. Unity there put the
@@ -593,10 +616,24 @@ export class SpeakerMixer {
 		else voice.loud = 0;
 		const strong = voice.loud >= this.onsetFrames;
 		if (strong || (vad.voiced && db >= vad.keep && this.frames - voice.speechAt <= this.holdFrames)) voice.speechAt = this.frames;
-		vad.track(db);
+		const lifted = vad.track(db);
 		if (peak > this.activityPeak) voice.audioAt = this.frames;
 		// For their turn, "still sending" is any frame that is not digital silence (see _speaking).
 		if (db >= vad.tuning.silenceDb) voice.sendingAt = this.frames;
+		// The steady check has just found that the last 300 ms were a room, not a voice -- and those frames
+		// were a talk-spurt until it did, which is all the AGC's estimate listens to. A fan switched on was
+		// "speech" for its first 24 frames, long enough to become the level the gain is set for; then it was
+		// never strong again, so nothing moved the estimate back: the gain stayed at +18 dB, and a -40 dBFS
+		// fan went out at -21.6 whenever the floor was free. What the estimate learned from the steady sound
+		// is thrown away with it: the level and the gain start again, as for somebody new, and the same fan
+		// goes out at -39.7. The cost would be a held "mmmm", the one voice the check catches, whose next
+		// words start at unity and climb back; over the 46 minutes of speech in bench:vad's rooms it fired
+		// once per room with a steady noise in it, as the noise began, and never inside speech.
+		if (lifted) {
+			voice.level = 0;
+			voice.gain = 1;
+			return false;
+		}
 		return strong;
 	}
 
@@ -819,8 +856,13 @@ export class SpeakerMixer {
 		const present = [];
 		const heard = [];
 		for (const f of frames) {
-			if (f.n > 0) mixInto(out, f.buf, f.n, this._gain(f));
-			if (f.peak > this.presencePeak) present.push(f.id);
+			if (f.n > 0) {
+				const gain = this._gain(f);
+				mixInto(out, f.buf, f.n, gain);
+				// Present as it goes out, after the gain (see PRESENCE_DB). The peak is known already; the energy
+				// costs one more pass over the frame, and only for a frame the peak did not settle.
+				if (f.peak * gain > this.presencePeak || rmsOf(f.buf, f.n) * gain >= this.presenceRms) present.push(f.id);
+			}
 			if (f.speaking) heard.push({ id: f.id, energy: f.voice.energy });
 		}
 		heard.sort((a, b) => b.energy - a.energy);

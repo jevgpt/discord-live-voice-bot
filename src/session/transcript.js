@@ -89,8 +89,16 @@ export const transcriptMethods = {
 		// Its window used to fall back to the whole utterance so far, so it was judged on everything said
 		// since the utterance began. Caught by the benchmark (bench/, the overlap rooms): a guest's "ban"
 		// sent that way, in an utterance the owner had held alone for four fifths of, came back as the
-		// owner's word and opened the gate. It is judged on the stretch the last fragment covered, which is
+		// owner's word and opened the gate. It is named from the stretch the last fragment covered, which is
 		// the audio the far end had just heard when it sent both; its own end stays where it was reported.
+		// That stretch alone decides nobody's authority, though. The same rule the other way round: guest,
+		// owner, guest in quick turns, and the far end reporting the guest's last word at the end of the
+		// owner's (it only ever moves the end forward) put a guest's "ban" on the owner's stretch, and the
+		// gate opened on it. So the owner's authority needs the owner alone under both, the last stretch and
+		// the fragment's own window, and nobody else anywhere in the stretch (reportedMs in noteTranscript).
+		// On the bench's reverse-repeat rooms that closed 4 guest commands in 192 and cost the owner 6 in 64:
+		// the owner's own word, sent that way straight after a guest's, is no longer the owner's, the command
+		// before it is refused as interrupted, and the owner has to ask again.
 		const repeats =
 			!straddles && Number.isFinite(buf.lastEnd) && Number.isFinite(buf.lastFrom) && Number.isFinite(from) && Number.isFinite(endMs) && from < buf.lastEnd && endMs <= buf.lastEnd;
 		let judgedEnd = endMs;
@@ -108,7 +116,7 @@ export const transcriptMethods = {
 			// ONE resolution per delta, made where the audio track lives and then reused for the record, for
 			// the model's context and for the run. Resolving it again downstream is how two parts of the code
 			// ended up naming two different people for the same words.
-			const hit = this.attribution.noteTranscript(text, { startMs: from, endMs: judgedEnd });
+			const hit = this.attribution.noteTranscript(text, { startMs: from, endMs: judgedEnd, reportedMs: repeats ? [startMs, endMs] : null });
 			this.health.fragment(hit);
 			this.health.driftNow(drift, this.attribution.driftRate);
 			this.trace?.delta({ audio: this.attribution.audioMs, rawStart, rawEnd, start: from, end: judgedEnd, drift, text, hit });

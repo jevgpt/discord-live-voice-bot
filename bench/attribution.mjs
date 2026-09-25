@@ -7,6 +7,7 @@
 //   npm run bench -- --only overlap,lag   some scenarios
 //   npm run bench -- --modes vote         one mode
 //   npm run bench -- --seed 7             another set of rooms
+//   npm run bench -- --vad peak           every room with the peak bar instead of VAD=adaptive
 //   npm run bench -- --trace data/traces  write every room as a flight-recorder trace (the first mode's
 //                                         lines), for scripts/replay-trace.mjs
 //
@@ -30,15 +31,18 @@ const seed = Math.max(1, Number(value('--seed', 1)) || 1);
 const only = value('--only', null)?.split(',').filter(Boolean) ?? null;
 const modes = value('--modes', 'vote,hmm').split(',').filter(Boolean);
 const traceDir = value('--trace', null);
+const vad = value('--vad', null);
+if (vad !== null && vad !== 'peak' && vad !== 'adaptive') throw new Error(`--vad is peak or adaptive, not ${vad}`);
 
 const started = performance.now();
-const result = await runBench({ reps, only, modes, seed, traceDir });
+const result = await runBench({ reps, only, modes, seed, traceDir, vad });
 const seconds = ((performance.now() - started) / 1000).toFixed(1);
 
 if (json) {
 	const out = {
 		reps,
 		seed,
+		vad: vad ?? 'as each scenario runs',
 		modes,
 		scenarios: result.scenarios.map((scenario) => ({
 			name: scenario.name,
@@ -84,5 +88,5 @@ if (json) {
 		if (row[0] && i) console.log('');
 		console.log(line(row));
 	}
-	console.log(`\npercentages; ${result.scenarios.length} scenarios x ${reps} rooms, seed ${seed}, ${seconds} s`);
+	console.log(`\npercentages; ${result.scenarios.length} scenarios x ${reps} rooms, seed ${seed}${vad ? `, VAD=${vad}` : ''}, ${seconds} s`);
 }

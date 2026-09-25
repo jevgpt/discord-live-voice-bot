@@ -11,10 +11,10 @@ import { replaySession } from '../../src/replay.js';
 // play three small ones, so that the harness cannot rot unnoticed, and use them for what only a whole
 // room can show: that ATTRIBUTION=hmm leaves the owner gate exactly where it was.
 
-const room = (name, rep = 0) => {
+const room = (name, rep = 0, vad = null) => {
 	const index = SCENARIOS.findIndex((scenario) => scenario.name === name);
 	assert.ok(index >= 0, name);
-	return buildRoom(SCENARIOS[index], 100_003 + index * 1009 + rep);
+	return buildRoom(SCENARIOS[index], 100_003 + index * 1009 + rep, { rep, vad });
 };
 
 /** What the gate reads, word by word and utterance by utterance. */
@@ -81,6 +81,37 @@ describe('the attribution benchmark', () => {
 			}
 		});
 	}
+
+	// Rooms of the three attacks the review found, each one a room that let a guest's command through
+	// before they were closed: a command spoken just over the guest's own fan (it opened twice here under
+	// VAD=adaptive), murmured commands in a quiet room (six times under VAD=peak), and a guest's word the
+	// far end reported at the end of the owner's (once each).
+	it('lets no guest through in the rooms the review found, under the voice detector each failed with', async () => {
+		for (const [name, rep, vad] of [
+			['fan-guest', 2, 'adaptive'],
+			['murmur-guest', 0, 'peak'],
+			['reverse-repeat', 0, 'peak'],
+			['reverse-repeat', 4, 'adaptive'],
+		]) {
+			const result = await runRoom(room(name, rep, vad));
+			for (const mode of ['vote', 'hmm']) {
+				const { score } = result[mode];
+				assert.ok(score.guestCommands > 0, `${name} ${vad} ${mode}: the guests did give commands`);
+				assert.equal(score.guestOpened, 0, `${name} ${vad} ${mode}: a guest opened the gate`);
+			}
+		}
+	});
+
+	it('still opens for the owner in a room with a murmuring guest, and hears the murmur at the right level', async () => {
+		const played = room('murmur-guest', 0, 'peak');
+		assert.deepEqual(
+			played.words.filter((word) => word.levelDb !== null).map((word) => word.levelDb).filter((level, i, all) => all.indexOf(level) === i),
+			[-60, -57, -54, -51],
+			'the guest speaks at the levels the scenario gives',
+		);
+		const result = await runRoom(played);
+		for (const mode of ['vote', 'hmm']) assert.equal(result[mode].score.ownerOpened, result[mode].score.ownerShouldOpen, mode);
+	});
 
 	it('writes a flight-recorder trace that replays to the lines it recorded, in either mode', async () => {
 		const dir = await mkdtemp(path.join(tmpdir(), 'bench-trace-'));

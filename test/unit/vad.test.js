@@ -278,6 +278,35 @@ describe('a fan that turns on mid-session', () => {
 		assert.ok(sentAsA('adaptive') > 0.9, `adaptive: ${sentAsA('adaptive')}`);
 		assert.ok(sentAsA('peak') < 0.2, `the baseline, where the fan held the floor: ${sentAsA('peak')}`);
 	});
+
+	// Its first 300 ms were a talk-spurt, which is what the AGC listens to: the fan's level became the
+	// "voice" the gain was set for, +18 dB, and nothing ever moved it back. Found in review.
+	it('leaves no gain behind it: the AGC forgets what the fan taught it before it was known for one', () => {
+		const seconds = 8;
+		const frames = toFrames(add(hiss({ seconds, levelDb: -72, seed: 11 }), fan({ seconds, levelDb: -40, seed: 5 })));
+		const m = adaptive({ agc: true, floorControl: true });
+		let acc = 0;
+		let count = 0;
+		for (let i = 0; i < frames.length; i++) {
+			m.push('b', frames[i]);
+			const { pcm } = m.tick();
+			if (i < 200) continue;
+			for (const v of pcm) acc += v * v;
+			count += pcm.length;
+		}
+		const out = 10 * Math.log10(acc / count / 32768 ** 2);
+		assert.equal(m.voices.get('b').gain, 1, 'the gain is back at unity');
+		assert.equal(m.levels()[0].levelDb, null, 'and no speech level is claimed for a fan');
+		assert.ok(out < -38, `the fan goes out as it came in: ${out.toFixed(1)} dBFS`);
+
+		// The AGC still works for the voice that follows: a quiet speaker over the same fan is raised.
+		const talk = toFrames(add(speech({ seconds, levelDb: -38, seed: 21, lead: 0.2 }).x, fan({ seconds, levelDb: -40, seed: 5 })));
+		for (const frame of talk) {
+			m.push('b', frame);
+			m.tick();
+		}
+		assert.ok(m.voices.get('b').gain > 2, `a quiet voice is still brought up: gain ${m.voices.get('b').gain.toFixed(2)}`);
+	});
 });
 
 describe('the owner s priority under the adaptive detector', () => {
