@@ -1,8 +1,22 @@
 // Music tools: the bot's own player (src/music.js). Music ducks by itself while the bot speaks.
+//
+// All of them are open to everybody, like play/stop/skip always were: the worst any of them does is to
+// somebody else's listening, and stop_music -- which clears the whole queue -- set that bar long ago.
 
 import { t } from '../i18n/index.js';
-import { QUEUE_FULL, UNSUPPORTED_LINK, YTDLP_MISSING } from '../music.js';
+import {
+	LOOP_MODES,
+	MAX_SEEK_SECONDS,
+	QUEUE_FULL,
+	SEEK_OUT_OF_RANGE,
+	SEEK_PAST_END,
+	SEEK_UNSUPPORTED,
+	UNSUPPORTED_LINK,
+	YTDLP_MISSING,
+	parseSeekTarget,
+} from '../music.js';
 import { MAX_SAVED_PER_USER, pickSaved } from '../savedtracks.js';
+import { formatClock } from '../text.js';
 import { P, defineTool } from './registry.js';
 
 /** The player is not wired up (.env: MUSIC=0); every music tool answers the same way. */
@@ -29,43 +43,68 @@ function playFailure(err, deps) {
 	return { ok: false, spoken: t('tools.music.play_failed_generic') };
 }
 
+/** play_music and play_next: the same lookup, the track going to the back of the queue or to its front. */
+async function queueTrack(args, deps, { next = false } = {}) {
+	if (!deps.music) return noMusic();
+	const query = String(args.query ?? '').trim();
+	if (!query) return { ok: false, spoken: t('tools.music.no_query') };
+	try {
+		const { track, position, startedNow, duplicate, moved } = await deps.music.enqueue(query, {
+			requestedBy: deps.currentSpeakerName?.() ?? null,
+			...(next ? { next: true } : {}),
+		});
+		const label = `${track.title}${track.uploader ? ` — ${track.uploader}` : ''}`;
+		if (duplicate) {
+			return {
+				ok: true,
+				spoken: t('tools.music.already_queued', { title: track.title }),
+				data: { title: track.title, duplicate: true, position },
+			};
+		}
+		const event = startedNow
+			? t('tools.music.playing_event', { label })
+			: next
+				? t('tools.music.queued_next_event', { label })
+				: t('tools.music.queued_event', { position, label });
+		musicEvent(deps, event, { query, source: track.kind });
+		const spoken = startedNow
+			? t('tools.music.playing', { title: track.title })
+			: moved
+				? t('tools.music.moved_up', { title: track.title })
+				: next
+					? t('tools.music.queued_next', { title: track.title })
+					: t('tools.music.queued', { position, title: track.title });
+		return {
+			ok: true,
+			spoken,
+			data: { title: track.title, uploader: track.uploader, duration: track.duration, position, started_now: startedNow, ...(moved ? { moved: true } : {}) },
+		};
+	} catch (err) {
+		return playFailure(err, deps);
+	}
+}
+
+/** "nothing playing" for the tools that act on the current track. */
+function nothingPlaying() {
+	return { ok: false, spoken: t('tools.music.nothing_playing') };
+}
+
 export const tools = [
 	defineTool({
 		name: 'play_music',
 		description:
 			'Plays a song or track: a YouTube search (song title + artist) or a direct link. If something is already playing it is queued instead. Music is ducked while the bot speaks.',
 		parameters: P.obj({ query: P.str('Song title (+ artist) or URL') }, ['query']),
-		async handler(args, deps) {
-			if (!deps.music) return noMusic();
-			const query = String(args.query ?? '').trim();
-			if (!query) return { ok: false, spoken: t('tools.music.no_query') };
-			try {
-				const { track, position, startedNow, duplicate } = await deps.music.enqueue(query, {
-					requestedBy: deps.currentSpeakerName?.() ?? null,
-				});
-				const label = `${track.title}${track.uploader ? ` — ${track.uploader}` : ''}`;
-				if (duplicate) {
-					return {
-						ok: true,
-						spoken: t('tools.music.already_queued', { title: track.title }),
-						data: { title: track.title, duplicate: true, position },
-					};
-				}
-				musicEvent(deps, startedNow ? t('tools.music.playing_event', { label }) : t('tools.music.queued_event', { position, label }), {
-					query,
-					source: track.kind,
-				});
-				return {
-					ok: true,
-					spoken: startedNow
-						? t('tools.music.playing', { title: track.title })
-						: t('tools.music.queued', { position, title: track.title }),
-					data: { title: track.title, uploader: track.uploader, duration: track.duration, position, started_now: startedNow },
-				};
-			} catch (err) {
-				return playFailure(err, deps);
-			}
-		},
+		handler: (args, deps) => queueTrack(args, deps),
+	}),
+
+	defineTool({
+		name: 'play_next',
+		description:
+			'Puts a song at the FRONT of the queue, so it plays right after the current track ("play X next", "after this one play X"). ' +
+			'Starts it at once when nothing is playing. A track that is already waiting is moved up rather than added twice.',
+		parameters: P.obj({ query: P.str('Song title (+ artist) or URL') }, ['query']),
+		handler: (args, deps) => queueTrack(args, deps, { next: true }),
 	}),
 
 	defineTool({
@@ -157,7 +196,8 @@ export const tools = [
 
 	defineTool({
 		name: 'music_status',
-		description: 'What is playing, what is in the queue, what is the volume?',
+		description:
+			'What is playing and how far into it (elapsed / length), what is in the queue and at which positions, the repeat mode and the volume.',
 		async handler(args, deps) {
 			if (!deps.music) return noMusic();
 			const state = deps.music.state();
@@ -176,6 +216,126 @@ export const tools = [
 			if (!removed) return { ok: false, spoken: t('tools.music.queue_not_found') };
 			musicEvent(deps, t('tools.music.removed_event', { title: removed.title }));
 			return { ok: true, spoken: t('tools.music.removed', { title: removed.title }), data: { title: removed.title } };
+		},
+	}),
+
+	defineTool({
+		name: 'move_in_queue',
+		description:
+			'Moves a waiting track to another place in the queue by position ("move 3 to 1" = track 3 plays next). ' +
+			'Positions are the ones music_status lists (1 = next up); a target past the end moves it to the end.',
+		parameters: P.obj(
+			{ from: P.int('Queue position of the track to move (1 = next up)'), to: P.int('Its new position (1 = next up)') },
+			['from', 'to'],
+		),
+		async handler(args, deps) {
+			if (!deps.music) return noMusic();
+			const moved = deps.music.move(Math.round(Number(args.from)), Math.round(Number(args.to)));
+			if (!moved) return { ok: false, spoken: t('tools.music.queue_not_found') };
+			musicEvent(deps, t('tools.music.moved_event', { title: moved.track.title, from: moved.from, position: moved.to }));
+			return {
+				ok: true,
+				spoken: t('tools.music.moved', { title: moved.track.title, position: moved.to }),
+				data: { title: moved.track.title, from: moved.from, to: moved.to },
+			};
+		},
+	}),
+
+	defineTool({
+		name: 'clear_queue',
+		description: 'Empties the queue of waiting tracks. The track playing now keeps playing (stop_music stops everything).',
+		async handler(args, deps) {
+			if (!deps.music) return noMusic();
+			const title = deps.music.current?.title ?? null;
+			const count = deps.music.clear();
+			if (!count) return { ok: true, spoken: t('tools.music.cleared_empty'), data: { cleared: 0 } };
+			musicEvent(deps, t('tools.music.cleared_event', { count }));
+			return {
+				ok: true,
+				spoken: title ? t('tools.music.cleared', { count, title }) : t('tools.music.cleared_idle', { count }),
+				data: { cleared: count, playing: title },
+			};
+		},
+	}),
+
+	defineTool({
+		name: 'shuffle_queue',
+		description: 'Shuffles the order of the waiting tracks. The track playing now is not touched.',
+		async handler(args, deps) {
+			if (!deps.music) return noMusic();
+			const count = deps.music.shuffle();
+			if (count < 2) return { ok: false, spoken: t('tools.music.shuffle_too_short') };
+			const next = deps.music.queue[0]?.title ?? '';
+			musicEvent(deps, t('tools.music.shuffled_event', { count }));
+			return { ok: true, spoken: t('tools.music.shuffled', { count, next }), data: { count, next } };
+		},
+	}),
+
+	defineTool({
+		name: 'loop_music',
+		description:
+			'Repeat mode: "track" repeats the current track ("loop this song"), "queue" starts the queue over when it ends ' +
+			'("repeat the queue"), "off" stops repeating. Skipping still moves on while a track is on repeat.',
+		parameters: P.obj({ mode: { type: 'string', enum: [...LOOP_MODES], description: 'off / track / queue' } }, ['mode']),
+		async handler(args, deps) {
+			if (!deps.music) return noMusic();
+			const mode = String(args.mode ?? '').trim().toLowerCase();
+			if (!LOOP_MODES.includes(mode)) return { ok: false, spoken: t('tools.music.bad_loop') };
+			// Repeating "this track" with no track is a request about nothing; the other two are settings.
+			if (mode === 'track' && !deps.music.current) return nothingPlaying();
+			deps.music.setLoop(mode);
+			const title = deps.music.current?.title ?? '';
+			const event = mode === 'track' ? 'tools.music.loop_event_track' : mode === 'queue' ? 'tools.music.loop_event_queue' : 'tools.music.loop_event_off';
+			musicEvent(deps, t(event, { title }), { mode });
+			const spoken = mode === 'track' ? t('tools.music.loop_track', { title }) : mode === 'queue' ? t('tools.music.loop_queue') : t('tools.music.loop_off');
+			return { ok: true, spoken, data: { mode } };
+		},
+	}),
+
+	defineTool({
+		name: 'seek_music',
+		description:
+			'Jumps within the current track. "to" is a place: "1:30", "90" (seconds) or "0" for the start ("go to 1:30", "start the song over"); ' +
+			'"+30" / "-10" in "to", or "by" in seconds, is a step from where it is now ("skip ahead 30 seconds", "rewind 10 seconds"). ' +
+			'A link with no known length (a live stream) can only be started over.',
+		parameters: P.obj({
+			to: P.str('Where to go: "1:30", "90", "0" for the start, or a step such as "+30" / "-10"'),
+			by: P.int('Seconds from the current position: positive = ahead, negative = back'),
+		}),
+		async handler(args, deps) {
+			if (!deps.music) return noMusic();
+			const music = deps.music;
+			if (!music.current) return nothingPlaying();
+			const given = (value) => value !== undefined && value !== null && String(value).trim() !== '';
+			const target = given(args.to)
+				? parseSeekTarget(args.to)
+				: given(args.by) && Number.isFinite(Number(args.by))
+					? { by: Math.round(Number(args.by)) }
+					: null;
+			// A model can send any number at all. One that is no place in any track (1e308 reached ffmpeg as
+			// "-ss Infinity") is answered here, in words, before the player is asked.
+			const amount = target ? ('by' in target ? target.by : target.to) : null;
+			if (!target || !Number.isFinite(amount) || Math.abs(amount) > MAX_SEEK_SECONDS) return { ok: false, spoken: t('tools.music.bad_seek') };
+			const title = music.current.title;
+			let result;
+			try {
+				result = 'by' in target ? music.seekBy(target.by) : music.seek(target.to);
+			} catch (err) {
+				if (err.message === SEEK_PAST_END) {
+					return { ok: false, spoken: t('tools.music.seek_past_end', { title, duration: formatClock(music.current.duration) }) };
+				}
+				if (err.message === SEEK_UNSUPPORTED) return { ok: false, spoken: t('tools.music.seek_live', { title }) };
+				if (err.message === SEEK_OUT_OF_RANGE) return { ok: false, spoken: t('tools.music.bad_seek') };
+				throw err;
+			}
+			if (!result) return nothingPlaying();
+			const position = formatClock(result.to);
+			musicEvent(deps, t('tools.music.seek_event', { title, position }), { from: Math.floor(result.from), to: Math.floor(result.to) });
+			return {
+				ok: true,
+				spoken: music.paused ? t('tools.music.seeked_paused', { title, position }) : t('tools.music.seeked', { title, position }),
+				data: { title, position: Math.floor(result.to), from: Math.floor(result.from), duration: music.current.duration ?? null },
+			};
 		},
 	}),
 

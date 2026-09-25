@@ -18,6 +18,9 @@ export class LatencyMeter {
 	constructor({ window = 100 } = {}) {
 		this.window = window;
 		this.samples = { response: [], delegation: [], tool: [] };
+		// How many of each were ever taken. The window above forgets the oldest, so without this the panel's
+		// history could not tell which of the samples in it are new since it last looked.
+		this.taken = { response: 0, delegation: 0, tool: 0 };
 		this.userSpeechEndAt = null;
 		this.delegationStartedAt = null;
 	}
@@ -55,7 +58,13 @@ export class LatencyMeter {
 	_push(kind, ms) {
 		const list = this.samples[kind];
 		list.push(ms);
+		this.taken[kind]++;
 		while (list.length > this.window) list.shift();
+	}
+
+	/** One kind's recent samples and how many were ever taken, for the panel's history (read, not copied). */
+	recent(kind) {
+		return { list: this.samples[kind] ?? [], total: this.taken[kind] ?? 0 };
 	}
 
 	summary() {

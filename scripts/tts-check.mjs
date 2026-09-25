@@ -5,7 +5,7 @@ import { loadConfig } from '../src/config.js';
 import { LocalTts } from '../src/localtts.js';
 
 const cfg = loadConfig();
-const tts = new LocalTts({ url: cfg.localTtsUrl, languageId: cfg.localTtsLang, timeoutMs: 300_000 });
+const tts = new LocalTts({ url: cfg.localTtsUrl, languageId: cfg.localTtsLang, timeoutMs: 300_000, token: cfg.localTtsToken });
 
 const health = await tts.health();
 console.log('health:', JSON.stringify(health));

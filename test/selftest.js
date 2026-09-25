@@ -21,6 +21,7 @@ import prism from 'prism-media';
 import { AudioBridge } from '../src/bridge.js';
 import { findMember } from '../src/tools/helpers.js';
 import { SpeakerAttribution } from '../src/attribution.js';
+import { ownerVoice } from './owner-voice.js';
 import { createTaskRunner, executeAction } from '../src/agent.js';
 import {
 	characterModal,
@@ -115,6 +116,8 @@ function makeToolDeps({ messages = new Map(), emojis = [], stickers = [] } = {})
 		id: '10',
 		name: 'general',
 		type: ChannelType.GuildText,
+		// A public channel: anybody may see it and read its history.
+		permissionsFor: () => ({ has: () => true }),
 		send: async (payload) => {
 			sent.push(payload);
 			return { id: 'm1' };
@@ -150,7 +153,7 @@ function makeToolDeps({ messages = new Map(), emojis = [], stickers = [] } = {})
 			]),
 			fetch: async () => new Map(),
 		},
-		roles: { cache: new Map([['2', { id: '2', name: 'Moderator' }]]) },
+		roles: { cache: new Map([['2', { id: '2', name: 'Moderator' }]]), everyone: { id: 'everyone' } },
 		emojis: { cache: new Map(emojis.map((e) => [e.id, e])) },
 		stickers: { cache: new Map(stickers.map((s) => [s.id, s])), fetch: async () => {} },
 	};
@@ -616,6 +619,10 @@ await checkAsync('executeAction: sends, reads, switches character and blocks a r
 	const readResult = await executeAction({ type: 'read', channel, count: 5 }, deps);
 	assert.equal(readResult.speak, true);
 
+	// Switching the character is for the owner and the administrators, as /character is.
+	deps.isOwnerActive = () => true;
+	deps.ownerSaidRecently = () => true;
+	deps.ownerMatch = (words) => words[0];
 	const characterResult = await executeAction({ type: 'character', character }, deps);
 	assert.equal(active, 'c1', 'the character must become active');
 	assert.equal(characterResult.speak, false, 'the model must stay quiet on a character switch (the session is rebuilt)');
@@ -859,6 +866,9 @@ await checkAsync('read_messages: reads the private conversation the bot was last
 		messages: { fetch: async () => dmMessages },
 	};
 	const { deps } = makeToolDeps();
+	// Private conversations are read for the owner only, so the owner is the one asking here.
+	deps.cfg.ownerId = '9';
+	deps.currentSpeakerId = () => '9';
 	deps.lastDirectMessage = () => ({ channelId: 'dm-1', name: 'Kaan' });
 	deps.client = { ...deps.client, channels: { cache: new Map([['dm-1', dmChannel]]), fetch: async () => dmChannel } };
 
@@ -1049,6 +1059,10 @@ check('pickRelativeVoiceChannel: picks the neighbour below or above', () => {
 await checkAsync('send_dm: finds the member by account name as well as by server nickname', async () => {
 	const fixture = makeToolDeps();
 	const { deps } = fixture;
+	// A DM to somebody other than the person asking is the owner's to ask for.
+	deps.isOwnerActive = () => true;
+	deps.ownerSaidRecently = () => true;
+	deps.ownerMatch = (words) => words[0];
 	const dms = [];
 	fixture.guild.members.cache.get('5').send = async (payload) => {
 		dms.push(payload.content);
@@ -1162,6 +1176,7 @@ await checkAsync('admin: channel create/edit/lock/delete, role create/edit/delet
 	deps.ownerSaidRecently = () => true;
 	deps.ownerMatch = (words) => words[0];
 	deps.ownerTextTail = () => 'open a channel and give a role';
+	const owner = ownerVoice(deps);
 
 	// Server/member information: no owner gate (anybody may ask)
 	guild.name = 'Test Server';
@@ -1249,7 +1264,8 @@ await checkAsync('admin: channel create/edit/lock/delete, role create/edit/delet
 	assert.equal(asked.needs_confirmation, true, asked.spoken);
 	assert.equal(deleted, null, 'nothing may be deleted without a confirmation');
 
-	// Confirming a DIFFERENT target does nothing (a garbled transcript can change the name)
+	// Confirming a DIFFERENT target does nothing (a garbled transcript can change the name), even after a yes
+	owner.says('yes');
 	const wrongTarget = await callTool('delete_channel', { channel: 'second-channel', confirm: true }, deps);
 	assert.equal(wrongTarget.ok, false, wrongTarget.spoken);
 	assert.equal(deleted, null, 'general-test must not be deleted');
@@ -1258,6 +1274,11 @@ await checkAsync('admin: channel create/edit/lock/delete, role create/edit/delet
 	// Right target + confirm -> deletes (it asks again first, because the wrong attempt consumed the confirmation)
 	assert.equal((await callTool('delete_channel', { channel: 'general-test', confirm: true }, deps)).ok, false);
 	assert.equal((await callTool('delete_channel', { channel: 'general-test' }, deps)).needs_confirmation, true);
+	// confirm:true in the same turn as the question is the model answering itself, not the owner
+	const selfConfirmed = await callTool('delete_channel', { channel: 'general-test', confirm: true }, deps);
+	assert.equal(selfConfirmed.needs_confirmation, true, selfConfirmed.spoken);
+	assert.equal(deleted, null, 'nothing may be deleted until the owner answers');
+	owner.says('yes, delete it');
 	const confirmedDelete = await callTool('delete_channel', { channel: 'general-test', confirm: true, reason: 'test' }, deps);
 	assert.equal(confirmedDelete.ok, true, confirmedDelete.spoken);
 	assert.equal(deleted, 'test');
@@ -1273,9 +1294,11 @@ await checkAsync('admin: channel create/edit/lock/delete, role create/edit/delet
 	// deletion four times and every attempt came back "I could not match that", because the record was
 	// thrown away on each refusal and the model kept sending the confirmation it had been given.
 	assert.equal(expired.needs_confirmation, true, 'the question is put again, so there is a way forward');
+	owner.says('yes');
 	const second = await callTool('delete_role', { role: 'Sample', confirm: true }, deps);
 	assert.equal(second.ok, true, `and answering the new question works: ${second.spoken}`);
 	assert.equal((await callTool('delete_role', { role: 'Sample' }, deps)).needs_confirmation, true);
+	owner.says('okay');
 	assert.equal((await callTool('delete_role', { role: 'Sample', confirm: true }, deps)).ok, true);
 	assert.ok(actions.includes('delete-role'), actions.join(' | '));
 
@@ -1354,6 +1377,7 @@ await checkAsync('moderation tools: refused without the owner, applied with them
 	guild.members.cache.set('1', human);
 	guild.roles.cache.set('r1', { id: 'r1', name: 'Moderator', editable: true, managed: false, position: 1 });
 	guild.members.ban = async (member, options) => actions.push(`ban:${member.displayName}:${options.reason}`);
+	const owner = ownerVoice(deps);
 
 	// While the owner is not speaking, moderation commands are refused
 	deps.isOwnerActive = () => false;
@@ -1390,9 +1414,11 @@ await checkAsync('moderation tools: refused without the owner, applied with them
 	assert.equal(banAsk.needs_confirmation, true, banAsk.spoken);
 	assert.ok(banAsk.spoken.includes('Ali Veli'), banAsk.spoken);
 	assert.ok(!actions.some((entry) => entry.startsWith('ban:')), 'nothing is banned before the answer');
+	owner.says('yes');
 	assert.equal((await callTool('ban_member', { member: 'Ali', reason: 'test', confirm: true }, deps)).ok, true);
 	human.kick = async (reason) => actions.push(`kick:${reason}`);
 	assert.equal((await callTool('kick_member', { member: 'Ali', reason: 'behaviour' }, deps)).needs_confirmation, true);
+	owner.says('yes, go ahead');
 	assert.equal((await callTool('kick_member', { member: 'Ali', reason: 'behaviour', confirm: true }, deps)).ok, true);
 	assert.equal(actions.at(-1), 'kick:behaviour');
 	assert.deepEqual(actions.slice(0, 4), ['timeout:300000:spam', 'add:Moderator', 'remove:Moderator', 'ban:Ali Veli:test']);
@@ -1466,10 +1492,11 @@ await checkAsync('message management: deletes/edits its own messages, somebody e
 	deps.cfg.textChannelId = '10';
 	deps.isOwnerActive = () => false;
 
-	// Deleting its own message needs no permission
-	const own = await callTool('delete_messages', { own: true, count: 1 }, deps);
-	assert.equal(own.ok, true, own.spoken);
-	assert.deepEqual(deleted, ['2'], "only the bot's own message may be deleted");
+	// Even the bot's own posts need the owner: one of them may be an announcement the owner had it make
+	const ownRefused = await callTool('delete_messages', { own: true, count: 1 }, deps);
+	assert.equal(ownRefused.ok, false);
+	assert.ok(ownRefused.spoken.includes('Only the bot owner'), ownRefused.spoken);
+	assert.deepEqual(deleted, [], 'nothing is deleted without the owner');
 
 	// Deleting somebody else's message needs the owner
 	const denied = await callTool('delete_messages', { count: 1 }, deps);
@@ -1477,6 +1504,10 @@ await checkAsync('message management: deletes/edits its own messages, somebody e
 	assert.ok(denied.spoken.includes('Only the bot owner'), denied.spoken);
 
 	deps.isOwnerActive = () => true;
+	const own = await callTool('delete_messages', { own: true, count: 1 }, deps);
+	assert.equal(own.ok, true, own.spoken);
+	assert.deepEqual(deleted, ['2'], "only the bot's own message may be deleted");
+
 	const removed = await callTool('delete_messages', { count: 1 }, deps);
 	assert.equal(removed.ok, true, removed.spoken);
 	assert.deepEqual(deleted, ['2', '3'], "with the owner asking, somebody else's last message is deleted");
@@ -1535,7 +1566,14 @@ await checkAsync('member_roles + role matching: finds a role from a decorated or
 	assert.ok(roles.spoken.includes('Chill'));
 
 	deps.isOwnerActive = () => true;
-	const grant = await callTool('grant_role', { member: 'Naci', role: 'chillz' }, deps);
+	// "chillz" is only close to the role's name, so the role that was found is named and waits for a yes.
+	const owner = ownerVoice(deps);
+	const asked = await callTool('grant_role', { member: 'Naci', role: 'chillz' }, deps);
+	assert.equal(asked.needs_confirmation, true, asked.spoken);
+	assert.ok(asked.spoken.includes('ᴄʜɪʟʟ'), asked.spoken);
+	assert.deepEqual(granted, [], 'nothing is granted before the answer');
+	owner.says('yes, that one');
+	const grant = await callTool('grant_role', { member: 'Naci', role: 'chillz', confirm: true }, deps);
 	assert.equal(grant.ok, true, grant.spoken);
 	assert.deepEqual(granted, ['ᴄʜɪʟʟ'], 'the role with the decorated name must be found and granted');
 });
@@ -1705,10 +1743,39 @@ await checkAsync('END TO END: real audio -> transcript attribution -> ban allowe
 	}
 	attribution.noteTranscript('okay ban garko', { startMs: 1200, endMs: 1500 });
 	assert.equal(attribution.isOwnerActive(), true, 'the owner spoke last');
+	// The confirmation reads the owner's answer from the same attribution the gate trusts.
+	deps.currentTurn = () => attribution.turn;
+	deps.speechMark = () => attribution.mark();
+	deps.ownerSpeechSince = (mark, options) => attribution.ownerSpeechSince(mark, options);
+	attribution.markTurn();
 	// The gate lets it through, and then the tool still names the target and waits for the answer.
 	const asked = await callTool('ban_member', { member: 'Ali' }, deps);
 	assert.equal(asked.needs_confirmation, true, asked.spoken);
 	assert.deepEqual(actions, [], 'the gate opening is not the same as being told to do it');
+	// The model sending confirm:true straight away, in the turn that asked, is not an answer.
+	const unasked = await callTool('ban_member', { member: 'Ali', confirm: true }, deps);
+	assert.equal(unasked.needs_confirmation, true, unasked.spoken);
+	assert.deepEqual(actions, [], 'nobody said yes yet');
+	// Somebody else says yes: not an answer either. The positions are read off the audio sent, which runs
+	// behind the ticks by the bridge's buffer.
+	let from = attribution.audioMs;
+	for (let i = 0; i < 10; i++) {
+		mixer.push(OTHER_ID, loud);
+		bridge.tick();
+	}
+	attribution.noteTranscript('yes do it', { startMs: from, endMs: attribution.audioMs });
+	attribution.markTurn();
+	const guestYes = await callTool('ban_member', { member: 'Ali', confirm: true }, deps);
+	assert.equal(guestYes.ok, false, guestYes.spoken);
+	assert.deepEqual(actions, [], "a guest's yes is not the owner's");
+	// The owner answers, and the model answers them in a turn of its own.
+	from = attribution.audioMs;
+	for (let i = 0; i < 10; i++) {
+		mixer.push(OWNER_ID, loud);
+		bridge.tick();
+	}
+	attribution.noteTranscript('yes', { startMs: from, endMs: attribution.audioMs });
+	attribution.markTurn();
 	const allowed = await callTool('ban_member', { member: 'Ali', confirm: true }, deps);
 	assert.equal(allowed.ok, true, allowed.spoken);
 	assert.deepEqual(actions, ['ban:Ali']);
@@ -1775,7 +1842,20 @@ await checkAsync('END TO END: a ban is refused when somebody talks over the owne
 		deps.transcriptLagging = (options) => attribution.transcriptLagging(options);
 		deps.isOwnerActive = () => attribution.isOwnerActive();
 		deps.ownerSaidRecently = (words, ms) => attribution.ownerSaidRecently(words, ms);
-		return attribution;
+		deps.currentTurn = () => attribution.turn;
+		deps.speechMark = () => attribution.mark();
+		deps.ownerSpeechSince = (mark, options) => attribution.ownerSpeechSince(mark, options);
+		// The owner alone for 200 ms after everything so far, and the model answering it in a new turn.
+		const ownerSays = (text) => {
+			const start = attribution.audioMs;
+			for (let i = 0; i < 10; i++) {
+				mixer.push(OWNER_ID, loud);
+				bridge.tick();
+			}
+			attribution.noteTranscript(text, { startMs: start, endMs: attribution.audioMs });
+			attribution.markTurn();
+		};
+		return { attribution, ownerSays };
 	};
 
 	// Priority off: the guest's voice really is in the frame the model transcribed.
@@ -1788,9 +1868,10 @@ await checkAsync('END TO END: a ban is refused when somebody talks over the owne
 	// Priority on (the default): the mixer physically discarded the guest's audio before summing the
 	// frame, so the model only ever heard the owner. Tightened where it was wrong, untouched where it
 	// was right.
-	run({ priority: true });
+	const { ownerSays } = run({ priority: true });
 	const asked = await callTool('ban_member', { member: 'Ali' }, deps);
 	assert.equal(asked.needs_confirmation, true, asked.spoken);
+	ownerSays('yes');
 	const allowed = await callTool('ban_member', { member: 'Ali', confirm: true }, deps);
 	assert.equal(allowed.ok, true, allowed.spoken);
 	assert.deepEqual(actions, ['ban:Ali']);
@@ -1987,6 +2068,10 @@ await checkAsync('edit_message: with no id, or a deleted one, it edits the bot\'
 	const fixture = makeToolDeps();
 	const { deps } = fixture;
 	deps.selfId = 'bot1'; // the bot's own id (the fixture does not provide it)
+	// Editing what the bot posted is the owner's to ask for.
+	deps.isOwnerActive = () => true;
+	deps.ownerSaidRecently = () => true;
+	deps.ownerMatch = (words) => words[0];
 	const edited = [];
 	const others = { id: 'm1', author: { id: '1' }, content: "somebody else's message", createdTimestamp: 100, edit: async () => edited.push('other') };
 	const mineOld = { id: 'm2', author: { id: 'bot1' }, content: 'my older message', createdTimestamp: 200, edit: async (payload) => edited.push(payload.content) };

@@ -7,7 +7,7 @@
 
 import { t, tList } from './i18n/index.js';
 import { providerFromDeps } from './provider.js';
-import { balanceCodeFences, squash } from './text.js';
+import { balanceCodeFences, safeContext, squash } from './text.js';
 
 export { balanceCodeFences };
 
@@ -167,14 +167,20 @@ export function shouldReply(message, { botId, guildId }) {
 	return false;
 }
 
-/** System instruction + input text for a written reply. The user text stays out of the instruction, inside a delimiter. */
+/**
+ * System instruction + input text for a written reply. The user text stays out of the instruction, inside
+ * a delimiter. The notes kept about the author are the author's own words as much as anybody's (anyone can
+ * have one kept about themselves), so they go in cleaned the way the voice session cleans them (safeContext)
+ * and closed off at the end, under the same framing: notes about a person, not instructions.
+ */
 export function buildReplyPrompt({ personaName, personaPrompt, authorName, channelName, isDm, text, memory = null }) {
 	const where = isDm ? t('messages.reply_where_dm') : t('messages.reply_where_channel', { channel: channelName });
+	const notes = memory ? safeContext(memory, { keepLines: true }) : '';
 	const instructions = [
 		personaPrompt ?? '',
 		t('messages.reply_intro', { where }),
 		...tList('messages.reply_rules'),
-		memory ? t('messages.reply_memory', { memory }) : '',
+		notes ? t('messages.reply_memory', { memory: notes }) : '',
 	]
 		.filter(Boolean)
 		.join(' ');

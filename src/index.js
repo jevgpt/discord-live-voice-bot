@@ -18,17 +18,20 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client, Events, GatewayIntentBits, Partials } from 'discord.js';
 import { OpenAI } from 'openai';
-import { handleInteraction, RecentActions, registerCommands } from './commands.js';
+import { handleInteraction, mayStartSession, RecentActions, registerCommands } from './commands.js';
 import { loadConfig } from './config.js';
 import { maskSecret, updateEnvFile } from './envfile.js';
 import { GuildSession } from './guildsession.js';
 import { t, tList } from './i18n/index.js';
-import { LocalServerManager, detectVenvPython } from './localserver.js';
+import { liveSlotsTaken, offerLiveSlots } from './liveslots.js';
+import { LocalServerManager, detectVenvPython, setSpeechToken } from './localserver.js';
 import { LocalStt } from './localstt.js';
 import { MemoryStore } from './memory.js';
 import { ReplyLimiter, handleMessage } from './messages.js';
+import { LIVE_STATE, MetricsHistory } from './metrics.js';
 import { ActivityLog, startPanel } from './panel.js';
 import { createTextProvider } from './provider.js';
+import { QueueStore } from './queuestore.js';
 import { DailyQuota } from './quota.js';
 import { ChannelReader } from './reader.js';
 import { ReminderStore } from './reminders.js';
@@ -36,6 +39,7 @@ import { SavedTracks } from './savedtracks.js';
 import { CharacterStore } from './store.js';
 import { summarizeConversation } from './summary.js';
 import { callTool, toolDefinitions } from './tools.js';
+import { roomMayRead } from './tools/access.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = path.join(here, '..', 'data');
@@ -49,6 +53,11 @@ try {
 	console.error(t('boot.config_failed', { error: err.message }));
 	process.exit(1);
 }
+// A value that was not read as written (a typo in an on/off word, an ID that cannot be one, a number
+// moved into its range) is said once, here, before anything acts on it.
+for (const warning of cfg.warnings ?? []) console.warn(t('boot.config_warning', { warning }));
+// And a default that changed under an existing .env, with how to keep the old behaviour.
+for (const note of cfg.notes ?? []) console.warn(t('boot.config_warning', { warning: note }));
 
 const stamp = () => new Date().toISOString().slice(11, 19);
 const log = (...args) => console.log(`[${stamp()}]`, ...args);
@@ -60,6 +69,10 @@ const quota = await new DailyQuota({ limitSeconds: cfg.dailyLiveSeconds, file: p
 const reminders = await new ReminderStore(path.join(dataDir, 'reminders.json'), { log }).load();
 // Saved tracks: one list per person, to be played again by name later.
 const savedTracks = await new SavedTracks(path.join(dataDir, 'saved-tracks.json'), { log }).load();
+// Music queues, one per server, kept across restarts and taken back (paused) when that server's session
+// starts. It holds tracks, not speech, so it is written whatever RECORD_TRANSCRIPTS says (see
+// MusicPlayer.snapshot for what is deliberately left out).
+const queueStore = cfg.musicEnabled ? await new QueueStore(path.join(dataDir, 'music-queues.json'), { log }).load() : null;
 const recentActions = new RecentActions();
 const reader = new ChannelReader({ defaultLimit: cfg.readLimit });
 const replyLimiter = new ReplyLimiter({ perMinute: 6 });
@@ -98,12 +111,17 @@ function safePort(url, fallback) {
 	}
 }
 
-// The Chatterbox server (TTS + whisper): the bot starts it itself when it is needed.
+// The Chatterbox server (TTS + whisper): the bot starts it itself when it is needed. Every request to
+// it carries a token: LOCAL_TTS_TOKEN for a server started by hand, or the one each launch is given.
+setSpeechToken(cfg.localTtsToken);
 const localServer = cfg.localTtsAutostart
 	? new LocalServerManager({
 			python: cfg.localTtsPython ?? detectVenvPython(path.join(here, '..')),
 			script: path.join(here, '..', 'tools', 'chatterbox_server.py'),
 			args: ['--port', String(safePort(cfg.localTtsUrl, 8020)), '--model', cfg.localTtsModel, '--stt', cfg.localSttModel],
+			token: cfg.localTtsToken,
+			// The token of the last launch, for the next start: a server outlives a bot that is killed outright.
+			tokenFile: path.join(dataDir, 'chatterbox.token'),
 			cwd: path.join(here, '..'),
 			log,
 		})
@@ -113,6 +131,9 @@ const localStt = new LocalStt({ url: cfg.localSttUrl, language: cfg.localSttLang
 let client = null;
 let panel = null;
 let shuttingDown = false;
+// The panel's last hour of every server, one row per ten seconds (src/metrics.js). Its memory is fixed
+// when it is made: about 52 KB per server, for at most 32 servers.
+const panelHistory = new MetricsHistory();
 
 // ---------------------------------------------------------------- keys
 
@@ -156,19 +177,33 @@ async function applyKeys(patch = {}) {
 // (conversation, model session, audio path, music, speaker attribution) lives inside its own session,
 // so the registry is the only place that knows there is more than one.
 const sessions = new Map();
+// Sessions dropped from the registry whose realtime socket is still closing: they are no longer
+// anybody's server, but until the socket is gone they still hold a slot.
+const retiring = new Set();
 
 /** The session of one guild, or null when the bot is not set up for that server. */
 function sessionFor(guildId) {
 	return (guildId ? sessions.get(String(guildId)) : null) ?? null;
 }
 
-/** How many guilds hold a realtime connection right now — what MAX_LIVE_SESSIONS counts. */
+/** How many guilds hold a realtime connection right now (open, connecting or closing) — what MAX_LIVE_SESSIONS counts. */
 function liveSessionCount(except = null) {
-	let count = 0;
-	for (const session of sessions.values()) {
-		if (session !== except && session.live) count++;
+	return liveSlotsTaken([...sessions.values(), ...retiring], except);
+}
+
+/**
+ * A realtime socket has closed somewhere. A server held back by the cap never hears of it on its own —
+ * it is not paused, so speech does not reopen it — which is why the registry hands the slot on here.
+ */
+function offerFreedSlots() {
+	// A dropped session is forgotten once its sockets are gone, and not before (see dropSession).
+	for (const session of retiring) {
+		if (!session.holdsLiveSlot()) retiring.delete(session);
 	}
-	return count;
+	if (shuttingDown) return;
+	for (const session of offerLiveSlots([...sessions.values(), ...retiring], cfg.maxLiveSessions)) {
+		log(t('runtime.live_slot_taken', { guild: session.guild?.name ?? session.guild?.id ?? '?' }));
+	}
 }
 
 /**
@@ -191,6 +226,7 @@ async function ensureSession(guildId, channelId = null) {
 		recentActions,
 		reminders,
 		savedTracks,
+		queueStore,
 		activity,
 		record,
 		provider,
@@ -202,6 +238,7 @@ async function ensureSession(guildId, channelId = null) {
 		presenceEnabled: usePresence,
 		// The cost cap lives in the registry because only it can see the other guilds.
 		canOpenLive: (asking) => liveSessionCount(asking) < cfg.maxLiveSessions,
+		onLiveSlotFreed: () => offerFreedSlots(),
 		onPermanentLeave: (left) => dropSession(left),
 		joinChannel: (channel) => joinChannel(channel),
 	});
@@ -233,7 +270,14 @@ function dropSession(session) {
 	sessions.delete(guildId);
 	log(t('runtime.session_dropped', { guild: session.guild?.name ?? guildId }));
 	session.stop();
-	void session.dispose().catch(() => {});
+	retiring.add(session);
+	// dispose() is over when every socket of the session is closed, and offerFreedSlots() then forgets the
+	// session. It is not simply deleted here: should a socket outlive dispose() after all, the session keeps
+	// its slot until that socket's own close reports in (onLiveSlotFreed) and the slot is really free.
+	void session
+		.dispose()
+		.catch(() => {})
+		.finally(() => offerFreedSlots());
 }
 
 /** Snapshot of every session; `first` (usually the guild being asked about) is put in front. */
@@ -277,6 +321,163 @@ function describeSessionForPanel(entry) {
 	);
 }
 
+// ---------------------------------------------------------------- panel: servers, history, metrics
+//
+// What the panel's dashboard, its hour of history and /metrics read off the sessions. Everything here
+// only reads, and reads numbers and names: no transcript, no message, no reason with words in it.
+
+/** Where a server's realtime session stands, in the words the dashboard uses (see LIVE_STATE). */
+function liveStateOf(entry) {
+	if (entry.brain === 'local') return 'local';
+	if (entry.liveReady) return 'ready';
+	if (entry.liveOpen) return 'connecting';
+	if (entry.liveBlocked) return 'waiting';
+	if (entry.paused) return 'paused';
+	return 'off';
+}
+
+/** The people (not bots) in the voice channel the bot sits in on that server. */
+function voiceMembersOf(session) {
+	const channelId = session.voice?.channelId;
+	if (!channelId || !session.guild?.voiceStates) return [];
+	const people = [];
+	for (const state of session.guild.voiceStates.cache.values()) {
+		if (state.channelId !== channelId) continue;
+		const member = state.member ?? session.guild.members?.cache.get(state.id);
+		if (member?.user?.bot) continue;
+		people.push(member?.displayName ?? session.nameFor(state.id));
+	}
+	return people;
+}
+
+/** One server as its dashboard card shows it. */
+function guildCard(session) {
+	const status = session.status();
+	// Who the mixer is sending right now under floor control; nobody when the room is quiet.
+	const floorId = session.mixer?.floorId ?? null;
+	const people = voiceMembersOf(session);
+	const quotaStatus = quota.status();
+	return {
+		id: status.guildId,
+		name: status.guildName,
+		persona: status.personaName,
+		voiceConnected: status.voiceConnected,
+		voiceChannel: status.voiceChannelName,
+		brain: status.brain,
+		live: liveStateOf(status),
+		liveBlocked: status.liveBlocked,
+		floor: floorId ? session.nameFor(String(floorId)) : null,
+		people: people.slice(0, 24),
+		peopleCount: people.length,
+		music: status.music ? { playing: status.music.playing, text: status.music.text, volume: status.music.volume, queue: status.music.queue } : null,
+		quota: { enabled: quota.enabled, used: quotaStatus.used, limit: quotaStatus.limit },
+	};
+}
+
+/**
+ * One server's numbers as they stand, for the history (see MetricsHistory.record) and for /metrics:
+ * gauges, running totals, and the recent timing windows with how many were ever taken.
+ */
+function readingOf(session) {
+	const status = session.status();
+	const totals = session.health?.totals?.() ?? {};
+	const audio = session.audioStats?.() ?? {};
+	const bridge = session.voice?.bridge ?? null;
+	const placed = (totals.fragmentsSure ?? 0) + (totals.fragmentsLeaning ?? 0);
+	return {
+		name: status.guildName,
+		status,
+		totals,
+		audio,
+		gauges: {
+			live_state: LIVE_STATE[liveStateOf(status)] ?? LIVE_STATE.off,
+			drift_ms: totals.driftMs ?? 0,
+			quota_used_s: quota.status().used,
+			people: voiceMembersOf(session).length,
+		},
+		counters: {
+			gate_allowed: totals.gateAllowed ?? 0,
+			gate_refused: totals.gateDenied ?? 0,
+			jev_calls: totals.jevCalls ?? 0,
+			jev_not_for_bot: totals.jevNotForBot ?? 0,
+			jev_banter: totals.jevBanter ?? 0,
+			jev_failed: totals.jevFailed ?? 0,
+			fragments_placed: placed,
+			fragments: placed + (totals.fragmentsUnsure ?? 0),
+			loop_late_total_ms: bridge?.stats?.lateMsTotal ?? 0,
+			loop_wakes: bridge?.stats?.wakes ?? 0,
+			// Frames the output could not take, and frames a full input ring threw away.
+			dropped_frames: (bridge?.dropped ?? 0) + Math.round(audio.overflow ?? 0),
+		},
+		samples: {
+			response: session.latency?.recent?.('response') ?? { list: [], total: 0 },
+			tool: session.latency?.recent?.('tool') ?? { list: [], total: 0 },
+			jev: session.health?.jevTimes?.() ?? { list: [], total: 0 },
+		},
+	};
+}
+
+/** The p-th percentile of a timing window, the way the latency meter takes it; null when it is empty. */
+function percentileOf(list, q) {
+	if (!list?.length) return null;
+	const sorted = [...list].sort((a, b) => a - b);
+	return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))];
+}
+
+/**
+ * The per-server Prometheus families, one sample per server labelled with its id and name. The names
+ * the panel had before stay as they were (they describe the primary server); these are added beside them.
+ */
+function guildFamilies(readings) {
+	const families = {};
+	const add = (name, type, labels, value) => {
+		const family = (families[name] ??= { type, samples: [] });
+		family.samples.push({ labels, value });
+	};
+	for (const { id, reading } of readings) {
+		const guild = { guild: id, guild_name: reading.name ?? id };
+		const { totals, audio, status } = reading;
+		add('guild_live_state', 'gauge', guild, reading.gauges.live_state);
+		add('guild_voice_members', 'gauge', guild, reading.gauges.people);
+		add('guild_response_p50_ms', 'gauge', guild, status.latency?.responseP50 ?? 0);
+		add('guild_response_p90_ms', 'gauge', guild, status.latency?.responseP90 ?? 0);
+		add('guild_tool_p50_ms', 'gauge', guild, percentileOf(reading.samples.tool.list, 0.5) ?? 0);
+		add('guild_tool_p95_ms', 'gauge', guild, percentileOf(reading.samples.tool.list, 0.95) ?? 0);
+		add('gate_decisions_total', 'counter', { ...guild, result: 'allowed' }, totals.gateAllowed ?? 0);
+		add('gate_decisions_total', 'counter', { ...guild, result: 'denied' }, totals.gateDenied ?? 0);
+		add('jev_calls_total', 'counter', guild, totals.jevCalls ?? 0);
+		add('jev_failed_total', 'counter', guild, totals.jevFailed ?? 0);
+		add('jev_not_for_bot_total', 'counter', guild, totals.jevNotForBot ?? 0);
+		add('jev_banter_total', 'counter', guild, totals.jevBanter ?? 0);
+		add('jev_suppressed_total', 'counter', guild, totals.jevSuppressed ?? 0);
+		add('jev_median_ms', 'gauge', guild, percentileOf(reading.samples.jev.list, 0.5) ?? 0);
+		add('transcript_drift_ms', 'gauge', guild, totals.driftMs ?? 0);
+		add('transcript_drift_max_ms', 'gauge', guild, totals.driftMaxMs ?? 0);
+		for (const [placement, key] of [
+			['sure', 'fragmentsSure'],
+			['leaning', 'fragmentsLeaning'],
+			['unsure', 'fragmentsUnsure'],
+		]) {
+			add('fragments_total', 'counter', { ...guild, placement }, totals[key] ?? 0);
+		}
+		const fragments = reading.counters.fragments;
+		add('placed_fragment_ratio', 'gauge', guild, fragments ? reading.counters.fragments_placed / fragments : 0);
+		for (const [owner, key] of [
+			['named', 'linesNamed'],
+			['mixed', 'linesMixed'],
+			['unknown', 'linesUnknown'],
+		]) {
+			add('lines_total', 'counter', { ...guild, owner }, totals[key] ?? 0);
+		}
+		add('audio_loop_late_avg_ms', 'gauge', guild, audio.avgLateMs ?? 0);
+		add('audio_loop_late_max_ms', 'gauge', guild, audio.maxLateMs ?? 0);
+		add('audio_dropped_frames_total', 'counter', guild, reading.counters.dropped_frames);
+		add('audio_holes_total', 'counter', guild, audio.holes ?? 0);
+		add('audio_concealed_total', 'counter', guild, audio.concealed ?? 0);
+	}
+	return families;
+}
+
 /** A display name for a user id: the servers are asked in turn, since a speaker can be in any of them. */
 function nameForUser(userId) {
 	if (!userId) return null;
@@ -292,12 +493,22 @@ function nameForUser(userId) {
  * Every join goes through here: /join, the join_voice tool and a rejoin after a permanent leave. A
  * channel in a server with no session gets that session built around it (start() does the join), so a
  * new server can be picked up without a restart.
+ *
+ * Building one costs a realtime connection on the owner's keys and a MAX_LIVE_SESSIONS slot, so outside
+ * cfg.targets it happens only when `requesterId` is the owner or in ADMIN_USER_IDS (mayStartSession).
+ * /join passes who asked; the tools pass nobody. They can only name channels of their own session's
+ * server, so they reach this branch only once that session has been dropped (left for good), and then a
+ * voice in the room must not be able to bring it back in a server nobody configured.
  */
-async function joinChannel(channel) {
+async function joinChannel(channel, { requesterId = null } = {}) {
 	const guildId = channel?.guildId ?? channel?.guild?.id ?? null;
 	const existing = sessionFor(guildId);
 	if (existing) return existing.joinVoice(channel);
 	if (guildId) {
+		if (!mayStartSession({ cfg, guildId, userId: requesterId })) {
+			log(t('runtime.session_start_refused', { guild: channel?.guild?.name ?? guildId }));
+			throw new Error(t('runtime.session_start_refused_reason'));
+		}
 		await ensureSession(guildId, channel.id);
 		return undefined;
 	}
@@ -356,8 +567,26 @@ function buildContext(session) {
 		summarize: (options) => session?.deps().summarize(options),
 		// Events from an interaction are tagged with the guild they belong to, like the session's own.
 		activity: (event) => (session ? session.activity.push(event) : activity.push(event)),
-		callTool: (name, args) => callTool(name, args, session.deps()),
-		joinVoice: (channel) => joinChannel(channel),
+		// Marked as a slash command, and asked for by the person who ran it: commands.js has checked them
+		// against their own Discord account, so a tool measures the request against them and not against
+		// whoever last spoke in voice. Being allowed to run /read is not being allowed into every channel,
+		// so read_messages still asks whether THEY may read the one named. No voice turn is in flight
+		// either: the rule about other people's words belongs to the voice turn that read them.
+		callTool: (name, args, { userId = null } = {}) => {
+			const invoker = userId ? String(userId) : null;
+			const deps = session.deps();
+			return callTool(name, args, {
+				...deps,
+				fromSlashCommand: true,
+				currentTurn: () => null,
+				currentSpeakerId: () => invoker,
+				currentSpeakerName: () => (invoker ? session.nameFor(invoker) : null),
+				currentSpeakerChannel: () => (invoker ? (session.guild?.voiceStates.cache.get(invoker)?.channel ?? null) : null),
+			});
+		},
+		// May everybody in the bot's voice channel read this channel? /read speaks what it read to the room.
+		roomMayRead: (channel) => (session ? roomMayRead(session.deps(), channel) : Promise.resolve(true)),
+		joinVoice: (channel, options) => joinChannel(channel, options),
 		leaveVoice: (options) => session?.leaveVoice(options),
 		// /status reports every server, this one first.
 		sessions: () => sessionSnapshots(session),
@@ -463,7 +692,11 @@ client.on(Events.MessageCreate, (message) => {
 	// Guild events are tagged with their server; a DM has none to tag.
 	const push = session ? (event) => session.record(event) : record;
 	if (message.member) session?.rememberMember(message.member);
-	const where = isDm ? null : { channel: `#${message.channel?.name ?? '?'}` };
+	// The ids are for src/summary.js: the log holds every channel of every server, and a summary may only
+	// quote the server it is asked in and the channels its audience can read. The name is for the panel.
+	const where = isDm
+		? null
+		: { channel: `#${message.channel?.name ?? '?'}`, channelId: message.channelId ?? message.channel?.id ?? null, guildId: message.guild.id };
 	if (!message.author?.bot) {
 		const text = String(message.content ?? '').trim() || (message.attachments?.size ? t('runtime.image_placeholder') : '');
 		if (text) {
@@ -552,6 +785,7 @@ client.once(Events.ClientReady, async () => {
 		log(t('boot.text_generation', { provider: provider.describe() }));
 		log(cfg.useResponsesDelegation ? t('boot.tools_backend', { model: cfg.researchModel, count: toolDefinitions().length }) : t('boot.tools_client'));
 		if (cfg.ownerPriority && cfg.ownerId) log(t('boot.owner_priority', { owner: cfg.ownerId }));
+		log(t(cfg.attribution === 'vote' ? 'boot.attribution_vote' : 'boot.attribution_path'));
 		if (!cfg.ownerId) log(t('boot.no_owner_id'));
 		if (primary?.music) {
 			log(
@@ -580,12 +814,22 @@ client.once(Events.ClientReady, async () => {
 				panel = await startPanel({
 					activity,
 					port: cfg.panelPort,
+					host: cfg.panelHost,
+					token: cfg.panelToken,
+					allowedHosts: cfg.panelAllowedHosts,
 					log,
 					// The keys may be entered here; they are written to .env, which is where they are read from.
 					keys: () => ({ openai: maskSecret(cfg.openaiApiKey), deepseek: maskSecret(cfg.deepseekApiKey) }),
 					applyKeys: (patch) => applyKeys(patch),
 					// Who is speaking can be someone in any of the servers, so every session gets asked.
 					nameFor: (userId) => nameForUser(userId),
+					// The dashboard: one card per server, the primary first, and an hour of each server's numbers.
+					guilds: () => {
+						const primary = primarySession();
+						return [...sessions.values()].sort((a, b) => (b === primary) - (a === primary)).map((session) => guildCard(session));
+					},
+					history: panelHistory,
+					sample: () => [...sessions.values()].filter((session) => session.guild?.id).map((session) => ({ id: session.guild.id, reading: readingOf(session) })),
 					state: () => {
 						const snapshots = sessionSnapshots(primarySession());
 						const snapshot = snapshots[0] ?? EMPTY_STATUS;
@@ -676,6 +920,10 @@ client.once(Events.ClientReady, async () => {
 							// Every metric name above keeps describing the primary target; these two are the whole fleet.
 							sessions_total: snapshots.length,
 							sessions_live: snapshots.filter((entry) => entry.liveOpen).length,
+							// And these, one sample per server, labelled with it.
+							...guildFamilies(
+								[...sessions.values()].filter((session) => session.guild?.id).map((session) => ({ id: session.guild.id, reading: readingOf(session) })),
+							),
 						};
 					},
 					health: () => {

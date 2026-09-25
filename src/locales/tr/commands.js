@@ -39,11 +39,16 @@ export default {
 		help: { name: 'yardim', description: 'Sesli ve slash komutların listesi' },
 		music: {
 			name: 'muzik',
-			description: 'Müzik çal / durdur / atla / ses',
+			description: 'Müzik çal, sıraya al, tekrarla, karıştır, sar ya da sesini ayarla',
 			subcommands: {
 				play: {
 					name: 'cal',
 					description: 'Şarkı çal ya da sıraya ekle',
+					options: { query: { name: 'sorgu', description: 'Şarkı adı, sanatçı ya da link' } },
+				},
+				playnext: {
+					name: 'siradaki',
+					description: 'Şarkıyı sıranın başına koy, bundan sonra çalsın',
 					options: { query: { name: 'sorgu', description: 'Şarkı adı, sanatçı ya da link' } },
 				},
 				stop: { name: 'durdur', description: 'Müziği durdur ve sırayı temizle' },
@@ -55,12 +60,43 @@ export default {
 					description: 'Müzik ses seviyesi',
 					options: { percent: { name: 'yuzde', description: '0-100' } },
 				},
-				status: { name: 'durum', description: 'Ne çalıyor, sırada ne var' },
+				status: { name: 'durum', description: 'Ne çalıyor, ne kadarı geçti, sırada ne var' },
+				seek: {
+					name: 'sar',
+					description: 'Çalan parçada ileri ya da geri git',
+					options: { position: { name: 'konum', description: '1:30 ya da 90: oraya git; +30 / -10: ileri ya da geri sar' } },
+				},
+				loop: {
+					name: 'tekrar',
+					description: 'Bu parçayı, tüm sırayı ya da hiçbirini tekrarla',
+					options: {
+						mode: {
+							name: 'mod',
+							description: 'Ne tekrarlansın',
+							choices: { off: 'kapalı', track: 'bu parça', queue: 'tüm sıra' },
+						},
+					},
+				},
+				shuffle: { name: 'karistir', description: 'Sırayı karıştır (çalan parça çalmaya devam eder)' },
+				move: {
+					name: 'tasi',
+					description: 'Sıradaki bir parçayı başka bir yere taşı',
+					options: {
+						from: { name: 'sira', description: 'Şu anki yeri (1 = sıradaki)' },
+						to: { name: 'yeni-sira', description: 'Yeni yeri' },
+					},
+				},
+				remove: {
+					name: 'cikar',
+					description: 'Bir parçayı sıradan çıkar',
+					options: { position: { name: 'sira', description: 'Sıradaki yeri (1 = sıradaki)' } },
+				},
+				clear: { name: 'temizle', description: 'Sırayı boşalt (çalan parça çalmaya devam eder)' },
 			},
 		},
 		summary: {
 			name: 'ozet',
-			description: 'Son konuşmaların özeti',
+			description: 'Buradaki son konuşmaların özeti, okuyabildiğin kanallardan',
 			options: { hours: { name: 'saat', description: 'Kaç saat geriye (varsayılan 3)' } },
 		},
 		recording: {
@@ -83,6 +119,7 @@ export default {
 		'• "genel kanalında ne yazıyor" — kanalın yeni mesajlarını oku',
 		'• "sohbet kanalına gel" — sesli kanala katıl · "kanaldan ayrıl"',
 		'• "Tarkan Şımarık çal" / "müzik aç: …" — müzik çal · "müziği durdur / duraklat / devam" · "şarkıyı atla" · "müziği kıs / aç" · "ne çalıyor"',
+		'• Sıra: "bundan sonra X çal" · "şarkıyı tekrarla" / "listeyi döngüye al" / "tekrarı kapat" · "karıştır" · "1:30\'a git" · "30 saniye ileri sar" / "10 saniye geri sar" / "başa sar" · "3. şarkıyı 1. sıraya al" · "3. şarkıyı sıradan çıkar" · "sırayı temizle"',
 		"• Sahip: \"X'i banla / sustur / rol ver / kanalı kilitle / şunu aklında tut / bugün ne konuşuldu\"",
 		'',
 		'**Slash komutları:** /katil /ayril /panel /karakter /gonder /oku /durum /muzik /ozet /kayit /yardim',
@@ -91,6 +128,9 @@ export default {
 	// The command came from a server the bot is not set up for (it is not in VOICE_TARGETS, or it was
 	// left for good); /join is the way back in.
 	no_guild_session: 'Bu sunucu için ayarlı değilim. Önce `/katil` ile bir sesli kanala çağır.',
+	// /join in a server outside GUILD_ID/VOICE_TARGETS: a new session there is on the owner's keys, so
+	// only the owner and ADMIN_USER_IDS may start one.
+	join_unconfigured_denied: 'Bu sunucu için ayarlı değilim; beni yeni bir sunucuya yalnızca sahibim getirebilir.',
 
 	log_registered: 'Slash komutları kaydedildi.',
 	log_register_failed:
@@ -98,6 +138,7 @@ export default {
 	log_interaction_error: 'Etkileşim hatası ({command}): {error}',
 	error_generic: 'Bir hata oldu: {error}',
 	gate_denied_activity: '{command}: reddedildi (yetkisiz)',
+	gate_unconfigured_activity: '{guild} sunucusunda katılma: reddedildi (ayarlı bir sunucu değil; orada oturumu yalnızca sahip ya da ADMIN_USER_IDS açabilir)',
 
 	modal_new_title: 'Yeni karakter',
 	modal_edit_title: 'Düzenle: {name}',
@@ -148,6 +189,7 @@ export default {
 	read_failed: 'Okuyamadım: {reason}',
 	reading: '#{channel} kanalından {count} mesaj okuyorum{suffix}.',
 	reading_new_suffix: ' (yeni)',
+	reading_private: 'Sesli kanaldaki herkes #{channel} kanalını okuyamıyor, o yüzden yalnızca sana gösteriyorum:\n{text}',
 
 	status_voice: 'Sesli kanal: {channel}',
 	status_voice_none: 'değil',
@@ -173,9 +215,14 @@ export default {
 
 	music_disabled: 'Müzik özelliği kapalı (.env: MUSIC=1).',
 	music_unknown: 'Bilinmeyen müzik komutu.',
+	// /music status: the waiting tracks, numbered as /music move and /music remove count them.
+	music_queue_header: '**Sırada:**',
+	music_queue_line: '{position}. {title}{duration}',
+	music_queue_more: '…ve {count} parça daha',
 	ok: 'Tamam.',
 	failed: 'Olmadı.',
 	summary_unavailable: 'Özet özelliği bu kurulumda yok.',
+	summary_guild_only: 'Özeti sunucunun içinden iste: orada okuyabildiğin kanalları kapsar.',
 	record_status:
 		'Kayıt şu an {state}. (Kapalıyken ses dökümleri ve mesaj metinleri panel günlüğüne yazılmaz; özet çıkarılamaz.)',
 	record_state_on: 'AÇIK',

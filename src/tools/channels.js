@@ -12,6 +12,7 @@ import {
 	checkConfirmation,
 	displayName,
 	failure,
+	noteGate,
 	parsePermissions,
 	permissionLabels,
 	resolveAnyChannel,
@@ -24,6 +25,7 @@ import {
 import { t, tList } from '../i18n/index.js';
 import { normalize } from '../text.js';
 import { P, defineTool } from './registry.js';
+import { riskyFlagsOf, riskyLabels } from './roles.js';
 
 /** Channel permission target: everyone (@everyone), a role or a single person. */
 /**
@@ -213,7 +215,8 @@ export const tools = [
 		name: 'delete_channel',
 		description: 'Deletes a channel. Owner only; two-step (asks first, deletes with confirm:true).',
 		parameters: P.obj({ channel: P.str('Channel name'), reason: P.str('Reason (optional)'), confirm: P.confirm() }, ['channel']),
-		gate: { keywords: WORDS.channel },
+		// The verb, not the thing: "channel" or "room" in passing must not be what opens a deletion.
+		gate: { keywords: WORDS.delete },
 		async handler(args, deps, { name }) {
 			const channel = resolveAnyChannel(deps, String(args.channel ?? ''));
 			if (!channel) return { ok: false, spoken: t('tools.channels.not_found', { name: args.channel }) };
@@ -307,6 +310,19 @@ export const tools = [
 				return { ok: false, spoken: t('tools.channels.unknown_permissions', { unknown: unknown.join(', '), help: PERMISSION_HELP }) };
 			}
 			const reset = args.reset === true;
+			// A moderator's powers in this channel (Manage Messages, Move Members, Mention @everyone...) given
+			// to a person or a role are a moderator role by another road, and grant_role refuses those by
+			// voice (RISKY_ROLE_PERMISSIONS in roles.js). Taking them away, or putting them back to default,
+			// is still fine.
+			const risky = reset ? [] : riskyFlagsOf(allow.flags);
+			if (risky.length) {
+				const permissions = riskyLabels(risky);
+				deps.log?.(t('tools.channels.log_risky_permission_refused', { channel: channel.name, target: label, permissions }));
+				const reason = t('tools.helpers.gate_reason_risky_permission', { permissions });
+				const tool = 'set_channel_permission';
+				noteGate(deps, t('tools.helpers.gate_denied_activity', { tool, reason }), { tool, result: 'denied', reason, code: 'risky_permission' });
+				return { ok: false, denied: true, spoken: t('tools.channels.risky_permission', { permissions }) };
+			}
 			const touched = [...new Set([...allow.flags, ...deny.flags])];
 			const reason = t('tools.helpers.audit_reason');
 			try {

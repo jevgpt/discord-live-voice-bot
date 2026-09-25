@@ -37,6 +37,20 @@ export function squash(text) {
 }
 
 /**
+ * Cleans a value that came from a channel member (a display name, a transcript, a saved note) before it
+ * is handed to the model. Newlines and control characters are what let such a value pretend to be a new
+ * instruction line, so they collapse to spaces; notes keep their line breaks because they are a list.
+ * (It lived in guildsession.js; the text replies in messages.js hand the same notes to a model too.)
+ */
+export function safeContext(text, { keepLines = false } = {}) {
+	const raw = String(text ?? '');
+	const cleaned = keepLines ? raw.replace(/\r/gu, '') : raw.replace(/[\r\n]+/gu, ' ');
+	// Control characters are stripped on purpose: they are the other way a value can fake a new line.
+	// oxlint-disable-next-line no-control-regex
+	return cleaned.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, '').trim();
+}
+
+/**
  * Takes off the part that has already been said. Some transcript streams re-send the text so far on
  * every delta, and a flush landing in between then records one sentence twice with the second copy
  * carrying the first — which reads, in the log and the panel, exactly like the bot repeating itself.
@@ -123,6 +137,30 @@ export function escapeHtml(text) {
 		.replace(/>/g, '&gt;')
 		.replace(/"/g, '&quot;')
 		.replace(/'/g, '&#39;');
+}
+
+/**
+ * A place in a track as people write it: "1:30" -> 90, "1:02:03" -> 3723, a bare "90" -> 90 seconds.
+ * A dot stands for the colon too ("1.30"), because a transcript writes it that way about as often.
+ * null for anything that is not a time, including "1:75".
+ */
+export function parseClock(text) {
+	const value = String(text ?? '').trim();
+	if (/^\d{1,6}$/u.test(value)) return Number(value);
+	const match = /^(\d{1,3})[:.](\d{2})(?:[:.](\d{2}))?$/u.exec(value);
+	if (!match) return null;
+	const [first, second, third] = [match[1], match[2], match[3]].map((part) => (part === undefined ? null : Number(part)));
+	if (second >= 60 || (third !== null && third >= 60)) return null;
+	return third === null ? first * 60 + second : first * 3600 + second * 60 + third;
+}
+
+/** Seconds -> "1:05", or "1:02:03" past the hour. Whole seconds, rounded down: 1:59.9 is still 1:59. */
+export function formatClock(seconds) {
+	const total = Math.max(0, Math.floor(Number(seconds) || 0));
+	const hours = Math.floor(total / 3600);
+	const minutes = Math.floor((total % 3600) / 60);
+	const rest = String(total % 60).padStart(2, '0');
+	return hours ? `${hours}:${String(minutes).padStart(2, '0')}:${rest}` : `${minutes}:${rest}`;
 }
 
 /** "1", "yes", "on" and their Turkish equivalents -> true; "0", "no", "off" and theirs -> false; otherwise fallback. */

@@ -33,9 +33,11 @@ export default {
 	local_server_starting: 'Chatterbox sunucusu başlatılıyor: {python} {script} {args}',
 	local_server_spawn_failed: 'Chatterbox sunucusu çalıştırılamadı: {error}',
 	local_server_exit_log: 'Chatterbox sunucusu kapandı (çıkış {code}); {count}/{max} deneme.',
+	local_server_token_not_kept: "Chatterbox token'ı {file} dosyasına yazılamadı ({error}); bot zorla kapatılırsa açık kalan sunucu bir sonraki başlangıcı reddeder.",
 	// --- local speech synthesis (src/localtts.js)
 	tts_fallback_language: 'tr',
 	tts_health_failed: 'yerel TTS sağlık sorgusu başarısız: {error}',
+	speech_refused: '{url} adresindeki ses sunucusu isteği reddetti ({status}): LOCAL_TTS_TOKEN ve LOCAL_TTS_URL ayarlarını kontrol et ya da botun önceki bir çalışmasından açık kalmış sunucuyu kapat (o portu tutan python sürecini sonlandır)',
 	tts_empty_text: 'boş metin',
 	tts_error: 'yerel TTS hatası ({status})',
 	tts_error_detail: 'yerel TTS hatası ({status}): {detail}',

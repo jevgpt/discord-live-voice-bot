@@ -506,7 +506,7 @@ export const tools = [
 			{ thread: P.str('Thread name or id'), reason: P.str('Reason (optional)'), confirm: P.confirm() },
 			['thread'],
 		),
-		gate: { keywords: WORDS.thread },
+		gate: { keywords: WORDS.delete },
 		async handler(args, deps, { name }) {
 			const thread = await resolveThread(deps, String(args.thread ?? ''));
 			if (!thread) return { ok: false, spoken: t('tools.threads.thread_not_found', { name: args.thread }) };

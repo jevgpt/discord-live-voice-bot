@@ -35,21 +35,49 @@ export default {
 	// "take", while "taking" and "taken" are ordinary speech and must not open the gate.
 	// English negates with a separate word rather than a suffix, so there is no tail to recognise.
 	negation: { pattern: '', flags: 'u' },
+	// Nor is there a negated shape of a word to find in an answer: "shouldn't" is spelled out as "should
+	// not" before it is read (spokenTokens in src/attribution.js), and "not" is one of the no words.
+	negative_word: { pattern: '', flags: 'u' },
 	inflection: { pattern: '^(?:s|es)?$', flags: 'u' },
+	// The forms a plain (non "=") entry is heard in. English builds no words by gluing, so a plain entry is
+	// the whole word plus these tails, never a prefix: "ban" is "ban", "bans", "banned", "banning", and
+	// not "banana", "band" or "bank". A word ending in e takes -s/-d and loses the e before -ing
+	// ("deleted", "deleting"); a short vowel before one final consonant doubles it ("banned").
+	word_forms: {
+		suffixes: ['s', 'es', 'ed', 'ing'],
+		after_e: ['s', 'd'],
+		drop_e: ['ing'],
+		doubled: ['ed', 'ing'],
+		double_after: '[^aeiou][aeiou][b-df-hj-np-tvz]$',
+	},
+	// Whole-word matching already keeps "banana" away from "ban", so English has no look-alikes to list.
+	lookalikes: [],
+	// Set phrases that hold a command word and ask for nothing: a command word heard inside one of these
+	// does not count. "Kick off" is a start, "boot up" a computer, and a saying is not a setting.
+	phrase_lookalikes: [
+		'kick off', 'kicks off', 'kicked off', 'kicking off',
+		'boot up', 'boots up', 'booted up', 'booting up',
+		'silence is golden',
+	],
 	// Owner-gate keywords: for an admin tool to run, the owner must have said one of these words.
-	// Matching is prefix based for words of 3+ letters ("ban" also matches "banned"), so stems are enough.
-	// An entry of three letters or more matches as a prefix ("ban" also matches "banned"); an entry
-	// written as "=word" must match exactly. Everyday words that would otherwise match a large part of
-	// ordinary speech are pinned to exact matches, so "the owner said the command word" stays meaningful.
+	// A plain entry matches the whole word in the forms above; an entry written as "=word" matches only
+	// itself and a plural "s". Words that are mostly everyday speech are left out when the group keeps a
+	// real command without them ("pardon?" and "forgive me" were opening the ban tools, "sounds good" the
+	// voice ones, "here" an @everyone ping), or pinned when a real command needs them ("=room").
+	// Destructive tools gate on the VERB (delete, cancel, prune, kick, ban): "channel" on its own was
+	// enough to open channel deletion, and naming a thing is not asking for it to go. "Get rid of" is a
+	// verb too; the gate matches single words, and "rid" is hardly ever heard outside that phrase.
 	words: {
-		ban: ['ban', 'banned', 'unban', 'blacklist', 'forbid', 'pardon', 'forgive'],
-		kick: ['kick', 'kicked', 'boot', 'eject'],
+		ban: ['ban', 'banned', 'unban', 'blacklist', 'forbid'],
+		kick: ['kick', 'kicked', 'boot', 'eject', 'disconnect'],
 		timeout: ['timeout', 'mute', 'silence'],
 		role: ['role', 'rank', 'permission'],
-		voice: ['voice', 'mic', 'microphone', 'mute', 'sound'],
-		setting: ['setting', 'mode', 'config', 'option', 'quiet', 'silence', 'shut', 'hush', '=speak', '=talk'],
-		delete: ['delete', 'remove', 'clear', 'purge', 'wipe', 'clean'],
-		channel: ['channel', 'room', 'category', 'lock', 'unlock'],
+		voice: ['voice', 'mic', 'microphone', 'mute'],
+		setting: ['setting', 'mode', 'config', 'configure', 'configuration', 'option', 'quiet', 'silence', 'shut', 'hush', '=speak', '=talk'],
+		delete: ['delete', 'remove', 'clear', 'purge', 'wipe', 'clean', '=rid'],
+		cancel: ['cancel', 'delete', 'remove', 'scrap', '=rid'],
+		prune: ['prune', 'purge', 'kick', 'remove', 'clean', '=rid'],
+		channel: ['channel', '=room', 'category', 'lock', 'unlock'],
 		name: ['nickname', 'nick', 'rename', '=name'],
 		invite: ['invite', 'invitation', 'link'],
 		log: ['log', 'audit', 'record', 'history'],
@@ -57,8 +85,8 @@ export default {
 			'move', 'relocate', 'transfer', 'drag', 'gather', 'summon', '=bring', '=pull', '=take', '=send',
 			'=come', '=join', '=fetch', '=put', '=shift', '=haul',
 		],
-		everyone: ['everyone', 'everybody', 'here', 'ping', 'tag', 'mention', 'announce'],
-		forget: ['forget', 'delete', 'remove', 'drop'],
+		everyone: ['everyone', 'everybody', 'ping', 'tag', 'mention', 'announce'],
+		forget: ['forget', 'delete', 'remove', 'drop', '=rid'],
 		record: ['record', 'transcript', 'privacy'],
 		bot: ['bot', 'use bot', 'bot command', 'robot'],
 		thread: ['thread', 'threads', 'subthread', 'discussion'],
@@ -71,13 +99,28 @@ export default {
 		server: ['server', 'guild', 'prune', 'vanity', 'widget', 'banner'],
 		identity: [
 			'avatar', 'banner', 'profile', 'nickname', 'status', 'presence', 'playing', 'appearance', 'picture',
-			'bio', 'about', 'rename', 'username', '=name',
+			'bio', 'rename', 'username', '=name',
 		],
 		permission: [
-			'permission', 'perm', 'access', 'channel', 'room', 'connect', '=lock', '=join', '=enter', '=view', '=see',
+			'permission', 'perm', 'access', 'connect', '=lock', '=join', '=enter', '=view', '=see',
 			'=read', '=write', '=send', '=speak', '=talk', '=allow', '=deny', '=block', '=only',
 		],
 	},
+
+	// The owner's answer to a two-step confirmation ("should I ban Sam?"). A yes counts only when the
+	// owner's words since the question hold one of these and none of the no words: "yes, no wait" is not
+	// a yes, and neither is "okay, forget it" or "ok stop". Every "n't" arrives as "not" (spokenTokens),
+	// so "I didn't say yes" and "you shouldn't do it" carry their no. "Cancel", "forget" and "stop" are
+	// no words, except when they are the verb of the thing being asked about: "yes, cancel it" to "should
+	// I cancel movie night?" is a yes, because the question's own command words are not read as a no.
+	confirm_yes: [
+		'=yes', '=yeah', '=yep', '=yup', '=sure', 'confirm', '=ok', '=okay', 'go ahead', 'do it', '=proceed',
+		'=absolutely', '=definitely', '=correct', '=affirmative',
+	],
+	confirm_no: [
+		'=no', '=nope', '=nah', '=not', '=cannot', '=dont', '=never', '=wait', '=hold', 'abort', '=negative', '=nevermind',
+		'cancel', 'forget', 'stop', 'leave it', 'skip it', 'as if',
+	],
 
 	// Mention resolution: names that mean the whole channel rather than one member.
 	everyone_mention_words: ['everyone', 'everybody', 'all', 'all members'],

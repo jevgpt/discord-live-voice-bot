@@ -4,6 +4,8 @@
 // and the start-up summary written once the Discord client is ready.
 export default {
 	config_failed: 'Could not read the settings: {error}',
+	// One line per setting that was not read as written (config.warn_*); the bot starts regardless.
+	config_warning: 'Settings: {warning}',
 
 	panel_history: 'Panel history loaded: {count} events (data/activity.jsonl).',
 	joined_channel: 'I joined the "{channel}" channel. Listening to what is said.',
@@ -19,6 +21,9 @@ export default {
 	tools_client: 'Tools: client delegation — regex voice commands only; set RESEARCH_MODEL and every tool is enabled.',
 
 	owner_priority: 'Owner priority on: while {owner} speaks only their audio is processed.',
+	attribution_path:
+		'Speaker attribution: one path of speakers over each line (ATTRIBUTION=hmm); a fragment at the edge of a turn goes with its neighbours unless its own audio says otherwise.',
+	attribution_vote: 'Speaker attribution: every fragment by its own audio (ATTRIBUTION=vote).',
 	no_owner_id: 'OWNER_ID is not set: the spoken admin tools (ban/role/channel/setting) are off; slash permission goes through ManageGuild.',
 
 	music_on: 'Music on: volume {volume}%, {duck}% while someone is speaking{folder}.',

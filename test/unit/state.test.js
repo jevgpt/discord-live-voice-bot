@@ -6,14 +6,14 @@ import { after, before, describe, it } from 'node:test';
 import { setLocale, tList } from '../../src/i18n/index.js';
 import { cleanEnvValue, loadConfig } from '../../src/config.js';
 import { MemoryStore } from '../../src/memory.js';
-import { DailyQuota } from '../../src/quota.js';
+import { DailyQuota, SessionUsage } from '../../src/quota.js';
 import { CharacterStore } from '../../src/store.js';
 import { SpeakerAttribution } from '../../src/attribution.js';
 import { createTextProvider, providerFromDeps } from '../../src/provider.js';
 
-// Where the locale really decides what happens, the test switches it: config.js reads its on/off
-// words out of the bundle, and the owner-gate keyword table is language data too, so those two tests
-// call setLocale('tr') and put it back afterwards.
+// Where the locale really decides what happens, the test switches it: the owner-gate keyword table is
+// language data, so those tests call setLocale('tr') and put it back afterwards. config.js accepts the
+// on/off words of every language whatever the locale, and its test checks that under both.
 // MemoryStore and SpeakerAttribution match through normalize() (src/text.js), which folds Turkish
 // letters whatever the interface language is; the Turkish fixtures there are deliberate input.
 
@@ -77,7 +77,7 @@ describe('config.js', () => {
 		assert.equal(loadConfig({ ...baseEnv, MAX_LIVE_SESSIONS: '2.7' }).maxLiveSessions, 2);
 		assert.equal(loadConfig({ ...baseEnv, MAX_LIVE_SESSIONS: 'abc' }).maxLiveSessions, 2);
 	});
-	it('understands the Turkish spelling of "off" under the Turkish locale', () => {
+	it('understands the Turkish spelling of "off" whatever the locale', () => {
 		setLocale('tr');
 		try {
 			const cfg = loadConfig({ ...baseEnv, RECORD_TRANSCRIPTS: 'kapalı', MEMORY: 'hayır' });
@@ -86,7 +86,7 @@ describe('config.js', () => {
 		} finally {
 			setLocale('en');
 		}
-		assert.equal(loadConfig({ ...baseEnv, RECORD_TRANSCRIPTS: 'kapalı' }).recordTranscripts, true, 'the English bundle does not know that word');
+		assert.equal(loadConfig({ ...baseEnv, RECORD_TRANSCRIPTS: 'kapalı' }).recordTranscripts, false, 'the same .env means the same thing in English');
 	});
 });
 
@@ -115,16 +115,63 @@ describe('DailyQuota', () => {
 	it('adds the cumulative session seconds to the quota and starts again when the day rolls over', async () => {
 		let now = Date.parse('2026-09-12T10:00:00Z');
 		const quota = new DailyQuota({ limitSeconds: 100, now: () => now });
-		quota.sessionStarted();
-		assert.equal(quota.report(40).exceeded, false);
-		assert.equal(quota.report(90).used, 90);
+		const first = new SessionUsage(quota);
+		assert.equal(first.report(40).status.exceeded, false);
+		assert.equal(first.report(90).status.used, 90);
 		assert.equal(quota.shouldWarn(), true);
 		assert.equal(quota.shouldWarn(), false, 'the warning is given once');
-		quota.sessionStarted();
-		assert.equal(quota.report(20).exceeded, true, 'a new session of 20 s -> 110 in total');
+		const second = new SessionUsage(quota);
+		assert.equal(second.report(20).status.exceeded, true, 'a new session of 20 s -> 110 in total');
 		now += 24 * 3_600_000;
 		assert.equal(quota.status().exceeded, false, 'the next day starts from zero');
 		assert.equal(quota.status().used, 0);
+	});
+
+	it('two servers reporting in turn are each charged their own seconds, not each other s totals', () => {
+		// One base used to be shared by every session and compared against every server's running total,
+		// so two servers reporting in turn were charged each other's totals as well as their own.
+		const quota = new DailyQuota({ limitSeconds: 0, now: () => Date.parse('2026-09-12T10:00:00Z') });
+		const alpha = new SessionUsage(quota);
+		const beta = new SessionUsage(quota);
+		for (let seconds = 50; seconds <= 750; seconds += 50) {
+			alpha.report(seconds);
+			beta.report(seconds);
+		}
+		assert.equal(quota.status().used, 1500);
+	});
+
+	it('a repeated or late report from a session adds nothing it has already added', () => {
+		const quota = new DailyQuota({ limitSeconds: 0, now: () => Date.parse('2026-09-12T10:00:00Z') });
+		const old = new SessionUsage(quota);
+		old.report(300);
+		const replacement = new SessionUsage(quota);
+		replacement.report(10);
+		assert.equal(old.report(300).delta, 0, 'the old session repeating its total is not charged again');
+		assert.equal(old.report(290).delta, 0, 'nor is a total that went back');
+		assert.equal(old.report(305).delta, 5, 'only what is new since its last report');
+		assert.equal(quota.status().used, 315);
+	});
+
+	it('does not charge the whole session so far to the new day at midnight', () => {
+		let now = Date.parse('2026-09-12T23:59:00Z');
+		const quota = new DailyQuota({ limitSeconds: 0, now: () => now });
+		const session = new SessionUsage(quota);
+		session.report(3000);
+		assert.equal(quota.status().used, 3000);
+		now = Date.parse('2026-09-13T00:01:00Z');
+		session.report(3120);
+		assert.equal(quota.status().used, 120, 'the new day holds the two minutes after midnight, not 52 minutes');
+	});
+
+	it('keeps the file format: { day, usedSeconds }, read back after a restart', async () => {
+		const file = path.join(dir, 'quota.json');
+		const now = () => Date.parse('2026-09-12T10:00:00Z');
+		const quota = await new DailyQuota({ limitSeconds: 600, file, now }).load();
+		quota.add(61.4);
+		await quota.pending;
+		assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), { day: '2026-09-12', usedSeconds: 61 });
+		const reloaded = await new DailyQuota({ limitSeconds: 600, file, now }).load();
+		assert.equal(reloaded.status().used, 61);
 	});
 });
 
@@ -322,7 +369,9 @@ describe('SpeakerAttribution: keyword matching', () => {
 		for (let i = 0; i < 30; i++) a.onFrame({ priority: true, active: ['o'] });
 		a.noteTranscript('taking the long way', { startMs: 0, endMs: 600 });
 		assert.equal(a.commandSpeaker(['=take']), null, '"taking" must not satisfy an exact "take"');
-		assert.equal(a.commandSpeaker(['take']), null, 'a three letter prefix still needs the stem at the start');
+		// A plain English entry is the whole word in its listed forms, and "taking" is one of the forms of
+		// "take"; that is exactly why the everyday verbs are written as "=take".
+		assert.equal(a.commandSpeaker(['take'])?.word, 'take', 'a plain entry takes -ing');
 
 		const b = new SpeakerAttribution({ ownerId: 'o' });
 		for (let i = 0; i < 30; i++) b.onFrame({ priority: true, active: ['o'] });

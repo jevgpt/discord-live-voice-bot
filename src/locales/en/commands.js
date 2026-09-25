@@ -41,11 +41,16 @@ export default {
 		help: { name: 'help', description: 'List of the voice and slash commands' },
 		music: {
 			name: 'music',
-			description: 'Play / stop / skip music, or set the volume',
+			description: 'Play, queue, repeat, shuffle and seek music, or set the volume',
 			subcommands: {
 				play: {
 					name: 'play',
 					description: 'Play a song or add it to the queue',
+					options: { query: { name: 'query', description: 'Song title, artist or link' } },
+				},
+				playnext: {
+					name: 'playnext',
+					description: 'Put a song at the front of the queue, to play after this one',
 					options: { query: { name: 'query', description: 'Song title, artist or link' } },
 				},
 				stop: { name: 'stop', description: 'Stop the music and clear the queue' },
@@ -57,12 +62,43 @@ export default {
 					description: 'Music volume',
 					options: { percent: { name: 'percent', description: '0-100' } },
 				},
-				status: { name: 'status', description: 'What is playing and what is queued' },
+				status: { name: 'status', description: 'What is playing, how far in, and what is queued' },
+				seek: {
+					name: 'seek',
+					description: 'Jump within the current track',
+					options: { position: { name: 'position', description: '1:30 or 90 to go there, +30 / -10 to step ahead or back' } },
+				},
+				loop: {
+					name: 'loop',
+					description: 'Repeat this track, the whole queue, or nothing',
+					options: {
+						mode: {
+							name: 'mode',
+							description: 'What to repeat',
+							choices: { off: 'off', track: 'this track', queue: 'the whole queue' },
+						},
+					},
+				},
+				shuffle: { name: 'shuffle', description: 'Shuffle the queue (the current track keeps playing)' },
+				move: {
+					name: 'move',
+					description: 'Move a queued track to another position',
+					options: {
+						from: { name: 'from', description: 'Its position now (1 = next up)' },
+						to: { name: 'to', description: 'Its new position' },
+					},
+				},
+				remove: {
+					name: 'remove',
+					description: 'Take a track out of the queue',
+					options: { position: { name: 'position', description: 'Its position in the queue (1 = next up)' } },
+				},
+				clear: { name: 'clear', description: 'Empty the queue (the current track keeps playing)' },
 			},
 		},
 		summary: {
 			name: 'summary',
-			description: 'Summary of the recent conversations',
+			description: 'Summary of the recent conversations here, from the channels you can read',
 			options: { hours: { name: 'hours', description: 'How many hours back (default 3)' } },
 		},
 		recording: {
@@ -85,6 +121,7 @@ export default {
 		"• \"what's new in the general channel\" — read the new messages of the channel",
 		'• "join the chat channel" — join a voice channel · "leave the channel"',
 		"• \"play Daft Punk Around the World\" / \"put on some jazz\" — play music · \"stop / pause / resume the music\" · \"skip the song\" · \"turn the music down / up\" · \"what's playing\"",
+		'• Queue: "play X next" · "loop this song" / "repeat the queue" / "stop repeating" · "shuffle" · "go to 1:30" · "skip ahead 30 seconds" / "rewind 10 seconds" · "move 3 to 1" · "remove 3 from the queue" · "clear the queue"',
 		'• Owner: "ban / mute X", "give X a role", "lock the channel", "remember this", "what was said today"',
 		'',
 		'**Slash commands:** /join /leave /panel /character /send /read /status /music /summary /recording /help',
@@ -93,6 +130,9 @@ export default {
 	// The command came from a server the bot is not set up for (it is not in VOICE_TARGETS, or it was
 	// left for good); /join is the way back in.
 	no_guild_session: 'I am not set up for this server. Bring me into a voice channel with `/join` first.',
+	// /join in a server outside GUILD_ID/VOICE_TARGETS: a new session there is on the owner's keys, so
+	// only the owner and ADMIN_USER_IDS may start one.
+	join_unconfigured_denied: 'I am not set up for this server, and only my owner can bring me into a new one.',
 
 	log_registered: 'Slash commands registered.',
 	log_register_failed:
@@ -100,6 +140,7 @@ export default {
 	log_interaction_error: 'Interaction error ({command}): {error}',
 	error_generic: 'Something went wrong: {error}',
 	gate_denied_activity: '{command}: denied (not allowed)',
+	gate_unconfigured_activity: 'join in {guild}: denied (not a configured server; only the owner or ADMIN_USER_IDS may start a session there)',
 
 	modal_new_title: 'New character',
 	modal_edit_title: 'Edit: {name}',
@@ -150,6 +191,7 @@ export default {
 	read_failed: 'I could not read it: {reason}',
 	reading: 'Reading {count} messages from #{channel}{suffix}.',
 	reading_new_suffix: ' (new)',
+	reading_private: 'Not everybody in the voice channel may read #{channel}, so here it is for you only:\n{text}',
 
 	status_voice: 'Voice channel: {channel}',
 	status_voice_none: 'none',
@@ -175,9 +217,14 @@ export default {
 
 	music_disabled: 'The music feature is off (.env: MUSIC=1).',
 	music_unknown: 'Unknown music command.',
+	// /music status: the waiting tracks, numbered as /music move and /music remove count them.
+	music_queue_header: '**Up next:**',
+	music_queue_line: '{position}. {title}{duration}',
+	music_queue_more: '…and {count} more',
 	ok: 'Done.',
 	failed: 'That did not work.',
 	summary_unavailable: 'The summary feature is not part of this setup.',
+	summary_guild_only: 'Ask for the summary inside the server: it covers the channels you can read there.',
 	record_status:
 		'Recording is currently {state}. (While it is off, voice transcripts and message texts are not written to the panel log; no summary can be made.)',
 	record_state_on: 'ON',

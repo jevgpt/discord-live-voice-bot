@@ -9,7 +9,7 @@ import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { locale } from './i18n/index.js';
-import { DEFAULT_YTDLP_DIR, UNSUPPORTED_LINK, YTDLP_MISSING, ensureYtDlpPath, isAllowedMediaUrl, runCommand } from './music.js';
+import { DEFAULT_YTDLP_DIR, UNSUPPORTED_LINK, YTDLP_MISSING, ensureYtDlpPath, isAllowedMediaUrl, runCommand, ytDlpArgs } from './music.js';
 
 const MAX_TRANSCRIPT = 120_000;
 const MAX_VIDEOS = 8;
@@ -76,7 +76,7 @@ export async function fetchVideo(input, { ytDlpPath = null, binDir = DEFAULT_YTD
 	try {
 		let raw;
 		try {
-			raw = await runCommand(binary, ['-j', '--no-playlist', '--no-warnings', '--skip-download', url], { timeoutMs: TIMEOUT_MS, spawnImpl });
+			raw = await runCommand(binary, ytDlpArgs(['-j', '--no-playlist', '--no-warnings', '--skip-download'], url), { timeoutMs: TIMEOUT_MS, spawnImpl });
 		} catch (err) {
 			if (err.reason === 'spawn') throw new Error(YTDLP_MISSING);
 			throw fail('no-result', err.message);
@@ -84,16 +84,23 @@ export async function fetchVideo(input, { ytDlpPath = null, binDir = DEFAULT_YTD
 		const line = raw.split('\n').find((candidate) => candidate.trim().startsWith('{'));
 		if (!line) throw fail('no-result', 'no metadata');
 		const info = JSON.parse(line);
+		// The page yt-dlp settled on (a search result, or where an allowed link redirected to) is the one the
+		// subtitles come from, so it passes the same host check the input did. Fetching that page rather
+		// than the input again also keeps a search from landing on a different video the second time.
+		const page = String(info.webpage_url ?? (url.startsWith('ytsearch1:') ? '' : url));
+		if (!isAllowedMediaUrl(page)) throw new Error(UNSUPPORTED_LINK);
 		try {
 			await runCommand(
 				binary,
-				[
-					'--skip-download', '--no-playlist', '--no-warnings',
-					'--write-subs', '--write-auto-subs', '--sub-langs', languages(),
-					'--convert-subs', 'srt',
-					'-o', path.join(dir, '%(id)s.%(ext)s'),
-					url,
-				],
+				ytDlpArgs(
+					[
+						'--skip-download', '--no-playlist', '--no-warnings',
+						'--write-subs', '--write-auto-subs', '--sub-langs', languages(),
+						'--convert-subs', 'srt',
+						'-o', path.join(dir, '%(id)s.%(ext)s'),
+					],
+					page,
+				),
 				{ timeoutMs: TIMEOUT_MS, spawnImpl },
 			);
 		} catch {
@@ -114,7 +121,7 @@ export async function fetchVideo(input, { ytDlpPath = null, binDir = DEFAULT_YTD
 		return rememberVideo({
 			id: String(info.id ?? url),
 			title: String(info.title ?? text),
-			url: String(info.webpage_url ?? url),
+			url: page,
 			duration: Number(info.duration) || null,
 			uploader: info.uploader ?? info.channel ?? null,
 			lang,

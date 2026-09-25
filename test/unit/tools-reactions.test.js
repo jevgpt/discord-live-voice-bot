@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { ChannelType, PermissionFlagsBits } from 'discord.js';
 import { callTool, toolMeta } from '../../src/tools.js';
+import { ownerVoice } from '../owner-voice.js';
 
 const SELF = 'bot';
 const PARTY = '123456789012345678'; // a server emoji id has to look like a snowflake
@@ -51,11 +52,17 @@ function makeDeps({ owner = false, permissions = ALL_PERMISSIONS, messages = nul
 			]);
 	const pinned = pins ? pins(sent) : [];
 	const held = new Set(permissions);
+	// `permissions` are the bot's own. Everybody else may see the channel and read it, so reading its pins
+	// is nobody's privilege here and the refusals under test are the bot's.
+	const open = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory];
 	const channel = {
 		id: '10',
 		name: 'chat',
 		type: ChannelType.GuildText,
-		permissionsFor: () => ({ has: (flag) => [...held].some((flagName) => PermissionFlagsBits[flagName] === flag) }),
+		permissionsFor: (subject) =>
+			subject?.id === SELF
+				? { has: (flag) => [...held].some((flagName) => PermissionFlagsBits[flagName] === flag) }
+				: { has: (flag) => open.includes(flag) },
 		send: async (payload) => (sent.push({ send: payload }), { id: 'poll-message' }),
 		messages: {
 			fetch: async (options) => {
@@ -98,7 +105,7 @@ function makeDeps({ owner = false, permissions = ALL_PERMISSIONS, messages = nul
 		deps.ownerMatch = (words) => words[0];
 	}
 	// The realtime path builds a fresh deps object for every call; two-step confirmation has to survive that.
-	const perCall = () => ({ ...deps, currentTurn: () => null });
+	const perCall = () => ({ ...deps });
 	return { deps, sent, guild, channel, perCall };
 }
 
@@ -223,10 +230,12 @@ describe('clear_reactions', () => {
 	]);
 
 	it('asks first and clears everything only after the confirmation', async () => {
-		const { perCall, sent } = makeDeps({ owner: true, messages: twoKinds });
+		const { deps, perCall, sent } = makeDeps({ owner: true, messages: twoKinds });
+		const owner = ownerVoice(deps);
 		const asked = await callTool('clear_reactions', {}, perCall());
 		assert.equal(asked.needs_confirmation, true, asked.spoken);
 		assert.deepEqual(sent, [], 'nothing is cleared before the answer');
+		owner.says('yes, clear them');
 		const done = await callTool('clear_reactions', { confirm: true }, perCall());
 		assert.equal(done.ok, true, done.spoken);
 		assert.deepEqual(sent.at(-1), { reactionsCleared: 'm2' });
@@ -234,8 +243,10 @@ describe('clear_reactions', () => {
 	});
 
 	it('clears a single emoji when one is named', async () => {
-		const { perCall, sent } = makeDeps({ owner: true, messages: twoKinds });
+		const { deps, perCall, sent } = makeDeps({ owner: true, messages: twoKinds });
+		const owner = ownerVoice(deps);
 		await callTool('clear_reactions', { emoji: 'party' }, perCall());
+		owner.says('yes');
 		const done = await callTool('clear_reactions', { emoji: 'party', confirm: true }, perCall());
 		assert.equal(done.ok, true, done.spoken);
 		assert.deepEqual(sent.at(-1), { reactionCleared: PARTY });

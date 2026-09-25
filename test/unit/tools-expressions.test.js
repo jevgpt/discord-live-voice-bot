@@ -4,6 +4,7 @@ import { describe, it } from 'node:test';
 import { PermissionFlagsBits } from 'discord.js';
 import { callTool } from '../../src/tools.js';
 import { tools as expressionTools } from '../../src/tools/expressions.js';
+import { ownerVoice } from '../owner-voice.js';
 
 const PNG_URL = 'https://cdn.discordapp.com/attachments/1/2/blob.png';
 const SELF_ID = 'me';
@@ -239,10 +240,12 @@ describe('rename_emoji', () => {
 describe('delete_emoji', () => {
 	it('asks first and deletes on the confirmed second call', async () => {
 		const { deps, sent } = makeDeps({ emojis: [emoji()] });
+		const owner = ownerVoice(deps);
 		const asked = await callTool('delete_emoji', { emoji: 'party_blob' }, deps);
 		assert.equal(asked.ok, false);
 		assert.equal(asked.needs_confirmation, true);
 		assert.equal(sent.length, 0, 'nothing is deleted on the first call');
+		owner.says('yes');
 		const done = await callTool('delete_emoji', { emoji: 'party_blob', confirm: true }, deps);
 		assert.equal(done.ok, true, done.spoken);
 		assert.equal(sent.find((entry) => entry.deletedEmoji)?.deletedEmoji, 'e1');
@@ -258,7 +261,9 @@ describe('delete_emoji', () => {
 
 	it('lets the bot delete an emoji it uploaded itself with only Create Expressions', async () => {
 		const { deps, sent } = makeDeps({ permissions: ['CreateGuildExpressions'], emojis: [emoji({ author: { id: SELF_ID } })] });
+		const owner = ownerVoice(deps);
 		await callTool('delete_emoji', { emoji: 'party_blob' }, deps);
+		owner.says('yes');
 		const done = await callTool('delete_emoji', { emoji: 'party_blob', confirm: true }, deps);
 		assert.equal(done.ok, true, done.spoken);
 		assert.equal(sent.find((entry) => entry.deletedEmoji)?.deletedEmoji, 'e1');
@@ -340,9 +345,11 @@ describe('rename_sticker', () => {
 describe('delete_sticker', () => {
 	it('asks first and deletes on the confirmed second call', async () => {
 		const { deps, sent } = makeDeps({ stickers: [sticker()] });
+		const owner = ownerVoice(deps);
 		const asked = await callTool('delete_sticker', { sticker: 'shrug' }, deps);
 		assert.equal(asked.needs_confirmation, true);
 		assert.equal(sent.length, 0);
+		owner.says('yes');
 		const done = await callTool('delete_sticker', { sticker: 'shrug', confirm: true }, deps);
 		assert.equal(done.ok, true, done.spoken);
 		assert.equal(sent.find((entry) => entry.deletedSticker)?.deletedSticker, 's1');
@@ -350,7 +357,9 @@ describe('delete_sticker', () => {
 
 	it('does not act on a confirmation that names a different sticker', async () => {
 		const { deps, sent } = makeDeps({ stickers: [sticker(), sticker({ id: 's2', name: 'oops' })] });
+		const owner = ownerVoice(deps);
 		await callTool('delete_sticker', { sticker: 'shrug' }, deps);
+		owner.says('yes');
 		const wrong = await callTool('delete_sticker', { sticker: 'oops', confirm: true }, deps);
 		assert.equal(wrong.ok, false);
 		assert.equal(sent.length, 0);

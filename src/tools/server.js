@@ -416,7 +416,7 @@ export const tools = [
 			reason: P.str('Reason for the audit log (optional)'),
 			confirm: P.confirm(),
 		}),
-		gate: { keywords: WORDS.server },
+		gate: { keywords: WORDS.prune },
 		async handler(args, deps, { name }) {
 			const missing = missingGuildPermissions(deps, ['ManageGuild', 'KickMembers']);
 			if (missing.length) return permissionRefusal(missing);

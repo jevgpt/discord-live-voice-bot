@@ -93,15 +93,20 @@ export class MemoryStore {
 	/**
 	 * Searches every note of every person. Without a query it returns the most recent notes, so
 	 * "look in your memory" has something to answer with instead of a bare "nothing found".
+	 * `userId` keeps the search to one person's notes: somebody who is not the owner may only look
+	 * through what is kept about themselves, and filtering after the limit would leave them with
+	 * whatever of theirs happened to survive among everybody else's.
 	 * @returns {Array<{ id: string, name: string|null, text: string, at: number }>}
 	 */
-	search(query = '', { limit = 12 } = {}) {
+	search(query = '', { limit = 12, userId = null } = {}) {
 		const needle = normalize(String(query ?? '').replace(/['’"“”]/gu, ' '));
 		// Two-letter words are ordinary words in Turkish ("ev", "su"), so they are kept: the length limit
 		// below applies to PREFIX matching only, not to matching a whole word.
 		const words = needle.split(' ').filter(Boolean);
 		const hits = [];
+		const only = userId === null || userId === undefined ? null : String(userId);
 		for (const [id, user] of Object.entries(this.data.users)) {
+			if (only !== null && id !== only) continue;
 			for (const note of user.notes ?? []) {
 				// Quotes become spaces first: normalize() strips a short apostrophe suffix (for "Ali'ye" -> "ali"),
 				// which would otherwise swallow a quoted keyword such as 'muz' out of the note.

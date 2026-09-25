@@ -124,6 +124,38 @@ export class SessionHealth {
 		if (ids?.length) this.overlapFrames++;
 	}
 
+	/**
+	 * The running totals as they stand, for the panel's history and /metrics. The snapshot below is made
+	 * for reading (percentages, a median); a graph needs the raw counts, so it can tell what happened in
+	 * the last ten seconds from what happened all evening. Counts only: no reason, no words.
+	 */
+	totals() {
+		return {
+			fragmentsSure: this.fragments.sure,
+			fragmentsLeaning: this.fragments.leaning,
+			fragmentsUnsure: this.fragments.unsure,
+			fragmentsSilent: this.fragments.silent,
+			linesNamed: this.lines.named,
+			linesMixed: this.lines.mixed,
+			linesUnknown: this.lines.unknown,
+			gateAllowed: this.gate.allowed,
+			gateDenied: this.gate.denied,
+			jevCalls: this.jev.calls,
+			jevFailed: this.jev.failed,
+			jevBanter: this.jev.banter,
+			jevNotForBot: this.jev.notForBot,
+			jevSuppressed: this.jev.suppressed,
+			driftMs: this.drift.now,
+			driftMaxMs: this.drift.max,
+			overlapFrames: this.overlapFrames,
+		};
+	}
+
+	/** Jev's round-trip times, in order, with how many there have been: the history takes the new ones. */
+	jevTimes() {
+		return { list: this.jev.ms, total: this.jev.ms.length };
+	}
+
 	/** The numbers, for the panel and for tests. */
 	snapshot() {
 		const fragments = this.fragmentCount;
@@ -206,8 +238,16 @@ export class SessionHealth {
 			: t('runtime.health_none');
 		lines.push(t('runtime.health_latency', { latency: latency || t('runtime.health_none'), tools }));
 		if (audio) {
+			// Each person's speech level and gain, and under the adaptive detector what it sees: the noise floor
+			// of their microphone and the bar a frame of theirs has to clear to count as speech. A floor of -40
+			// is a fan or music in that microphone; a level near the bar is somebody the detector barely hears.
+			// The level is only measured with AGC on, and "?" without it.
 			const levels = (audio.levels ?? [])
-				.map((entry) => t('runtime.health_audio_level', { name: entry.name ?? entry.id, level: entry.levelDb, gain: (entry.gainDb >= 0 ? '+' : '') + entry.gainDb }))
+				.map((entry) => {
+					const params = { name: entry.name ?? entry.id, level: entry.levelDb ?? '?', gain: (entry.gainDb >= 0 ? '+' : '') + entry.gainDb };
+					if (!Number.isFinite(entry.floorDb)) return t('runtime.health_audio_level', params);
+					return t('runtime.health_audio_level_vad', { ...params, floor: entry.floorDb, threshold: entry.thresholdDb });
+				})
 				.join(', ');
 			const ratio = Number.isFinite(audio.sentRatio) ? Math.round(audio.sentRatio * 1000) / 10 : '?';
 			const pad = Number.isFinite(audio.padRate) ? Math.round(audio.padRate * 10) / 10 : '?';

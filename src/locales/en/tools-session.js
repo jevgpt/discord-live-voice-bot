@@ -4,6 +4,8 @@ export default {
 	log_character_changed: '[tool] character changed: {character}',
 	persona_reason_character: 'tool: {character}',
 	character_switched: 'All right, I am speaking as {character} now.',
+	// Owner-gate words for switching the character; the character's own name is added to these.
+	character_words: ['character', 'persona', '=switch'],
 	character_active: '{name} (active)',
 	characters: 'Saved characters: {names}.',
 	characters_empty: 'There are no saved characters.',

@@ -4,6 +4,8 @@ export default {
 	no_send_channel: 'I did not know which channel to send it to.',
 	everyone_warning: 'tagging everyone only happens when the owner asks; the message was sent without the tag',
 	everyone_denied_activity: 'send_message: @everyone denied (not the owner)',
+	role_ping_warning: 'tagging the {role} role only happens when the owner asks; the message was sent without the tag',
+	role_ping_denied_activity: 'send_message: @{role} ping denied (not the owner)',
 	empty_message: 'The message looks empty; I could not work out what to write.',
 	sent: 'I sent the message to #{channel}.',
 	send_failed: 'I could not send the message',
@@ -23,6 +25,11 @@ export default {
 	log_read: '[tool] {channel} read: {count} messages{fresh}',
 	log_read_new: ' (new)',
 	read_failed: 'I could not read {channel}',
+	read_not_allowed: 'You cannot read #{channel} yourself, so I will not read it out for you.',
+	read_not_allowed_unknown: 'I could not tell who asked, and #{channel} is not open to everyone, so I will not read it out.',
+	dm_read_owner_only: 'Only the bot owner can have me read private conversations.',
+	log_read_refused: '[tool] read refused: #{channel} is not readable by {who}',
+	log_dm_read_refused: '[tool] read refused: private conversations are for the owner ({who} asked)',
 
 	member_not_found: 'I could not find anyone called "{name}".',
 	no_dm_text: 'I could not work out what to write.',
@@ -32,6 +39,9 @@ export default {
 	dm_sent: 'I sent {who} a DM.',
 	dm_failed: 'I could not DM {who}',
 	dm_failed_fallback_name: 'them',
+	// Owner-gate words for a DM to somebody other than the person asking. Three letters or more match as
+	// a prefix ("private" also matches "privately"); "=word" matches the word and its plural/verb -s.
+	dm_words: ['dm', 'direct', 'private', 'message', 'inbox', 'whisper', 'pm', '=tell', '=write', '=send', '=text'],
 
 	no_delete_channel: 'I did not know which channel to delete from.',
 	log_deleted_one: '[tool] message deleted -> #{channel}',
@@ -42,6 +52,8 @@ export default {
 	delete_none: 'I could not delete the messages (permission or age limit).',
 	deleted_many: 'I deleted {count} messages.',
 	delete_failed: 'I could not delete the messages',
+	delete_many_question: 'I am about to delete the last {count} messages in {channel}; this cannot be undone.',
+	delete_many_from_question: 'I am about to delete the last {count} messages from {who} in {channel}; this cannot be undone.',
 
 	no_edit_channel: 'I did not know which channel the message to edit is in.',
 	no_edit_text: 'I could not work out the new message text.',
@@ -50,6 +62,8 @@ export default {
 	log_edited: '[tool] message edited -> #{channel}',
 	edited: 'I edited the message: "{text}"',
 	edit_failed: 'I could not edit the message',
+	// Owner-gate words for editing a message the bot already posted.
+	edit_words: ['edit', 'change', 'fix', 'correct', 'rewrite', 'reword', 'update', 'replace', 'amend'],
 
 	no_bots: 'There are no other bots I know of on this server.',
 	bots_authorized: 'authorised: {names}',

@@ -8,6 +8,57 @@
 // English puts the verb and the message first and the target last ("write hello in the general
 // channel"), so the channel name is read out of the tail of the sentence and the message out of the
 // part in front of it; see the send.body_before_channel switch below.
+
+// Numbers the transcript may write out as words, for the queue and seek commands under music below. A
+// place in the queue ("move three to one") takes cardinals and ordinals; an amount of time ("skip ahead
+// thirty seconds", "a minute") takes cardinals and the article. [spoken word, value] pairs.
+const CARDINALS = [
+	['one', 1], ['two', 2], ['three', 3], ['four', 4], ['five', 5], ['six', 6], ['seven', 7], ['eight', 8], ['nine', 9],
+	['ten', 10], ['eleven', 11], ['twelve', 12], ['thirteen', 13], ['fourteen', 14], ['fifteen', 15], ['sixteen', 16],
+	['seventeen', 17], ['eighteen', 18], ['nineteen', 19], ['twenty', 20], ['thirty', 30], ['forty', 40], ['forty-five', 45],
+	['fifty', 50], ['sixty', 60], ['ninety', 90],
+];
+const ORDINALS = [
+	['first', 1], ['second', 2], ['third', 3], ['fourth', 4], ['fifth', 5], ['sixth', 6], ['seventh', 7], ['eighth', 8],
+	['ninth', 9], ['tenth', 10],
+];
+const ARTICLES = [['a', 1], ['an', 1]];
+// Longest first, so "forty-five" is not read as "forty"; the hyphen may be a space in a transcript.
+const alternatives = (pairs) =>
+	pairs
+		.map(([word]) => word)
+		.sort((a, b) => b.length - a.length)
+		.map((word) => word.replace(/-/gu, '[\\s-]'))
+		.join('|');
+// A queue position: digits ("3", "3rd") or a word; ORD takes the ordinal ending and closes the number.
+const POS = `(?:\\d{1,3}|${alternatives([...CARDINALS, ...ORDINALS])})`;
+const ORD = '(?:st|nd|rd|th)?(?![\\p{L}\\p{N}])';
+// An amount of time: digits or a word, never an ordinal ("second" is a unit here).
+const AMOUNT = `(?:\\d{1,4}|${alternatives([...CARDINALS, ...ARTICLES])})`;
+const UNIT = '(?:sec(?:ond)?s?|min(?:ute)?s?)(?![\\p{L}])';
+// "30 seconds", "a minute and 15 seconds", "1 minute 30 seconds".
+const SPAN = `(?<n1>${AMOUNT})\\s*(?<u1>${UNIT})(?:\\s*(?:and\\s+)?(?<n2>${AMOUNT})\\s*(?<u2>${UNIT}))?`;
+// "1:30", "1.30", "1:02:03".
+const STAMP = '(?<stamp>\\d{1,2}[:.]\\d{2}(?:[:.]\\d{2})?)';
+// The end of the sentence, and what may trail a seek or queue command without making it another one.
+// The commands are held to the end of the line on purpose: "go to 2:30" is a seek, "let's go to the
+// 2:30 showing" is not.
+const END = '(?:\\s+please)?[.!?]*\\s*$';
+// "The list" is anybody's list (shopping, guests, things to do): only the queue and the playlist are the music's.
+const QUEUE_NAME = '(?:queue|playlist)';
+const TAIL = `(?:\\s+(?:in|of)\\s+(?:the|this)\\s+(?:song|track))?(?:\\s+(?:in|on)\\s+the\\s+${QUEUE_NAME})?${END}`;
+// ... and where one may begin. These commands run with no wake word, straight off what was heard, so they
+// have to BE the sentence rather than sit inside one: "go back ten seconds" is a request, "I had to go back
+// 10 seconds", "let's go back to the beginning" and "I will go to 3:30" are people talking. In front of the
+// command there may be a name and a comma ("Aria, shuffle") and a filler word or two; the bot's own names
+// are taken off in src/commands.js before any of this is tried, with a comma or without.
+const LEAD = "^\\s*(?:[\\p{L}\\p{N}'’]+,\\s*)?(?:(?:please|just|now|ok(?:ay)?|hey|so),?\\s+)*";
+// Where the words name the music outright ("loop this song", "shuffle the queue", "rewind 10 seconds"), a
+// request put as a question counts as well.
+const ASK = `${LEAD}(?:(?:can|could|would)\\s+you\\s+(?:please\\s+|just\\s+)?)?`;
+// "move song 3", "move the third one", "move number 3".
+const MOVE_HEAD = `${ASK}(?:move|bump|shift)\\s+(?:(?:song|track|number|the)\\s+)*(?<from>${POS})${ORD}(?:\\s+(?:song|track|one))?\\s+(?:up\\s+|down\\s+)?to\\s+`;
+
 export default {
 	// Dictation particles: "write X in general" leaves a trailing quoting particle that must not
 	// become part of the message. Source string for a case-insensitive unicode RegExp.
@@ -218,6 +269,125 @@ export default {
 		not_a_query: [
 			'something', 'something good', 'something nice', 'some music', 'some songs', 'some tunes', 'music', 'song',
 			'songs', 'track', 'tracks', 'tunes', 'anything', 'a song', 'a track', 'us', 'me', 'please', 'a good one',
+		],
+
+		// ---- The queue and the place in the track. All of these are tried BEFORE the controls and the
+		// play requests above: "skip ahead 30 seconds" would otherwise be a skip, "play X next" a skip (the
+		// word "next") and "start the song over" a search for "the song over".
+
+		// Numbers written out as words, [word, value]; the patterns below use them for positions and amounts.
+		number_words: [...CARDINALS, ...ORDINALS, ...ARTICLES],
+		// Units of time as [how the spoken word starts, seconds]: "sec", "second" and "seconds" are one entry.
+		time_units: [['sec', 1], ['min', 60]],
+		// Repeat modes; the first hit wins, so "stop repeating the song" is read as off before "repeat the song".
+		// A repeat is about the song or the queue, and says so: "I keep looping this in my head" and "can you
+		// repeat that one more time" are not. The short forms with no song in them ("stop repeating", "loop
+		// it", "turn off repeat") count only as the whole sentence.
+		loop: [
+			{
+				mode: 'off',
+				pattern: `${ASK}(?:(?:stop|quit|cancel|end)\\s+(?:repeating|looping)|(?:don(?:'|’)?t|do\\s+not)\\s+(?:repeat|loop))\\s+(?:the|this|that)\\s+(?:song|track|queue|playlist)${END}`,
+				flags: 'iu',
+			},
+			{
+				mode: 'off',
+				pattern: `${LEAD}(?:(?:stop|quit)\\s+(?:repeating|looping)|(?:turn|switch|shut)\\s+(?:off\\s+(?:the\\s+)?(?:repeat|loop)(?:ing)?|(?:the\\s+)?(?:repeat|loop)(?:ing)?\\s+off)|(?:repeat|loop)(?:ing)?\\s+off|no\\s+more\\s+(?:repeat|loop)(?:ing|s)?|disable\\s+(?:the\\s+)?(?:repeat|loop)(?:ing)?|unloop(?:\\s+(?:it|this))?)${END}`,
+				flags: 'iu',
+			},
+			{
+				mode: 'queue',
+				pattern: `${ASK}(?:(?:repeat|loop)\\s+(?:the\\s+(?:whole\\s+|entire\\s+)?|this\\s+|our\\s+|my\\s+)?${QUEUE_NAME}|put\\s+(?:the\\s+)?${QUEUE_NAME}\\s+on\\s+(?:repeat|loop))${END}`,
+				flags: 'iu',
+			},
+			{ mode: 'queue', pattern: `${LEAD}(?:repeat|loop)\\s+(?:them\\s+)?all${END}`, flags: 'iu' },
+			{
+				mode: 'track',
+				pattern: `${ASK}(?:(?:repeat|loop)\\s+(?:this|the|that)\\s+(?:current\\s+)?(?:song|track)|put\\s+(?:this|the|that)\\s+(?:song|track)\\s+on\\s+(?:repeat|loop)|keep\\s+(?:repeating|looping)\\s+(?:this|the|that)\\s+(?:song|track))${END}`,
+				flags: 'iu',
+			},
+			{
+				mode: 'track',
+				pattern: `${LEAD}(?:loop\\s+(?:this|it)(?:\\s+one)?|(?:repeat|loop)\\s+this\\s+one|put\\s+(?:it|this(?:\\s+one)?)\\s+on\\s+(?:repeat|loop)|(?:song|track)\\s+on\\s+(?:repeat|loop))${END}`,
+				flags: 'iu',
+			},
+		],
+		// "shuffle the queue", "mix up the playlist", or "shuffle" as the whole sentence (after the bot's name,
+		// or a name and a comma, or a filler word): "the deck needs a shuffle" is about cards.
+		shuffle: {
+			pattern: `${ASK}(?:shuffle\\s+(?:up\\s+)?(?:the\\s+|our\\s+|my\\s+|this\\s+)?(?:queue|playlist|songs|tracks|music)|(?:mix\\s+up|randomi[sz]e|scramble)\\s+(?:the\\s+)?(?:queue|playlist|songs|tracks)|(?:turn|put)\\s+(?:on\\s+shuffle|shuffle\\s+on)|shuffle\\s+(?:mode\\s+)?on)${END}|${LEAD}shuffle(?:\\s+up)?${END}`,
+			flags: 'iu',
+		},
+		// "clear the queue" empties what is waiting; the track playing now carries on.
+		clear: {
+			pattern: `${ASK}(?:(?:clear|empty|wipe|flush)\\s+(?:out\\s+)?(?:the\\s+|our\\s+|my\\s+|this\\s+)?(?:whole\\s+|entire\\s+)?(?:music\\s+)?(?:queue|playlist|up\\s*next)|(?:remove|delete|drop)\\s+(?:everything|all\\s+(?:the\\s+)?(?:songs|tracks))\\s+(?:from|in)\\s+the\\s+${QUEUE_NAME})${END}`,
+			flags: 'iu',
+		},
+		// "move 3 to 1", "move the third song to the top". Named groups: from, to; `place` stands in for a
+		// missing "to" (top = 1, end = the last place).
+		move: [
+			{ pattern: `${MOVE_HEAD}(?:the\\s+)?(?:(?:position|number|spot|place|slot)\\s+)?(?<to>${POS})${ORD}(?:\\s+(?:position|spot|place|slot))?${TAIL}`, flags: 'iu' },
+			{ place: 'top', pattern: `${MOVE_HEAD}the\\s+(?:top|front|start|beginning)(?:\\s+of\\s+the\\s+${QUEUE_NAME})?${TAIL}`, flags: 'iu' },
+			{ place: 'end', pattern: `${MOVE_HEAD}the\\s+(?:end|bottom|back)(?:\\s+of\\s+the\\s+${QUEUE_NAME})?${TAIL}`, flags: 'iu' },
+		],
+		// "remove 3 from the queue", "remove song 3", "take the second one out of the queue". Named group: pos.
+		// What is taken out has to be a song, or come out of the queue: "ok, take two out" is about anything,
+		// and "the list" is anybody's list.
+		remove: [
+			{
+				pattern: `${ASK}(?:remove|delete|drop|take)\\s+(?:(?:song|track|number|the)\\s+)*(?<pos>${POS})${ORD}(?:\\s+(?:song|track|one))?\\s+(?:out\\s+of|from|off)\\s+(?:the\\s+|our\\s+|my\\s+)?${QUEUE_NAME}${END}`,
+				flags: 'iu',
+			},
+			{ pattern: `${ASK}(?:remove|delete|drop)\\s+(?:the\\s+)?(?:song|track)\\s+(?:number\\s+)?(?<pos>${POS})${ORD}${END}`, flags: 'iu' },
+			{ pattern: `${ASK}(?:remove|delete|drop|take)\\s+(?:the\\s+)?(?<pos>${POS})${ORD}\\s+(?:song|track)(?:\\s+(?:out|off))?${END}`, flags: 'iu' },
+		],
+		// Seeking. `dir`: start (back to 0:00), back / forward (a step), to (a place). Named groups: stamp
+		// ("1:30"), or n1/u1 and n2/u2 (amount and unit, "1 minute 30 seconds"). Back to the start takes a
+		// word that is only ever about playback (rewind, restart) or names the song: "let's go back to the
+		// beginning" and "take it from the top" are said about plenty besides music.
+		seek: [
+			{
+				dir: 'start',
+				pattern:
+					`${ASK}(?:(?:start|play)\\s+(?:the\\s+|this\\s+)?(?:song|track)\\s+(?:over|(?:again\\s+)?from\\s+the\\s+(?:start|beginning|top))|restart\\s+(?:the\\s+|this\\s+)?(?:song|track)|` +
+					`(?:rewind|skip\\s+back|jump\\s+back)\\s+(?:it\\s+|the\\s+(?:song|track)\\s+)?to\\s+the\\s+(?:very\\s+)?(?:start|beginning|top)|` +
+					`(?:go|skip|jump)\\s+back\\s+to\\s+the\\s+(?:very\\s+)?(?:start|beginning)\\s+of\\s+the\\s+(?:song|track))${TAIL}`,
+				flags: 'iu',
+			},
+			{
+				dir: 'back',
+				pattern: `(?:${ASK}(?:rewind|skip\\s+back(?:wards?)?|jump\\s+back)|${LEAD}(?:go\\s+back|back\\s+up))\\s+(?:it\\s+|the\\s+(?:song|track)\\s+)?(?:by\\s+)?${SPAN}${TAIL}`,
+				flags: 'iu',
+			},
+			{ dir: 'back', pattern: `${LEAD}(?:go|skip|jump|move)\\s+${SPAN}\\s+back(?:wards?)?${TAIL}`, flags: 'iu' },
+			{
+				dir: 'forward',
+				pattern: `${ASK}(?:(?:skip|jump|go|move|seek)\\s+(?:ahead|forward)|fast\\s*-?\\s*forward|forward|skip)\\s+(?:it\\s+|the\\s+(?:song|track)\\s+)?(?:by\\s+)?${SPAN}${TAIL}`,
+				flags: 'iu',
+			},
+			{ dir: 'forward', pattern: `${LEAD}(?:go|skip|jump|move)\\s+${SPAN}\\s+(?:ahead|forward)${TAIL}`, flags: 'iu' },
+			// "Go to 3:30" is a seek only as the whole sentence ("could you go to 3:30?" asks somebody to be
+			// somewhere); jump, skip, seek, fast forward and rewind are about playback however they are asked.
+			{
+				dir: 'to',
+				pattern: `(?:${ASK}(?:jump|skip|seek|fast\\s*-?\\s*forward|rewind)|${LEAD}(?:go|move|take\\s+(?:it|me|us)))\\s+(?:back\\s+|ahead\\s+|forward\\s+)?to\\s+(?:the\\s+)?${STAMP}(?:\\s+mark)?${TAIL}`,
+				flags: 'iu',
+			},
+			{
+				dir: 'to',
+				pattern: `(?:${ASK}(?:jump|skip|seek|fast\\s*-?\\s*forward|rewind)|${LEAD}(?:go|move|take\\s+(?:it|me|us)))\\s+(?:back\\s+|ahead\\s+|forward\\s+)?to\\s+(?:the\\s+)?${SPAN}(?:\\s+mark)?${TAIL}`,
+				flags: 'iu',
+			},
+		],
+		// "play X next", "queue up X next", "put X at the front of the queue", "after this, play X". Group 1
+		// is the query; it goes through the same cleanup and "means anything" check as a play request.
+		play_next: [
+			{
+				pattern:
+					'(?:^|\\s)(?:play|queue(?:\\s+up)?|put\\s+on)\\s+(?:us\\s+|me\\s+)?(.+?)\\s+(?:next|(?:right\\s+)?after\\s+this(?:\\s+(?:one|song|track))?)(?:\\s+(?:please|for\\s+(?:us|me)))?[.!?]*\\s*$',
+				flags: 'iu',
+			},
+			{ pattern: `(?:^|\\s)(?:add|put)\\s+(.+?)\\s+(?:to|at)\\s+the\\s+(?:front|top|start)\\s+of\\s+the\\s+${QUEUE_NAME}${END}`, flags: 'iu' },
+			{ pattern: '(?:^|\\s)after\\s+this(?:\\s+(?:one|song|track))?\\s*,?\\s*(?:play|put\\s+on)\\s+(.+?)(?:\\s+please)?[.!?]*\\s*$', flags: 'iu' },
 		],
 	},
 };

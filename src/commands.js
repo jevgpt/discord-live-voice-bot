@@ -5,7 +5,9 @@
 //   "New character" modal: name, prompt (long text), voice (optional)
 // Permissions: changing/deleting a character, sending a message, reading a channel, leaving and the
 //   recording switch are limited to the owner / ADMIN_USER_IDS / ADMIN_ROLE_IDS / members with the
-//   "Manage Server" permission (src/auth.js).
+//   "Manage Server" permission (src/auth.js). /join in a server outside GUILD_ID/VOICE_TARGETS builds a
+//   new session there, so it takes the owner or ADMIN_USER_IDS (mayStartSession). /summary covers only
+//   the channels the member could read themselves (the owner excepted), and so does /read.
 // Voice commands (picked up from what is said in the channel) -- the phrasings themselves live in
 //   src/locales/<code>/grammar.js, so every language brings its own:
 //   "switch to the <name> character"     -> change character (the live session is rebuilt)
@@ -13,7 +15,8 @@
 //   "join the <channel> channel"         -> join a voice channel
 //   "leave the channel"                  -> leave the voice channel
 //   "play <song>", "stop/pause/resume the music", "skip the song", "turn the music down/up",
-//   "what's playing"
+//   "what's playing", and the queue: "play <song> next", "loop this song", "repeat the queue",
+//   "shuffle", "go to 1:30", "skip ahead 30 seconds", "move 3 to 1", "remove 3", "clear the queue"
 
 import {
 	ActionRowBuilder,
@@ -33,7 +36,7 @@ import { NOT_ALLOWED, interactionPrivileged } from './auth.js';
 import { t, tRaw } from './i18n/index.js';
 import enCommands from './locales/en/commands.js';
 import trCommands from './locales/tr/commands.js';
-import { findCharacter, findChannelByName, normalize, stripDictationTail } from './text.js';
+import { findCharacter, findChannelByName, normalize, parseClock, stripDictationTail } from './text.js';
 import { VOICES } from './voices.js';
 
 export { VOICES, findCharacter, findChannelByName, normalize, stripDictationTail };
@@ -51,6 +54,10 @@ const EN_SLASH = enCommands.slash;
 const TR_SLASH = trCommands.slash;
 
 const RECORD_STATES = ['on', 'off', 'status'];
+// The repeat modes /music loop offers; the same three the player knows (LOOP_MODES in src/music.js).
+const LOOP_CHOICES = ['off', 'track', 'queue'];
+// How many queued titles /music status lists under the now-playing line.
+const STATUS_QUEUE_LINES = 10;
 
 /** "music.subcommands.play.options.query" -> that entry of a locale's slash tree. */
 function slashEntry(tree, key) {
@@ -107,10 +114,16 @@ export function commandData() {
 		),
 		named(new SlashCommandBuilder(), 'status'),
 		named(new SlashCommandBuilder(), 'help'),
+		// Fourteen subcommands of the twenty-five Discord allows; none takes more than two options.
 		named(new SlashCommandBuilder(), 'music')
 			.addSubcommand((sub) =>
 				named(sub, 'music.subcommands.play').addStringOption((option) =>
 					named(option, 'music.subcommands.play.options.query').setRequired(true),
+				),
+			)
+			.addSubcommand((sub) =>
+				named(sub, 'music.subcommands.playnext').addStringOption((option) =>
+					named(option, 'music.subcommands.playnext.options.query').setRequired(true),
 				),
 			)
 			.addSubcommand((sub) => named(sub, 'music.subcommands.stop'))
@@ -122,7 +135,31 @@ export function commandData() {
 					named(option, 'music.subcommands.volume.options.percent').setRequired(true).setMinValue(0).setMaxValue(100),
 				),
 			)
-			.addSubcommand((sub) => named(sub, 'music.subcommands.status')),
+			.addSubcommand((sub) => named(sub, 'music.subcommands.status'))
+			.addSubcommand((sub) =>
+				named(sub, 'music.subcommands.seek').addStringOption((option) =>
+					named(option, 'music.subcommands.seek.options.position').setRequired(true).setMaxLength(12),
+				),
+			)
+			.addSubcommand((sub) =>
+				named(sub, 'music.subcommands.loop').addStringOption((option) =>
+					named(option, 'music.subcommands.loop.options.mode')
+						.setRequired(true)
+						.addChoices(...choicesFor('music.subcommands.loop.options.mode', LOOP_CHOICES)),
+				),
+			)
+			.addSubcommand((sub) => named(sub, 'music.subcommands.shuffle'))
+			.addSubcommand((sub) =>
+				named(sub, 'music.subcommands.move')
+					.addIntegerOption((option) => named(option, 'music.subcommands.move.options.from').setRequired(true).setMinValue(1))
+					.addIntegerOption((option) => named(option, 'music.subcommands.move.options.to').setRequired(true).setMinValue(1)),
+			)
+			.addSubcommand((sub) =>
+				named(sub, 'music.subcommands.remove').addIntegerOption((option) =>
+					named(option, 'music.subcommands.remove.options.position').setRequired(true).setMinValue(1),
+				),
+			)
+			.addSubcommand((sub) => named(sub, 'music.subcommands.clear')),
 		named(new SlashCommandBuilder(), 'summary').addIntegerOption((option) =>
 			named(option, 'summary.options.hours').setMinValue(1).setMaxValue(72),
 		),
@@ -239,6 +276,51 @@ export function panelView(store) {
 	return { embeds: [embed], components: rows };
 }
 
+// ---------------------------------------------------------------- /music
+
+/**
+ * /music <subcommand> -> [tool, args]. Every entry reads only its own options, and only when it is the
+ * one asked for: discord.js throws for a required option the interaction does not carry, and the table
+ * this replaced read /music play's query for every subcommand, so all of them but play failed.
+ */
+const MUSIC_SLASH = {
+	play: (options) => ['play_music', { query: options.getString('query', true) }],
+	playnext: (options) => ['play_next', { query: options.getString('query', true) }],
+	stop: () => ['stop_music', {}],
+	pause: () => ['pause_music', {}],
+	resume: () => ['resume_music', {}],
+	skip: () => ['skip_music', {}],
+	volume: (options) => ['set_music_volume', { percent: options.getInteger('percent', true) }],
+	status: () => ['music_status', {}],
+	// The text goes to the tool as typed: "1:30", "90", "+30" and "-10" are all read there (parseSeekTarget).
+	seek: (options) => ['seek_music', { to: options.getString('position', true) }],
+	loop: (options) => ['loop_music', { mode: options.getString('mode', true) }],
+	shuffle: () => ['shuffle_queue', {}],
+	move: (options) => ['move_in_queue', { from: options.getInteger('from', true), to: options.getInteger('to', true) }],
+	remove: (options) => ['remove_from_queue', { position: options.getInteger('position', true) }],
+	clear: () => ['clear_queue', {}],
+};
+
+/** The tool call behind a /music subcommand, or null for one this build does not know. */
+export function musicSlashCall(sub, options) {
+	const build = MUSIC_SLASH[sub];
+	return build ? build(options) : null;
+}
+
+/** The waiting tracks under /music status, numbered the way /music move and /music remove count them. */
+function musicQueueLines(queue) {
+	if (!Array.isArray(queue) || !queue.length) return '';
+	const lines = queue.slice(0, STATUS_QUEUE_LINES).map((track) =>
+		t('commands.music_queue_line', {
+			position: track.position,
+			title: track.title,
+			duration: track.durationText ? ` (${track.durationText})` : '',
+		}),
+	);
+	if (queue.length > STATUS_QUEUE_LINES) lines.push(t('commands.music_queue_more', { count: queue.length - STATUS_QUEUE_LINES }));
+	return `\n${t('commands.music_queue_header')}\n${lines.join('\n')}`;
+}
+
 // ---------------------------------------------------------------- interactions
 
 export async function handleInteraction(interaction, ctx) {
@@ -277,10 +359,68 @@ async function denyUnlessPrivileged(interaction, ctx) {
 		who: interaction.user?.id ?? null,
 		whoName: interaction.member?.displayName ?? interaction.user?.username ?? null,
 		text: t('commands.gate_denied_activity', { command: interaction.commandName ?? interaction.customId }),
-		meta: { result: 'denied' },
+		meta: { result: 'denied', code: 'not_privileged', command: interaction.commandName ?? interaction.customId ?? null },
 	});
 	await interaction.reply({ content: NOT_ALLOWED, flags: MessageFlags.Ephemeral }).catch(() => {});
 	return true;
+}
+
+/** Is this one of the servers the bot was set up for: the GUILD_ID pair or a VOICE_TARGETS entry? */
+export function isConfiguredGuild(cfg, guildId) {
+	if (!guildId) return false;
+	const id = String(guildId);
+	if (cfg?.guildId && String(cfg.guildId) === id) return true;
+	return Array.isArray(cfg?.targets) && cfg.targets.some((target) => target?.guildId && String(target.guildId) === id);
+}
+
+/**
+ * May `userId` make the bot build a session for this server? A configured server keeps the rule it always
+ * had: anybody who can reach /join there. Any other server gets one only from the owner or ADMIN_USER_IDS.
+ * A new session is a realtime connection billed to the owner's API keys, one of the MAX_LIVE_SESSIONS
+ * slots (a stranger filling them silences the owner's own server) and the tools that come with it; and
+ * whoever invited a public bot into their own server holds Manage Server and every role there, so the
+ * rest of isPrivileged() proves nothing about a foreign server.
+ */
+export function mayStartSession({ cfg, guildId, userId }) {
+	if (isConfiguredGuild(cfg, guildId)) return true;
+	const id = userId ? String(userId) : null;
+	if (!id) return false;
+	if (cfg?.ownerId && id === String(cfg.ownerId)) return true;
+	return Array.isArray(cfg?.adminUserIds) && cfg.adminUserIds.includes(id);
+}
+
+/**
+ * /join in a server that has no session builds one (see mayStartSession); this answers everybody else.
+ * A server that already has a session is not asked about: moving the bot there is what /join always did.
+ */
+async function denyUnlessMayStartSession(interaction, ctx) {
+	if (ctx.hasSession?.() !== false) return false;
+	if (mayStartSession({ cfg: ctx.config, guildId: interaction.guildId, userId: interaction.user?.id })) return false;
+	const guild = interaction.guild?.name ?? interaction.guildId ?? '?';
+	ctx.activity?.({
+		kind: 'gate',
+		who: interaction.user?.id ?? null,
+		whoName: interaction.member?.displayName ?? interaction.user?.username ?? null,
+		text: t('commands.gate_unconfigured_activity', { guild }),
+		meta: { result: 'denied', guild, code: 'unconfigured_server', command: interaction.commandName ?? null },
+	});
+	await interaction.reply({ content: t('commands.join_unconfigured_denied'), flags: MessageFlags.Ephemeral }).catch(() => {});
+	return true;
+}
+
+/**
+ * Who a written summary is for (see summarizeConversation in src/summary.js). The log it is made from
+ * holds every text channel of the server, so a member gets the channels they could read themselves, and
+ * that includes the admins: /read holds them to their own account as well, and Manage Server is a
+ * permission people hand out more freely than the moderators' channel. Only the owner gets everything.
+ * It is this server only either way. A DM has no member to judge, so there it is null (the owner aside):
+ * the command answers that it needs a server.
+ */
+export function summaryAudience(interaction, cfg) {
+	const userId = interaction.user?.id ? String(interaction.user.id) : null;
+	if (userId && cfg?.ownerId && userId === String(cfg.ownerId)) return { everything: true };
+	if (!interaction.guildId || !interaction.member) return null;
+	return { readers: [interaction.member] };
 }
 
 async function handleAutocomplete(interaction, ctx) {
@@ -301,7 +441,9 @@ async function joinFromInteraction(interaction, ctx, chosen) {
 	}
 	await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 	try {
-		await ctx.joinVoice(chosen);
+		// Who asked travels with the join: the registry builds a session for an unconfigured server only
+		// on the owner's word, and a join without a requester is taken as nobody's.
+		await ctx.joinVoice(chosen, { requesterId: interaction.user?.id ?? null });
 		await interaction.editReply({ content: t('commands.joined', { channel: chosen.name }) });
 	} catch (err) {
 		await interaction.editReply({ content: t('commands.join_failed', { error: err.message }) });
@@ -311,6 +453,7 @@ async function joinFromInteraction(interaction, ctx, chosen) {
 async function handleCommand(interaction, ctx) {
 	switch (interaction.commandName) {
 		case 'join': {
+			if (await denyUnlessMayStartSession(interaction, ctx)) return;
 			const chosen = interaction.options.getChannel('channel') ?? interaction.member?.voice?.channel ?? null;
 			await joinFromInteraction(interaction, ctx, chosen);
 			return;
@@ -345,7 +488,7 @@ async function handleCommand(interaction, ctx) {
 			const channel = interaction.options.getChannel('channel', true);
 			const message = interaction.options.getString('message', true);
 			await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-			const result = await ctx.callTool('send_message', { channel, text: message });
+			const result = await ctx.callTool('send_message', { channel, text: message }, { userId: interaction.user?.id ?? null });
 			await interaction.editReply({
 				content: result.ok ? t('commands.sent', { channel: channel.name }) : t('commands.send_failed', { reason: result.spoken }),
 			});
@@ -356,9 +499,21 @@ async function handleCommand(interaction, ctx) {
 			const channel = interaction.options.getChannel('channel', true);
 			const count = interaction.options.getInteger('count') ?? ctx.config.readLimit;
 			await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-			const result = await ctx.callTool('read_messages', { channel, count });
+			// Read as the person who ran the command: read_messages checks that THEY may read the channel.
+			const result = await ctx.callTool('read_messages', { channel, count }, { userId: interaction.user?.id ?? null });
 			if (!result.ok) {
 				await interaction.editReply({ content: t('commands.read_failed', { reason: result.spoken }) });
+				return;
+			}
+			// Said out loud, it is read to everybody in the voice channel, and the person who ran /read may be
+			// able to read a channel that somebody listening may not. Then it is shown to them alone, in this
+			// reply, instead: the simplest answer that leaks nothing, and they still get what they asked for.
+			// (Refusing would work as well and help nobody; waiting for the room to empty is not an answer.)
+			const aloud = typeof ctx.roomMayRead === 'function' ? await ctx.roomMayRead(channel) : true;
+			if (!aloud) {
+				await interaction.editReply({
+					content: t('commands.reading_private', { channel: channel.name, text: String(result.spoken ?? '') }).slice(0, 1900),
+				});
 				return;
 			}
 			ctx.say(result.spoken);
@@ -425,33 +580,32 @@ async function handleCommand(interaction, ctx) {
 				return;
 			}
 			const sub = interaction.options.getSubcommand();
-			const map = {
-				play: ['play_music', { query: interaction.options.getString('query', true) }],
-				stop: ['stop_music', {}],
-				pause: ['pause_music', {}],
-				resume: ['resume_music', {}],
-				skip: ['skip_music', {}],
-				volume: ['set_music_volume', { percent: interaction.options.getInteger('percent', true) }],
-				status: ['music_status', {}],
-			};
-			const [tool, args] = map[sub] ?? [];
+			const [tool, args] = musicSlashCall(sub, interaction.options) ?? [];
 			if (!tool) {
 				await interaction.reply({ content: t('commands.music_unknown'), flags: MessageFlags.Ephemeral });
 				return;
 			}
 			await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-			const result = await ctx.callTool(tool, args);
-			await interaction.editReply({ content: result.spoken ?? (result.ok ? t('commands.ok') : t('commands.failed')) });
+			const result = await ctx.callTool(tool, args, { userId: interaction.user?.id ?? null });
+			let content = result.spoken ?? (result.ok ? t('commands.ok') : t('commands.failed'));
+			// Written, the queue can be shown with its positions, which is what /music move and remove take.
+			if (sub === 'status') content += musicQueueLines(result.data?.queue);
+			await interaction.editReply({ content: content.slice(0, 1900) });
 			return;
 		}
 		case 'summary': {
 			const hours = interaction.options.getInteger('hours') ?? 3;
+			const audience = summaryAudience(interaction, ctx.config);
+			if (!audience) {
+				await interaction.reply({ content: t('commands.summary_guild_only'), flags: MessageFlags.Ephemeral });
+				return;
+			}
 			await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 			if (typeof ctx.summarize !== 'function') {
 				await interaction.editReply({ content: t('commands.summary_unavailable') });
 				return;
 			}
-			const { summary } = await ctx.summarize({ hours, spoken: false });
+			const { summary } = await ctx.summarize({ hours, spoken: false, audience });
 			await interaction.editReply({ content: summary.slice(0, 1900) });
 			return;
 		}
@@ -670,6 +824,7 @@ const JOIN_LEGACY = rx(JOIN.legacy);
 
 const MUSIC = tRaw('grammar.music');
 const MUSIC_PATTERNS = MUSIC.patterns.map((entry) => ({ action: entry.action, re: rx(entry) }));
+const MUSIC_STOP = MUSIC_PATTERNS.find((entry) => entry.action === 'stop')?.re ?? null;
 const VOLUME_SET = rx(MUSIC.volume_set);
 const VOLUME_REQUIRES = rx(MUSIC.volume_requires);
 const VOLUME_DOWN = rx(MUSIC.volume_down);
@@ -679,6 +834,18 @@ const SKIP_REQUIRES = rx(MUSIC.skip_requires);
 const PLAY_PATTERNS = MUSIC.play_patterns.map(rx);
 const QUERY_CLEANUP = MUSIC.query_cleanup.map(rx);
 const NOT_A_QUERY = new Set(MUSIC.not_a_query);
+// The queue and seek commands (loop, shuffle, clear, move, remove, seek, play next).
+const NUMBER_WORDS = new Map((MUSIC.number_words ?? []).map(([word, value]) => [normalize(word), value]));
+const TIME_UNITS = (MUSIC.time_units ?? []).map(([start, seconds]) => [normalize(start), seconds]);
+const LOOP_PATTERNS = (MUSIC.loop ?? []).map((entry) => ({ mode: entry.mode, re: rx(entry) }));
+const SHUFFLE = rx(MUSIC.shuffle);
+const CLEAR_QUEUE = rx(MUSIC.clear);
+const MOVE_PATTERNS = (MUSIC.move ?? []).map((entry) => ({ place: entry.place ?? null, re: rx(entry) }));
+const REMOVE_PATTERNS = (MUSIC.remove ?? []).map(rx);
+const SEEK_PATTERNS = (MUSIC.seek ?? []).map((entry) => ({ dir: entry.dir, re: rx(entry) }));
+const PLAY_NEXT_PATTERNS = (MUSIC.play_next ?? []).map(rx);
+// "Move it to the end": a place past any queue, which the player reads as the last one.
+const QUEUE_END = Number.MAX_SAFE_INTEGER;
 
 function escapeRegExp(value) {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -834,9 +1001,102 @@ function extractJoin(text, channels) {
 
 // ---------------------------------------------------------------- music commands
 
-/** Music command: { type:'music', action, query?, percent?, delta? } or null. */
-export function extractMusic(text) {
-	const line = String(text ?? '');
+/** A captured play query, cleaned; null when what is left names nothing ("play something"). */
+function cleanQuery(raw) {
+	const query = QUERY_CLEANUP.reduce((value, cleanup) => value.replace(cleanup, ''), cleanMessage(raw)).trim();
+	return query.length < 3 || NOT_A_QUERY.has(normalize(query)) ? null : query;
+}
+
+/** "3", "three", "üç", "üçüncü" -> 3, through the locale's number words; null for anything else. */
+function spokenNumber(token) {
+	const text = normalize(token);
+	if (!text) return null;
+	if (/^\d+$/u.test(text)) return Number(text);
+	return NUMBER_WORDS.get(text) ?? null;
+}
+
+/** Seconds per unit for a spoken unit word, matched by how it starts ("seconds", "saniyeye"). */
+function unitSeconds(word) {
+	const text = normalize(word);
+	return TIME_UNITS.find(([start]) => text.startsWith(start))?.[1] ?? null;
+}
+
+/** The seconds a seek pattern captured: a clock time ("1:30"), or one or two amounts with their units. */
+function seekSeconds(groups) {
+	if (groups.stamp) return parseClock(groups.stamp);
+	let total = null;
+	for (const [amount, unit] of [
+		[groups.n1, groups.u1],
+		[groups.n2, groups.u2],
+	]) {
+		if (amount === undefined) continue;
+		const value = spokenNumber(amount);
+		const seconds = unitSeconds(unit);
+		if (value === null || seconds === null) return null;
+		total = (total ?? 0) + value * seconds;
+	}
+	return total;
+}
+
+/**
+ * The queue and seek commands. They are matched before the playback controls and the play requests,
+ * which would otherwise take them for something else: "skip ahead 30 seconds" is not a skip, and
+ * "play X next" is not a skip either (the word "next").
+ */
+function extractQueueCommand(line) {
+	for (const { mode, re } of LOOP_PATTERNS) {
+		if (re.test(line)) return { type: 'music', action: 'loop', mode };
+	}
+	if (SHUFFLE?.test(line)) return { type: 'music', action: 'shuffle' };
+	if (CLEAR_QUEUE?.test(line)) return { type: 'music', action: 'clear' };
+	for (const { place, re } of MOVE_PATTERNS) {
+		const groups = re.exec(line)?.groups;
+		if (!groups) continue;
+		const from = spokenNumber(groups.from);
+		const to = place === 'top' ? 1 : place === 'end' ? QUEUE_END : spokenNumber(groups.to);
+		if (from && to) return { type: 'music', action: 'move', from, to };
+	}
+	for (const re of REMOVE_PATTERNS) {
+		const position = spokenNumber(re.exec(line)?.groups?.pos);
+		if (position) return { type: 'music', action: 'remove', position };
+	}
+	for (const { dir, re } of SEEK_PATTERNS) {
+		const match = re.exec(line);
+		if (!match) continue;
+		if (dir === 'start') return { type: 'music', action: 'seek', to: 0 };
+		const seconds = seekSeconds(match.groups ?? {});
+		if (seconds === null) continue;
+		if (dir === 'to') return { type: 'music', action: 'seek', to: seconds };
+		return { type: 'music', action: 'seek', by: dir === 'back' ? -seconds : seconds };
+	}
+	for (const re of PLAY_NEXT_PATTERNS) {
+		const match = re.exec(line);
+		const query = match ? cleanQuery(match[1]) : null;
+		if (query) return { type: 'music', action: 'play', query, next: true };
+	}
+	return null;
+}
+
+/**
+ * The line without the bot's name in front of it: "Aria, shuffle" and "Aria shuffle" -> "shuffle". The
+ * queue and seek commands have to be the whole sentence (the grammar's LEAD), and the name the bot is
+ * called by is not part of any sentence it is asked.
+ */
+function withoutBotName(line, characters = []) {
+	const match = /^\s*([\p{L}\p{N}'’]+)[,.!?:]?\s+(\S.*)$/su.exec(line);
+	if (!match) return line;
+	const names = [...(characters ?? []).map((character) => character?.name), ...(tRaw('runtime.wake_words') ?? [])];
+	const first = normalize(match[1]);
+	return names.some((name) => name && normalize(String(name)) === first) ? match[2] : line;
+}
+
+/**
+ * Music command: { type:'music', action, ... } or null. Besides play (query, next?), volume (percent or
+ * delta) and the bare controls, the queue commands: loop (mode), shuffle, clear, move (from, to),
+ * remove (position) and seek (to, or by for a step). `characters` are the bot's names (see withoutBotName).
+ */
+export function extractMusic(text, characters = []) {
+	const line = withoutBotName(String(text ?? ''), characters);
 	const setMatch = VOLUME_SET.exec(line);
 	if (setMatch && VOLUME_REQUIRES.test(line)) {
 		const percent = Math.max(0, Math.min(100, Number(setMatch[1])));
@@ -846,16 +1106,19 @@ export function extractMusic(text) {
 	if (VOLUME_UP.test(line) && !VOLUME_UP_EXCLUDE.test(line)) {
 		return { type: 'music', action: 'volume', delta: 15 };
 	}
+	// Stop still comes first: it clears the queue as well, so "stop the music and clear the queue" asks
+	// for nothing that stopping does not do, and read as a clear it would leave the music playing.
+	if (MUSIC_STOP?.test(line)) return { type: 'music', action: 'stop' };
+	const queued = extractQueueCommand(line);
+	if (queued) return queued;
 	for (const { action, re } of MUSIC_PATTERNS) {
 		if (action === 'skip' && !SKIP_REQUIRES.test(line)) continue;
 		if (re.test(line)) return { type: 'music', action };
 	}
 	for (const re of PLAY_PATTERNS) {
 		const match = re.exec(line);
-		if (!match) continue;
-		const query = QUERY_CLEANUP.reduce((value, cleanup) => value.replace(cleanup, ''), cleanMessage(match[1])).trim();
-		if (query.length < 3 || NOT_A_QUERY.has(normalize(query))) continue;
-		return { type: 'music', action: 'play', query };
+		const query = match ? cleanQuery(match[1]) : null;
+		if (query) return { type: 'music', action: 'play', query };
 	}
 	return null;
 }
@@ -910,7 +1173,7 @@ export function parseVoiceCommand(text, characters = [], channels = { text: [], 
 
 	if (LEAVE.test(line)) return { type: 'leave' };
 
-	const music = extractMusic(line);
+	const music = extractMusic(line, characters);
 	if (music) return music;
 
 	const quiet = extractQuiet(line, characters);
@@ -947,12 +1210,19 @@ export function actionSignature(command, now = Date.now()) {
 			return `quiet:${command.value}:${Math.floor(now / 5000)}`;
 		case 'character':
 			return `character:${command.character?.id ?? command.name ?? '-'}`;
-		case 'music':
+		case 'music': {
 			// A play request is deduplicated for 30 s (the same request can arrive by two routes);
 			// skip/volume and friends only within a 5 s window, so that "skip, skip" skips two tracks.
-			return command.action === 'play'
-				? `music:play:${normalize(command.query ?? '')}`
-				: `music:${command.action}:${command.percent ?? command.delta ?? ''}:${Math.floor(now / 5000)}`;
+			// "Play X next" is its own request: said right after "play X", it moves X up rather than
+			// being answered from the first one's result.
+			if (command.action === 'play') return `music:play${command.next ? ':next' : ''}:${normalize(command.query ?? '')}`;
+			// Named, not just listed: a seek "to 90" and a seek "by 90" are different requests.
+			const detail = ['percent', 'delta', 'mode', 'from', 'to', 'by', 'position']
+				.filter((key) => command[key] !== undefined)
+				.map((key) => `${key}=${command[key]}`)
+				.join(',');
+			return `music:${command.action}:${detail}:${Math.floor(now / 5000)}`;
+		}
 		default:
 			return null;
 	}

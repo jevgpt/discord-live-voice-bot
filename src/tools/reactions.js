@@ -16,6 +16,7 @@ import {
 	PermissionFlagsBits,
 	STALE_CONFIRMATION,
 	WORDS,
+	askAfterUntrustedRead,
 	askConfirmation,
 	checkConfirmation,
 	displayName,
@@ -30,6 +31,7 @@ import {
 } from './helpers.js';
 import { t } from '../i18n/index.js';
 import { normalize } from '../text.js';
+import { askBeforePrivateRead, readRefusal } from './messaging.js';
 import { P, defineTool } from './registry.js';
 
 // Poll limits straight from the API reference: at most 10 answers, 300 characters of question,
@@ -203,6 +205,8 @@ export const tools = [
 			},
 			['emoji'],
 		),
+		// Somebody else's reaction goes through the owner gate, which can ask the owner first.
+		asks: true,
 		async handler(args, deps, { name }) {
 			const emoji = resolveReactionEmoji(deps, args.emoji);
 			if (!emoji) return { ok: false, spoken: t('tools.reactions.which_emoji') };
@@ -266,7 +270,7 @@ export const tools = [
 			emoji: P.str('Clear only this emoji (optional; empty = every reaction)'),
 			confirm: P.confirm(),
 		}),
-		gate: { keywords: WORDS.reaction },
+		gate: { keywords: WORDS.delete },
 		async handler(args, deps, { name }) {
 			const emoji = resolveReactionEmoji(deps, args.emoji);
 			if (emoji?.missing) return { ok: false, spoken: t('tools.reactions.emoji_not_found', { name: emoji.missing }) };
@@ -382,10 +386,19 @@ export const tools = [
 			channel: P.str('Channel name (empty = the default channel)'),
 			count: P.int('How many pins at most (1-50, default 10)'),
 		}),
-		async handler(args, deps) {
+		// A staff channel's pins, after other people's words were read in the same turn, wait for a yes.
+		asks: true,
+		async handler(args, deps, { name }) {
 			const found = resolveMessageChannel(deps, args.channel);
 			if (found.error) return { ok: false, spoken: found.error };
 			const { channel } = found;
+			// Pinned messages are the channel's messages, usually the ones that matter most: whoever asks has
+			// to be able to read the channel themselves, exactly as read_messages asks. This took any channel
+			// or thread the bot could see, #mod-chat included, for anybody at all.
+			const refusal = await readRefusal(deps, channel);
+			if (refusal) return refusal;
+			const asked = await askBeforePrivateRead(deps, channel, name);
+			if (asked) return asked;
 			if (!botHas(deps, channel, 'ReadMessageHistory')) {
 				return { ok: false, spoken: t('tools.reactions.need_read_history', { channel: channel.name }) };
 			}
@@ -432,10 +445,15 @@ export const tools = [
 			},
 			['question', 'answers'],
 		),
-		async handler(args, deps) {
+		// A poll is a message in the bot's name, eleven lines of text chosen by the model: after other
+		// people's words were read in the same turn it waits for the owner's yes, as send_message does.
+		asks: true,
+		async handler(args, deps, { name }) {
 			const found = resolveMessageChannel(deps, args.channel);
 			if (found.error) return { ok: false, spoken: found.error };
 			const { channel } = found;
+			const untrusted = askAfterUntrustedRead(deps, name);
+			if (untrusted) return untrusted;
 			const question = String(args.question ?? '').trim().slice(0, POLL_QUESTION_MAX);
 			if (!question) return { ok: false, spoken: t('tools.reactions.no_question') };
 			const given = (Array.isArray(args.answers) ? args.answers : []).map((answer) => String(answer ?? '').trim()).filter(Boolean);
