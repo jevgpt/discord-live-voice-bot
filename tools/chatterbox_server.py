@@ -1,6 +1,8 @@
-"""Chatterbox local TTS server -- binds to 127.0.0.1 only.
+"""Local voice server (Chatterbox, FreyaTTS, Pocket TTS + faster-whisper) -- binds to 127.0.0.1 only.
 
-The bot pulls raw PCM from this server and pushes it straight into Discord (no cloud TTS).
+The bot pulls raw PCM from this server and pushes it straight into Discord (no cloud TTS). Three speech
+engines sit behind it (tools/voice_engines.py): Chatterbox, FreyaTTS (Turkish) and Pocket TTS (English and
+five other European languages). A request may name one; a request that does not is routed by language.
 
 Loopback is reachable from every web page the machine's browser opens, so a request is refused when:
   - its Host header does not name the loopback address the server is bound to (DNS rebinding; the port
@@ -10,29 +12,38 @@ Loopback is reachable from every web page the machine's browser opens, so a requ
   - a token is set (--token or CHATTERBOX_TOKEN) and the X-Chatterbox-Token header does not match it.
 The bot starts the server with a fresh random token each time; one started by hand takes LOCAL_TTS_TOKEN.
 
-Setup (once):
-    python -m venv .venv-chatterbox
-    .venv-chatterbox/Scripts/python -m pip install chatterbox-tts
-    (for the GPU) .venv-chatterbox/Scripts/python -m pip install --force-reinstall torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+Setup (once): tools/setup-chatterbox.ps1 (Windows) or tools/setup-voice.sh (Linux, macOS) installs the
+engines it is given (-Engines / --engines) into .venv-chatterbox.
 
 Running:
     .venv-chatterbox/Scripts/python tools/chatterbox_server.py --port 8020 --model multilingual --device cuda
+    --tts-engine auto|chatterbox|freya|pocket   what a request that names no engine gets (auto: by language)
+    --engines chatterbox,freya,pocket           the engines this server may load (default: every installed one)
+    --preload all|none|tr,en                    what loads before the server reports ready (default: all)
 
 Endpoints:
-    GET  /health   -> {"ok":true,"model":"multilingual","sr":24000,"device":"cuda","voice":...,"stt":"small"|null}
+    GET  /health   -> {"ok":true,"status":"ready","model":"multilingual","sr":24000,"device":"cuda","voice":...,
+                       "stt":"small"|null,"error":null,"engine":"auto",
+                       "engines":{"freya":{"available":true,"enabled":true,"loaded":true,"device":"cuda",
+                                           "placement":"...","languages":["tr"],"cloning":false,
+                                           "sample_rate":48000,"error":null,"notes":"..."}, ...},
+                       "routing":{"tr":"freya","en":"pocket", ..., "*":"chatterbox"},
+                       "routing_voice":{... the same for a request with a voice to clone ...}}
     POST /stt      -> body: raw int16 PCM mono (x-sample-rate header, 16000 by default), ?language=tr (empty = auto-detect)
                       response: {"ok":true,"text":"...","language":"tr","duration":2.4}   (switched on with --stt <model>)
-    POST /tts      -> {"text":"...","voice_ref":"C:/path/ref.wav","language_id":"tr","exaggeration":0.5,"cfg_weight":0.5}
-                      response: raw int16 PCM (mono), x-sample-rate header
+    POST /tts      -> {"text":"...","language_id":"tr","engine":"auto","voice_ref":"C:/path/ref.wav",
+                       "exaggeration":0.5,"cfg_weight":0.5,"seed":7,"temperature":0.3,"steps":32}
+                      only text is required; a tuning field reaches the engines that take it and no other
+                      response: raw int16 PCM (mono), headers x-sample-rate, x-channels and x-engine
     POST /voice    -> {"voice_ref":"C:/path/ref.wav"}  (sets the default reference voice; an existing audio file)
     POST /shutdown -> shuts the server down
 
-Note: the model is downloaded from Hugging Face on the first run; every generated audio carries a Perth watermark.
+Note: the models are downloaded from Hugging Face on the first run; every audio Chatterbox generates
+carries a Perth watermark.
 """
 
 import argparse
 import contextlib
-import ctypes
 import faulthandler
 import hmac
 import inspect
@@ -47,15 +58,32 @@ import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import numpy as np
+# Run as a script, this folder is on the import path already; imported from elsewhere (the tests) it is not.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# numpy is imported where it is used: the request checks and the routing run without it (and are tested so).
+from voice_engines import AUDIO_EXTENSIONS  # noqa: E402,F401  (still importable from here)
+from voice_engines import (  # noqa: E402
+    CHATTERBOX_LANGUAGES,
+    ENGINE_NAMES,
+    Engine,
+    EngineUnavailable,
+    FreyaEngine,
+    PocketEngine,
+    VoiceEngines,
+    available_commit_gb,
+    checked_voice_ref,
+    parse_engine_list,
+    to_pcm16,
+)
 
 STATE = {
-    "model": None,
-    "kind": "multilingual",
+    "kind": "multilingual",  # the Chatterbox variant (--model)
     "sr": 24000,
-    "device": "cpu",
+    "device": "cpu",  # --device: the GPU the engines may use, each one only where its VRAM fits
     "voice_ref": None,
-    "lock": threading.Lock(),
+    "voices": None,  # the VoiceEngines main() builds
+    "status": "loading",  # loading -> ready, or error when no engine could be loaded
     "stop": threading.Event(),  # /shutdown ends the main loop too (so no zombie process is left behind)
     "stt": None,  # faster-whisper model (switched on with --stt)
     "stt_name": None,
@@ -67,8 +95,8 @@ MAX_STT_BYTES = 20 * 1024 * 1024  # ~10 min of 16 kHz int16
 
 TOKEN_HEADER = "X-Chatterbox-Token"
 LOOPBACK_NAMES = {"localhost", "127.0.0.1", "::1"}
-# What a reference voice can be: the model reads it as audio, so nothing else on the disk is accepted.
-AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".oga", ".opus", ".m4a", ".aac"}
+# AUDIO_EXTENSIONS and checked_voice_ref (what a reference voice may be) live in voice_engines.py now,
+# beside every engine that clones a voice.
 
 
 def is_loopback(host: str) -> bool:
@@ -117,19 +145,6 @@ def request_refusal(headers, allowed_hosts, token):
     return None
 
 
-def checked_voice_ref(value):
-    """A reference voice from a request: None for none, else the resolved path of an existing audio file.
-    Anything else raises ValueError, so a request cannot point the model at an arbitrary file."""
-    if value is None or value == "":
-        return None
-    if not isinstance(value, str):
-        raise ValueError("voice_ref must be a file path")
-    path = os.path.realpath(value)
-    if os.path.splitext(path)[1].lower() not in AUDIO_EXTENSIONS or not os.path.isfile(path):
-        raise ValueError(f"voice_ref must be an existing audio file ({', '.join(sorted(AUDIO_EXTENSIONS))})")
-    return path
-
-
 def _prepare_cuda_dlls():
     """On CUDA, ctranslate2 (faster-whisper) looks for the cuBLAS/cuDNN DLLs; pip's nvidia-* packages
     and the torch/lib folder are added to the DLL search path (Windows)."""
@@ -159,6 +174,7 @@ def load_stt(name: str, device: str):
     """Loads the faster-whisper model (float16 on CUDA, int8 on the CPU). When the CUDA libraries are
     missing it falls back to the CPU with a warning; a transcription is tried right here as well (a
     library error can surface only then)."""
+    import numpy as np
     from faster_whisper import WhisperModel
 
     if device == "cuda":
@@ -182,6 +198,8 @@ def load_stt(name: str, device: str):
 
 def transcribe(pcm_bytes: bytes, sample_rate: int, language, prompt=None):
     """Raw int16 PCM -> text. Resamples linearly when the rate is not 16 kHz."""
+    import numpy as np
+
     audio = np.frombuffer(pcm_bytes, dtype="<i2").astype(np.float32) / 32768.0
     if sample_rate != 16000 and len(audio) > 1:
         target = int(round(len(audio) * 16000 / sample_rate))
@@ -212,32 +230,6 @@ def _from_pretrained(cls, device: str, **extra):
 
 # Peak memory while the multilingual model loads on the CPU (~2 GB of random weights + 2.1 GB file + s3gen)
 NEEDED_COMMIT_GB = {"multilingual": 6.5, "english": 4.5, "turbo": 3.0, "nano": 2.0}
-
-
-def available_commit_gb():
-    """Windows: available commit (RAM + page file) and free RAM, in GB. None on every other system."""
-    if os.name != "nt":
-        return None
-    try:
-        class MemoryStatus(ctypes.Structure):
-            _fields_ = [
-                ("dwLength", ctypes.c_ulong),
-                ("dwMemoryLoad", ctypes.c_ulong),
-                ("ullTotalPhys", ctypes.c_ulonglong),
-                ("ullAvailPhys", ctypes.c_ulonglong),
-                ("ullTotalPageFile", ctypes.c_ulonglong),
-                ("ullAvailPageFile", ctypes.c_ulonglong),
-                ("ullTotalVirtual", ctypes.c_ulonglong),
-                ("ullAvailVirtual", ctypes.c_ulonglong),
-                ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
-            ]
-
-        status = MemoryStatus()
-        status.dwLength = ctypes.sizeof(MemoryStatus)
-        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
-        return status.ullAvailPageFile / 1e9, status.ullAvailPhys / 1e9
-    except Exception:
-        return None
 
 
 def memory_preflight(kind: str, device: str):
@@ -446,33 +438,72 @@ def accepted_params(model) -> set:
         return set()
 
 
-def synthesize(model, payload: dict) -> tuple[bytes, int]:
-    text = str(payload.get("text") or "").strip()
-    if not text:
-        raise ValueError("text is empty")
-    allowed = accepted_params(model)
-    kwargs = {}
-    voice_ref = checked_voice_ref(payload.get("voice_ref")) or STATE["voice_ref"]
-    if voice_ref:
-        kwargs["audio_prompt_path"] = voice_ref
-    if STATE["kind"] == "multilingual":
-        kwargs["language_id"] = str(payload.get("language_id") or "tr")
-    for key, cast in (("exaggeration", float), ("cfg_weight", float)):
-        if key in allowed or not allowed:
-            if payload.get(key) is not None:
-                kwargs[key] = cast(payload[key])
-    dropped = [key for key in kwargs if allowed and key not in allowed]
-    if dropped:
-        print(f"[chatterbox] this model does not support these parameters, they were skipped: {', '.join(dropped)}", flush=True)
-    kwargs = {key: value for key, value in kwargs.items() if not allowed or key in allowed}
+# What Chatterbox took from a request before there were other engines; with no signature to read, only
+# these go through, as they always did.
+CHATTERBOX_CLASSIC_OPTIONS = ("exaggeration", "cfg_weight")
 
-    with STATE["lock"]:  # a single model instance: queue the requests up
-        wav = model.generate(text, **kwargs)
-    import torch
 
-    samples = wav.squeeze(0).detach().to("cpu", dtype=torch.float32).clamp(-1.0, 1.0).numpy()
-    pcm = (samples * 32767.0).astype("<i2").tobytes()
-    return pcm, int(getattr(model, "sr", 24000))
+class ChatterboxEngine(Engine):
+    """Chatterbox behind the engine interface: the loading above (low-memory, streamed on CUDA), the
+    short-text alignment patch and generate(), as this server has always run them."""
+
+    name = "chatterbox"
+    supports_cloning = True
+    vram_gb = 4.0
+    options = frozenset({"exaggeration", "cfg_weight", "temperature", "top_p", "min_p", "repetition_penalty", "seed"})
+    modules = ("chatterbox", "torch")
+    notes = (
+        "Chatterbox: multilingual (Turkish included), clones a reference voice; autoregressive, so it can "
+        "ramble on a weak GPU; wants ~4 GB of VRAM"
+    )
+
+    def __init__(self, kind="multilingual"):
+        super().__init__()
+        self.kind = kind
+        self.model = None
+        self.languages = CHATTERBOX_LANGUAGES if kind == "multilingual" else ("en",)
+        self.ram_gb = NEEDED_COMMIT_GB.get(kind, 6.5)
+        self.patched = False
+
+    def speaks(self, language):
+        # The catch-all: every language the others do not have comes here, as every language did before
+        # there were others; the multilingual model says itself which ones it cannot do.
+        return True
+
+    def loaded(self, language=None):
+        return self.model is not None
+
+    def load(self, device, language=None):
+        memory_preflight(self.kind, device)
+        if not self.patched:
+            patch_alignment_analyzer()
+            self.patched = True
+        self.model = load_model(self.kind, device)
+        self.device = device
+        self.sample_rate = int(getattr(self.model, "sr", 24000))
+
+    def synthesize(self, text, language, voice, options):
+        allowed = accepted_params(self.model)
+        kwargs = {}
+        if voice:
+            kwargs["audio_prompt_path"] = voice
+        if self.kind == "multilingual":
+            kwargs["language_id"] = language
+        dropped = [key for key in kwargs if allowed and key not in allowed]
+        if dropped:
+            print(f"[chatterbox] this model does not support these parameters, they were skipped: {', '.join(dropped)}", flush=True)
+        kwargs = {key: value for key, value in kwargs.items() if not allowed or key in allowed}
+        # Tuning the model's generate() does not take is left out without a word: a request may carry
+        # fields meant for another engine.
+        for key, value in options.items():
+            if key != "seed" and (key in allowed if allowed else key in CHATTERBOX_CLASSIC_OPTIONS):
+                kwargs[key] = value
+        if "seed" in options:
+            import torch
+
+            torch.manual_seed(options["seed"])
+        wav = self.model.generate(text, **kwargs)
+        return to_pcm16(wav), int(getattr(self.model, "sr", self.sample_rate))
 
 
 class QuietServer(ThreadingHTTPServer):
@@ -612,17 +643,22 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.split("?")[0] != "/health":
             self._json(404, {"ok": False, "error": "not found"})
             return
+        voices = STATE["voices"]
+        # The fields a client of the single-model server read keep their meaning: ok/status say whether a
+        # line can be spoken, model is the Chatterbox variant, device the --device the engines may use.
+        # What each engine is doing, and where a line in each language goes, comes after them.
         self._json(
             200,
             {
-                "ok": STATE["model"] is not None,
-                "status": "ready" if STATE["model"] is not None else ("error" if STATE.get("load_error") else "loading"),
+                "ok": STATE["status"] == "ready",
+                "status": STATE["status"],
                 "model": STATE["kind"],
                 "sr": STATE["sr"],
                 "device": STATE["device"],
                 "voice": STATE["voice_ref"],
                 "stt": STATE["stt_name"] if STATE["stt"] is not None else None,
                 "error": (STATE.get("load_error") or "").splitlines()[-1] if STATE.get("load_error") else None,
+                **(voices.health() if voices is not None else {}),
             },
         )
 
@@ -666,35 +702,68 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"ok": False, "error": "not found"})
             return
 
-        if STATE["model"] is None:
+        if STATE["status"] != "ready" or STATE["voices"] is None:
             self._json(503, {"ok": False, "error": "the model is not loaded yet"})
             return
         try:
-            pcm, sr = synthesize(STATE["model"], payload)
-        except ValueError as err:  # client errors such as empty text
+            pcm, sr, engine = STATE["voices"].synthesize(payload, STATE["voice_ref"])
+        except ValueError as err:  # client errors such as empty text, a bad voice_ref or an unknown engine
             self._json(400, {"ok": False, "error": str(err)})
+            return
+        except EngineUnavailable as err:  # not installed, not enabled, failed to load: try again later
+            self._json(503, {"ok": False, "error": str(err)})
             return
         except Exception as err:  # return a meaningful error to the client
             traceback.print_exc()
             self._json(500, {"ok": False, "error": str(err)})
             return
+        STATE["sr"] = sr
         self.send_response(200)
         self.send_header("content-type", "application/octet-stream")
+        # Every engine has its own rate (Freya 48 kHz, the others 24 kHz): the client resamples by this.
         self.send_header("x-sample-rate", str(sr))
         self.send_header("x-channels", "1")
+        self.send_header("x-engine", engine)
         self.send_header("content-length", str(len(pcm)))
         self.end_headers()
         self._write(pcm)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Chatterbox local TTS server")
+def log(message):
+    print(f"[chatterbox] {message}", flush=True)
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Local voice server: Chatterbox, FreyaTTS, Pocket TTS and faster-whisper")
     parser.add_argument("--port", type=int, default=8020)
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--model", default="multilingual", choices=["multilingual", "turbo", "nano", "english"])
-    parser.add_argument("--device", default="cuda" if _cuda() else "cpu")
-    parser.add_argument("--voice", default=None, help="default reference voice (path to a wav)")
+    parser.add_argument(
+        "--model",
+        default="multilingual",
+        choices=["multilingual", "turbo", "nano", "english"],
+        help="the Chatterbox variant (the other engines have one model each)",
+    )
+    parser.add_argument("--device", default=None, help="cuda or cpu (default: cuda when torch sees a GPU); each engine goes on the GPU only if its VRAM fits")
+    parser.add_argument("--voice", default=None, help="default reference voice (path to an audio file), cloned by the engines that can")
     parser.add_argument("--stt", default=None, help="faster-whisper model (tiny/base/small/medium/large-v3); empty = STT off")
+    parser.add_argument(
+        "--tts-engine",
+        default="auto",
+        choices=["auto", *ENGINE_NAMES],
+        help="the engine a request that names none gets; auto routes by language (freya for Turkish, pocket for "
+        "en/fr/de/it/pt/es/nl, chatterbox for the rest and for a voice pocket cannot clone)",
+    )
+    parser.add_argument(
+        "--engines",
+        default=",".join(ENGINE_NAMES),
+        help="the engines this server may load, comma-separated (default: all of them; those not installed are skipped)",
+    )
+    parser.add_argument(
+        "--preload",
+        default="all",
+        help="what loads before the server reports ready: all (every enabled, installed engine), none, or "
+        "language codes such as tr,en (the engine each one is routed to); the rest loads on first use",
+    )
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument(
         "--token",
@@ -702,11 +771,37 @@ def main():
         help="require this value in the X-Chatterbox-Token header (default: $CHATTERBOX_TOKEN; the environment "
         "is the better place, a command line is visible to every account on the machine)",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    try:
+        args.engines = parse_engine_list(args.engines)
+    except ValueError as err:
+        parser.error(f"--engines: {err}")
+    if args.tts_engine != "auto" and args.tts_engine not in args.engines:
+        parser.error(f"--tts-engine {args.tts_engine} is not among --engines {','.join(args.engines)}")
+    if args.device is None:
+        args.device = "cuda" if _cuda() else "cpu"
+    return args
+
+
+def build_voices(args, **overrides):
+    """The engines of this server, as the arguments set them up (`overrides` are for the tests)."""
+    engines = [ChatterboxEngine(args.model), FreyaEngine(), PocketEngine()]
+    return VoiceEngines(engines, enabled=args.engines, default=args.tts_engine, device=args.device, log=log, **overrides)
+
+
+def main():
+    args = parse_args()
 
     STATE["kind"] = args.model
     STATE["device"] = args.device
-    STATE["voice_ref"] = args.voice
+    # The same check a /tts or /voice request gets: every engine that clones reads this file as audio.
+    try:
+        STATE["voice_ref"] = checked_voice_ref(args.voice)
+    except ValueError as err:
+        log(f"--voice is not used: {err}")
+    voices = build_voices(args)
+    STATE["voices"] = voices
+    STATE["status"] = "loading"
 
     # Open the port FIRST so the client can see the "loading" status (it answers while the model downloads).
     server = QuietServer((args.host, args.port), Handler)
@@ -725,18 +820,21 @@ def main():
         )
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    print(f"[chatterbox] loading model: {args.model} ({args.device}) — downloaded on the first run", flush=True)
-    memory_preflight(args.model, args.device)
-    patch_alignment_analyzer()
-    try:
-        STATE["model"] = load_model(args.model, args.device)
-    except Exception:
-        STATE["load_error"] = traceback.format_exc()
-        print(STATE["load_error"], flush=True)
+    log(f"engines: {voices.summary()}; a request that names none gets {args.tts_engine}")
+    log(f"preloading: {args.preload} (Chatterbox variant {args.model}, device {args.device})")
+    voices.preload(args.preload, cloning=STATE["voice_ref"] is not None)
+    if not any(voices.usable(name) for name in ENGINE_NAMES):
+        # Nothing can speak. The single-model server ended here, and so does this one: the bot counts the
+        # exit and starts it again, a bounded number of times.
+        STATE["load_error"] = f"no speech engine could be loaded ({voices.summary()}); install one with the setup script"
+        STATE["status"] = "error"
+        log(STATE["load_error"])
         server.shutdown()
-        raise
-    STATE["sr"] = int(getattr(STATE["model"], "sr", 24000))
-    print(f"[chatterbox] ready — sr={STATE['sr']} device={args.device}", flush=True)
+        server.server_close()
+        sys.exit(1)
+    STATE["sr"] = voices.sample_rate()
+    STATE["status"] = "ready"
+    log(f"ready — {voices.summary()}")
 
     if args.stt:
         print(f"[chatterbox] loading STT: faster-whisper {args.stt} ({args.device})", flush=True)

@@ -202,6 +202,8 @@ export default {
 	status_closed: 'kapalı',
 	status_voice_engine: 'Ses: {engine}{server}',
 	status_voice_engine_local: 'yerel (Chatterbox)',
+	// Once the speech server has said which engine speaks each language, e.g. "tr freya, en pocket".
+	status_voice_engine_local_voices: 'yerel ({voices})',
 	status_chatterbox_server: ' · Chatterbox sunucusu: {url}',
 	status_character: 'Karakter: {character}',
 	status_character_default: 'varsayılan',

@@ -7,7 +7,7 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
-import { LocalServerManager, SPEECH_TOKEN_HEADER, detectVenvPython, setSpeechToken, speechHeaders } from '../../src/localserver.js';
+import { LocalServerManager, SPEECH_TOKEN_HEADER, detectVenvPython, setSpeechToken, speechHeaders, speechServerArgs } from '../../src/localserver.js';
 import { LocalStt } from '../../src/localstt.js';
 import { LocalTts } from '../../src/localtts.js';
 
@@ -70,6 +70,39 @@ describe('LocalServerManager', () => {
 		assert.equal(manager.ensureRunning(), false);
 		assert.ok(manager.status.includes('no virtual environment'), manager.status);
 		assert.equal(detectVenvPython(path.join(os.tmpdir(), 'no-such-directory')), null);
+	});
+});
+
+describe('the speech server command line', () => {
+	const base = { port: 8020, model: 'multilingual', stt: 'small' };
+
+	it('passes the engine settings on, and preloads the engine for the language the bot speaks', () => {
+		assert.deepEqual(speechServerArgs({ ...base, language: 'tr' }), [
+			'--port', '8020', '--model', 'multilingual', '--stt', 'small', '--tts-engine', 'auto', '--preload', 'tr',
+		]);
+		assert.deepEqual(
+			speechServerArgs({ ...base, model: 'turbo', engine: 'freya', engines: ['freya', 'pocket'], language: 'tr', voice: 'data/owner.wav' }),
+			['--port', '8020', '--model', 'turbo', '--stt', 'small', '--tts-engine', 'freya', '--engines', 'freya,pocket', '--preload', 'tr', '--voice', 'data/owner.wav'],
+		);
+	});
+
+	it('loads every engine up front when the language is guessed line by line', () => {
+		const args = speechServerArgs({ ...base, language: 'auto' });
+		assert.equal(args[args.indexOf('--preload') + 1], 'all');
+		assert.equal(args.includes('--engines'), false, 'no list: the server may load every installed engine');
+		assert.equal(args.includes('--voice'), false);
+	});
+
+	it('the launch carries them, and still no token on the command line', () => {
+		const fake = fakeSpawn();
+		const args = speechServerArgs({ ...base, engine: 'pocket', engines: ['pocket'], language: 'en' });
+		const manager = new LocalServerManager({ ...venv(), args, log: () => {}, spawnImpl: fake.spawn });
+		try {
+			manager.ensureRunning();
+			assert.deepEqual(fake.calls[0].args.slice(2), args);
+		} finally {
+			setSpeechToken(null);
+		}
 	});
 });
 
@@ -243,6 +276,67 @@ describe('speech server token', () => {
 	});
 });
 
+describe('LocalTts: the engine each line asks for and the one that answered', () => {
+	/** A speech server that routes like the real one: Turkish to freya at 48 kHz, the rest to pocket. */
+	async function withRoutingServer(run, { engineHeader = true } = {}) {
+		const bodies = [];
+		const original = globalThis.fetch;
+		globalThis.fetch = async (url, options = {}) => {
+			if (url.endsWith('/health')) {
+				return Response.json({ ok: true, model: 'multilingual', sr: 24_000, engine: 'auto', routing: { tr: 'freya', en: 'pocket', '*': 'chatterbox' } });
+			}
+			const body = JSON.parse(options.body);
+			bodies.push(body);
+			const engine = body.engine ?? (body.language_id === 'tr' ? 'freya' : 'pocket');
+			const rate = engine === 'freya' ? 48_000 : 24_000;
+			// Two seconds of silence, a plausible length for one of these lines.
+			return new Response(Buffer.alloc(rate * 2 * 2), { headers: { 'x-sample-rate': String(rate), ...(engineHeader ? { 'x-engine': engine } : {}) } });
+		};
+		try {
+			await run(bodies);
+		} finally {
+			globalThis.fetch = original;
+		}
+	}
+
+	it('auto names no engine, lets the server route, and records who answered each language', async () => {
+		await withRoutingServer(async (bodies) => {
+			const tts = new LocalTts({ url: 'http://127.0.0.1:8020', languageId: 'auto' });
+			assert.equal(tts.engine, 'auto');
+			const turkish = await tts.speak('Merhaba, bu bir deneme ve çok güzel.');
+			const english = await tts.speak('Hello there, this is a test and it is fine.');
+			assert.deepEqual(bodies.map((body) => [body.language_id, 'engine' in body]), [['tr', false], ['en', false]]);
+			assert.equal(turkish.engine, 'freya');
+			assert.equal(turkish.pcm.length, 48_000, 'the 48 kHz answer is resampled to the 24 kHz Discord path by its header');
+			assert.equal(english.engine, 'pocket');
+			assert.deepEqual([...tts.engines], [['tr', 'freya'], ['en', 'pocket']]);
+		});
+	});
+
+	it('a named engine goes with every line', async () => {
+		await withRoutingServer(async (bodies) => {
+			const tts = new LocalTts({ url: 'http://127.0.0.1:8020', languageId: 'tr', engine: 'chatterbox', voiceRef: 'owner.wav' });
+			const result = await tts.speak('Merhaba.');
+			assert.deepEqual(bodies[0], { text: 'Merhaba.', language_id: 'tr', engine: 'chatterbox', voice_ref: 'owner.wav' });
+			assert.equal(result.engine, 'chatterbox');
+		});
+	});
+
+	it('keeps the routing /health reports, and works with a server that sends no x-engine', async () => {
+		await withRoutingServer(
+			async () => {
+				const tts = new LocalTts({ url: 'http://127.0.0.1:8020', languageId: 'en' });
+				await tts.health();
+				assert.deepEqual(tts.routing, { tr: 'freya', en: 'pocket', '*': 'chatterbox' });
+				const result = await tts.speak('Hello.');
+				assert.equal(result.engine, null);
+				assert.equal(tts.engines.size, 0);
+			},
+			{ engineHeader: false },
+		);
+	});
+});
+
 // The server's request checks, run by the Python that is on the machine. The file imports numpy and the
 // model libraries at the top, so only the pure functions are lifted out of it and run on their own.
 const HOST_CHECK = `
@@ -303,5 +397,23 @@ describe('tools/chatterbox_server.py: the Host check', () => {
 			'127.0.0.1:1234': null,
 			'[::2]:8020': 'host not allowed',
 		});
+	});
+});
+
+// The engines, the routing and the HTTP protocol of the speech server have a suite of their own in
+// Python (fakes only, no torch). It runs here with the Python on the machine, and is skipped without one.
+describe('tools/test_voice_server.py', () => {
+	it('passes: routing, placement, loading, the protocol and every refusal', (t) => {
+		const interpreter = python();
+		if (!interpreter) return t.skip('no Python 3 on this machine');
+		const root = fileURLToPath(new URL('../..', import.meta.url));
+		const run = spawnSync(interpreter, ['-m', 'unittest', 'tools/test_voice_server.py'], {
+			cwd: root,
+			encoding: 'utf8',
+			timeout: 120_000,
+			env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' },
+		});
+		assert.equal(run.status, 0, `${run.stdout}\n${run.stderr}`);
+		assert.match(run.stderr, /\nOK/u);
 	});
 });

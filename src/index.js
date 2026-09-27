@@ -24,7 +24,7 @@ import { maskSecret, updateEnvFile } from './envfile.js';
 import { GuildSession } from './guildsession.js';
 import { t, tList } from './i18n/index.js';
 import { liveSlotsTaken, offerLiveSlots } from './liveslots.js';
-import { LocalServerManager, detectVenvPython, setSpeechToken } from './localserver.js';
+import { LocalServerManager, detectVenvPython, setSpeechToken, speechServerArgs } from './localserver.js';
 import { LocalStt } from './localstt.js';
 import { MemoryStore } from './memory.js';
 import { BotChain, ReplyLimiter, handleMessage, messageText, shouldReply } from './messages.js';
@@ -40,6 +40,7 @@ import { CharacterStore } from './store.js';
 import { summarizeConversation } from './summary.js';
 import { callTool, toolDefinitions } from './tools.js';
 import { roomMayRead } from './tools/access.js';
+import { panelVoices } from './ttsengines.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = path.join(here, '..', 'data');
@@ -121,7 +122,15 @@ const localServer = cfg.localTtsAutostart
 	? new LocalServerManager({
 			python: cfg.localTtsPython ?? detectVenvPython(path.join(here, '..')),
 			script: path.join(here, '..', 'tools', 'chatterbox_server.py'),
-			args: ['--port', String(safePort(cfg.localTtsUrl, 8020)), '--model', cfg.localTtsModel, '--stt', cfg.localSttModel],
+			args: speechServerArgs({
+				port: safePort(cfg.localTtsUrl, 8020),
+				model: cfg.localTtsModel,
+				stt: cfg.localSttModel,
+				engine: cfg.localTtsEngine,
+				engines: cfg.localTtsEngines,
+				language: cfg.localTtsLang,
+				voice: cfg.localTtsVoice,
+			}),
 			token: cfg.localTtsToken,
 			// The token of the last launch, for the next start: a server outlives a bot that is killed outright.
 			tokenFile: path.join(dataDir, 'chatterbox.token'),
@@ -311,6 +320,7 @@ const EMPTY_STATUS = {
 	latency: { count: 0, responseP50: null, responseP90: null, delegationP50: null, toolP50: null, text: '' },
 	memberIndexSize: 0,
 	music: null,
+	voices: {},
 };
 
 /** One server on the panel's status line: its name, the voice channel it sits in and its brain. */
@@ -813,7 +823,12 @@ client.once(Events.ClientReady, async () => {
 		if (localServer) {
 			log(
 				localServer.python
-					? t('boot.chatterbox_autostart', { model: cfg.localTtsModel, stt: cfg.localSttModel })
+					? t('boot.chatterbox_autostart', {
+							engine: cfg.localTtsEngine,
+							engines: cfg.localTtsEngines.length ? cfg.localTtsEngines.join(', ') : t('boot.tts_engines_installed'),
+							model: cfg.localTtsModel,
+							stt: cfg.localSttModel,
+						})
 					: t('boot.chatterbox_missing_venv'),
 			);
 		}
@@ -863,6 +878,7 @@ client.once(Events.ClientReady, async () => {
 											channel: snapshot.voiceConnected ? `#${snapshot.voiceChannelName ?? '?'}` : t('runtime.panel_off'),
 										}) + t('runtime.panel_status_brain', { brain: snapshot.brain === 'local' ? t('runtime.panel_local') : 'GPT-Live' })) +
 								(localServer ? t('runtime.panel_status_chatterbox', { status: localServer.status }) : '') +
+								panelVoices(snapshot) +
 								t('runtime.panel_status_live', {
 									state: snapshots.some((entry) => entry.liveReady) ? t('runtime.panel_on') : t('runtime.panel_off'),
 								}) +
@@ -947,6 +963,8 @@ client.once(Events.ClientReady, async () => {
 							voice: snapshot.voiceConnected,
 							brain: snapshot.brain,
 							chatterbox: localServer?.status ?? null,
+							// Which local engine speaks each language: { tr: 'freya', en: 'pocket' }.
+							voices: snapshot.voices ?? {},
 							live: snapshot.liveReady,
 							paused: snapshot.paused,
 							quotaExceeded: quota.status().exceeded,

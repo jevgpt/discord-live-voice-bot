@@ -225,6 +225,7 @@ export class GuildSession {
 			url: cfg.localTtsUrl,
 			voiceRef: cfg.localTtsVoice,
 			languageId: cfg.localTtsLang,
+			engine: cfg.localTtsEngine,
 			log: (message) => cfg.debug && log(message),
 		});
 		this.localMode = cfg.localTtsOn;
@@ -912,6 +913,8 @@ export class GuildSession {
 			music: this.music
 				? { playing: this.music.playing, queue: this.music.queue.length, text: this.music.nowPlayingText(), volume: this.music.volume }
 				: null,
+			// Which local engine speaks each language (see voicesByLanguage).
+			voices: this.localVoices(),
 		};
 	}
 

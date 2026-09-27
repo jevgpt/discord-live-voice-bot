@@ -1,4 +1,5 @@
-// The bot itself starts and stops the Chatterbox (TTS + whisper STT) server.
+// The bot itself starts and stops the local speech server: Chatterbox, FreyaTTS and Pocket TTS for the
+// voice, whisper for the ears (file and log prefix keep the name from when Chatterbox was all it ran).
 // When it has to switch to the local brain and the server is not up, tools/chatterbox_server.py is
 // run with the Python inside .venv-chatterbox; its output lands in the bot log as "[chatterbox] …".
 //
@@ -30,6 +31,22 @@ export function detectVenvPython(root) {
 			? [path.join(root, '.venv-chatterbox', 'Scripts', 'python.exe')]
 			: [path.join(root, '.venv-chatterbox', 'bin', 'python3'), path.join(root, '.venv-chatterbox', 'bin', 'python')];
 	return candidates.find((candidate) => existsSync(candidate)) ?? null;
+}
+
+/**
+ * The command line the bot starts the speech server with. Besides the port, the Chatterbox variant and
+ * whisper, it says which engine a line gets (LOCAL_TTS_ENGINE; auto lets the server route by language),
+ * which engines the server may load (LOCAL_TTS_ENGINES; left out, every installed one), and what it loads
+ * before it reports ready: the engine for the language the bot speaks, or with LOCAL_TTS_LANG=auto,
+ * which can pick any of them, every one. A voice to clone goes along too, so that what is loaded first
+ * is the engine that clones it rather than one that will be passed over on the first line.
+ */
+export function speechServerArgs({ port, model, stt, engine = 'auto', engines = [], language = 'auto', voice = null }) {
+	const args = ['--port', String(port), '--model', model, '--stt', stt, '--tts-engine', engine];
+	if (engines.length) args.push('--engines', engines.join(','));
+	args.push('--preload', !language || language === 'auto' ? 'all' : language);
+	if (voice) args.push('--voice', voice);
+	return args;
 }
 
 /** The header the speech server reads its token from (tools/chatterbox_server.py). */

@@ -37,6 +37,7 @@ import { t, tRaw } from './i18n/index.js';
 import enCommands from './locales/en/commands.js';
 import trCommands from './locales/tr/commands.js';
 import { findCharacter, findChannelByName, normalize, parseClock, stripDictationTail } from './text.js';
+import { describeVoices } from './ttsengines.js';
 import { VOICES } from './voices.js';
 
 export { VOICES, findCharacter, findChannelByName, normalize, stripDictationTail };
@@ -571,6 +572,8 @@ async function handleCommand(interaction, ctx) {
 			const active = ctx.store.getActive();
 			const live = ctx.getLive();
 			const stats = ctx.latency?.summary?.();
+			// Which local engine speaks each language in this server (its snapshot comes first).
+			const voices = describeVoices(ctx.sessions?.()?.[0]?.voices);
 			const lines = [
 				t('commands.status_voice', {
 					channel: ctx.voice.connected ? `<#${ctx.voice.channelId}>` : t('commands.status_voice_none'),
@@ -578,7 +581,11 @@ async function handleCommand(interaction, ctx) {
 				t('commands.status_brain', { brain: ctx.brain?.() === 'local' ? t('commands.status_brain_local') : 'GPT-Live' }),
 				t('commands.status_live', { state: live?.ready ? t('commands.status_open') : t('commands.status_closed') }),
 				t('commands.status_voice_engine', {
-					engine: ctx.localMode?.() ? t('commands.status_voice_engine_local') : 'GPT-Live',
+					engine: ctx.localMode?.()
+						? voices
+							? t('commands.status_voice_engine_local_voices', { voices })
+							: t('commands.status_voice_engine_local')
+						: 'GPT-Live',
 					server: ctx.chatterbox?.() ? t('commands.status_chatterbox_server', { url: ctx.chatterbox() }) : '',
 				}),
 				t('commands.status_character', { character: active ? `**${active.name}**` : t('commands.status_character_default') }),

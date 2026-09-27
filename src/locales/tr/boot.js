@@ -33,8 +33,12 @@ export default {
 	brain_auto: 'Beyin: GPT-Live; kredi/anahtar hatasında yerel beyne (whisper + DeepSeek + Chatterbox) düşer.',
 	brain_live: 'Beyin: yalnızca GPT-Live.',
 
-	chatterbox_autostart: 'Chatterbox sunucusu gerekince bot tarafından başlatılacak ({model}, whisper {stt}).',
-	chatterbox_missing_venv: 'Chatterbox sanal ortamı bulunamadı (.venv-chatterbox); yerel ses için tools/setup-chatterbox.ps1.',
+	chatterbox_autostart:
+		'Ses sunucusu gerekince bot tarafından başlatılacak (motor {engine}, seçilebilenler: {engines}; Chatterbox {model}, whisper {stt}).',
+	// {engines} above while LOCAL_TTS_ENGINES is empty.
+	tts_engines_installed: 'kurulu olanların hepsi',
+	chatterbox_missing_venv:
+		'Yerel ses sanal ortamı bulunamadı (.venv-chatterbox); yerel ses için tools/setup-chatterbox.ps1 (Windows) ya da tools/setup-voice.sh (Linux, macOS) çalıştır.',
 
 	daily_quota: 'Günlük GPT-Live kotası: {limit} dk (bugün {used} dk kullanıldı).',
 	record_off: 'Kayıt KAPALI: ses dökümleri ve mesaj metinleri panel günlüğüne yazılmıyor.',

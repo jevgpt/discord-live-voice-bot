@@ -59,7 +59,9 @@ export default {
 	local_brain_hint_manual: 'tools\\run-chatterbox.cmd ile başlat',
 	local_brain_not_yet: 'Yerel beyne henüz geçilemedi ({reason}): {problems} — {hint}',
 	local_brain_failed: 'Yerel beyne geçilemedi: {problems}',
-	local_brain_active: 'Yerel beyin devrede ({reason}): kulak whisper ({stt}), beyin {brain}, ağız Chatterbox ({tts}).',
+	local_brain_active: 'Yerel beyin devrede ({reason}): kulak whisper ({stt}), beyin {brain}, ağız {tts}.',
+	// {tts} above before the speech server has said which engine speaks which language.
+	local_brain_mouth_default: 'Chatterbox ({model})',
 	chatterbox_started: 'Chatterbox sunucusu bot tarafından başlatıldı',
 	local_brain_gave_up: 'Yerel beyin: Chatterbox 10 dk içinde hazır olmadı; vazgeçildi (sunucu logunu kontrol et).',
 	local_brain_off_log: 'Yerel beyin kapandı ({reason}); GPT-Live kullanılıyor.',
@@ -256,7 +258,7 @@ export default {
 	local_tts_status_unknown: 'bilinmiyor',
 	local_tts_status_loading: 'yükleniyor',
 	local_tts_not_ready: 'Yerel ses sunucusu henüz hazır değil ({status}).',
-	local_tts_on_log: 'Yerel ses modu AÇIK — model {model} ({device}), {rate} Hz.',
+	local_tts_on_log: 'Yerel ses modu AÇIK — sesler: {voices}; Chatterbox modeli {model} ({device}), {rate} Hz.',
 	local_tts_off_log: 'Yerel ses modu kapandı; GPT-Live sesi kullanılıyor.',
 	local_tts_mode_on: 'Yerel ses modu açıldı',
 	local_tts_mode_off: 'Yerel ses modu kapandı',
@@ -321,6 +323,8 @@ export default {
 	panel_status_guild: '{guild}: {channel} · {brain}',
 	panel_status_guild_silent: ' (sessiz: {reason})',
 	panel_status_chatterbox: ' · Chatterbox: {status}',
+	// Which engine speaks each language, e.g. "tr freya, en pocket".
+	panel_status_voices: ' · Sesler: {voices}',
 	panel_status_live: ' · GPT-Live: {state}',
 	panel_status_record: ' · Kayıt: {state}',
 	panel_status_events: ' · {count} olay',

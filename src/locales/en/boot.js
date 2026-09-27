@@ -33,8 +33,12 @@ export default {
 	brain_auto: 'Brain: GPT-Live; falls back to the local brain (whisper + DeepSeek + Chatterbox) on a credit/key error.',
 	brain_live: 'Brain: GPT-Live only.',
 
-	chatterbox_autostart: 'The Chatterbox server will be started by the bot when it is needed ({model}, whisper {stt}).',
-	chatterbox_missing_venv: 'The Chatterbox virtual environment was not found (.venv-chatterbox); for local speech run tools/setup-chatterbox.ps1.',
+	chatterbox_autostart:
+		'The speech server will be started by the bot when it is needed (engine {engine}, from {engines}; Chatterbox {model}, whisper {stt}).',
+	// {engines} above while LOCAL_TTS_ENGINES is empty.
+	tts_engines_installed: 'every installed one',
+	chatterbox_missing_venv:
+		'The local speech virtual environment was not found (.venv-chatterbox); for local speech run tools/setup-chatterbox.ps1 (Windows) or tools/setup-voice.sh (Linux, macOS).',
 
 	daily_quota: 'Daily GPT-Live quota: {limit} min ({used} min used today).',
 	record_off: 'Recording is OFF: voice transcripts and message texts are not written to the panel log.',

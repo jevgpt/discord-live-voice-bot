@@ -140,6 +140,76 @@ describe('config.js: fixed choices', () => {
 	});
 });
 
+describe('config.js: local speech engines', () => {
+	/** The warnings that start with `key=` or `key:`, so LOCAL_TTS_ENGINE is not found in LOCAL_TTS_ENGINES. */
+	const about = (cfg, key) => cfg.warnings.filter((line) => line.startsWith(`${key}=`) || line.startsWith(`${key}:`));
+
+	it('lets the server route by language unless an engine is named, and may load every installed one', () => {
+		const cfg = loadConfig(baseEnv);
+		assert.equal(cfg.localTtsEngine, 'auto');
+		assert.deepEqual(cfg.localTtsEngines, []);
+		assert.equal(cfg.localTtsModel, 'multilingual', 'the Chatterbox variant is read as it always was');
+		assert.deepEqual(cfg.warnings, []);
+		const fixed = loadConfig({ ...baseEnv, LOCAL_TTS_ENGINE: 'Freya', LOCAL_TTS_LANG: 'tr', LOCAL_TTS_ENGINES: 'pocket, FREYA', LOCAL_TTS_MODEL: 'turbo' });
+		assert.equal(fixed.localTtsEngine, 'freya');
+		assert.deepEqual(fixed.localTtsEngines, ['freya', 'pocket'], 'in the order the server knows them');
+		assert.equal(fixed.localTtsModel, 'turbo');
+		assert.deepEqual(fixed.warnings, []);
+		assert.deepEqual(loadConfig({ ...baseEnv, LOCAL_TTS_ENGINES: 'all' }).localTtsEngines, []);
+	});
+
+	it('reports an engine that is not one, in either variable', () => {
+		const wrong = loadConfig({ ...baseEnv, LOCAL_TTS_ENGINE: 'espeak', LOCAL_TTS_ENGINES: 'freya, piper' });
+		assert.equal(wrong.localTtsEngine, 'auto');
+		assert.deepEqual(wrong.localTtsEngines, ['freya']);
+		assert.equal(about(wrong, 'LOCAL_TTS_ENGINE').length, 1);
+		assert.match(about(wrong, 'LOCAL_TTS_ENGINE')[0], /espeak.*auto, chatterbox, freya, pocket/);
+		assert.equal(about(wrong, 'LOCAL_TTS_ENGINES').length, 1);
+		assert.match(about(wrong, 'LOCAL_TTS_ENGINES')[0], /"piper" is not a speech engine \(chatterbox, freya, pocket\)/);
+	});
+
+	it('adds a named engine LOCAL_TTS_ENGINES would keep the server from loading, and says so under its own name', () => {
+		const cfg = loadConfig({ ...baseEnv, LOCAL_TTS_ENGINE: 'pocket', LOCAL_TTS_ENGINES: 'freya' });
+		assert.deepEqual(cfg.localTtsEngines, ['freya', 'pocket']);
+		assert.equal(about(cfg, 'LOCAL_TTS_ENGINES').length, 0);
+		assert.match(about(cfg, 'LOCAL_TTS_ENGINE')[0], /^LOCAL_TTS_ENGINE=pocket is not in LOCAL_TTS_ENGINES \(freya\)/);
+		assert.deepEqual(loadConfig({ ...baseEnv, LOCAL_TTS_ENGINE: 'freya', LOCAL_TTS_ENGINES: 'freya', LOCAL_TTS_LANG: 'tr' }).warnings, []);
+		// The same word in both variables: a warning about the engine still names LOCAL_TTS_ENGINE.
+		const same = loadConfig({ ...baseEnv, LOCAL_TTS_ENGINE: 'freya', LOCAL_TTS_ENGINES: 'freya', LOCAL_TTS_LANG: 'en' });
+		assert.equal(same.warnings.length, 1);
+		assert.match(same.warnings[0], /^LOCAL_TTS_ENGINE=freya does not speak en/);
+	});
+
+	it('warns when a named engine does not speak what LOCAL_TTS_LANG asks for', () => {
+		const english = loadConfig({ ...baseEnv, LOCAL_TTS_ENGINE: 'freya', LOCAL_TTS_LANG: 'en' });
+		assert.match(about(english, 'LOCAL_TTS_ENGINE')[0], /does not speak en, which LOCAL_TTS_LANG=en/);
+		const guessed = loadConfig({ ...baseEnv, LOCAL_TTS_ENGINE: 'pocket', LOCAL_TTS_LANG: 'auto' });
+		assert.match(about(guessed, 'LOCAL_TTS_ENGINE')[0], /does not speak tr, ru, which LOCAL_TTS_LANG=auto/);
+		for (const quiet of [
+			{ LOCAL_TTS_ENGINE: 'pocket', LOCAL_TTS_LANG: 'pt-BR' },
+			{ LOCAL_TTS_ENGINE: 'chatterbox', LOCAL_TTS_LANG: 'auto' },
+			{ LOCAL_TTS_ENGINE: 'auto', LOCAL_TTS_LANG: 'ja' },
+			{ BOT_LANGUAGE: 'tr', LOCAL_TTS_ENGINE: 'freya' },
+		]) {
+			assert.deepEqual(loadConfig({ ...baseEnv, ...quiet }).warnings, [], JSON.stringify(quiet));
+		}
+	});
+
+	it('writes these warnings in the active language', () => {
+		inEveryLocale((code) => {
+			const cfg = loadConfig({ ...baseEnv, LOCAL_TTS_ENGINE: 'freya', LOCAL_TTS_LANG: 'en', LOCAL_TTS_ENGINES: 'pocket,piper' });
+			assert.equal(cfg.warnings.length, 3, `${code}: ${cfg.warnings.join(' | ')}`);
+			assert.ok(cfg.warnings.every((line) => !line.includes('config.')), `${code}: a key was not found`);
+		});
+		setLocale('tr');
+		try {
+			assert.match(loadConfig({ ...baseEnv, LOCAL_TTS_ENGINES: 'piper' }).warnings[0], /bir ses motoru değil/);
+		} finally {
+			setLocale('en');
+		}
+	});
+});
+
 describe('config.js: numbers', () => {
 	it('moves a number into its range and reports the edge it used', () => {
 		const cfg = loadConfig({ ...baseEnv, MUSIC_VOLUME: '250', MAX_LIVE_SESSIONS: '0', PANEL_PORT: '70000' });

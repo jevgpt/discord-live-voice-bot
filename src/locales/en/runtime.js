@@ -59,7 +59,9 @@ export default {
 	local_brain_hint_manual: 'start it with tools\\run-chatterbox.cmd',
 	local_brain_not_yet: 'Could not switch to the local brain yet ({reason}): {problems} — {hint}',
 	local_brain_failed: 'Could not switch to the local brain: {problems}',
-	local_brain_active: 'Local brain engaged ({reason}): ears whisper ({stt}), brain {brain}, mouth Chatterbox ({tts}).',
+	local_brain_active: 'Local brain engaged ({reason}): ears whisper ({stt}), brain {brain}, mouth {tts}.',
+	// {tts} above before the speech server has said which engine speaks which language.
+	local_brain_mouth_default: 'Chatterbox ({model})',
 	chatterbox_started: 'The Chatterbox server was started by the bot',
 	local_brain_gave_up: 'Local brain: Chatterbox did not become ready within 10 min; gave up (check the server log).',
 	local_brain_off_log: 'The local brain is off ({reason}); GPT-Live is in use.',
@@ -246,7 +248,7 @@ export default {
 	local_tts_status_unknown: 'unknown',
 	local_tts_status_loading: 'loading',
 	local_tts_not_ready: 'The local voice server is not ready yet ({status}).',
-	local_tts_on_log: 'Local voice mode ON — model {model} ({device}), {rate} Hz.',
+	local_tts_on_log: 'Local voice mode ON — voices: {voices}; Chatterbox model {model} ({device}), {rate} Hz.',
 	local_tts_off_log: 'Local voice mode is off; the GPT-Live voice is in use.',
 	local_tts_mode_on: 'Local voice mode on',
 	local_tts_mode_off: 'Local voice mode off',
@@ -311,6 +313,8 @@ export default {
 	panel_status_guild: '{guild}: {channel} · {brain}',
 	panel_status_guild_silent: ' (silent: {reason})',
 	panel_status_chatterbox: ' · Chatterbox: {status}',
+	// Which engine speaks each language, e.g. "tr freya, en pocket".
+	panel_status_voices: ' · Voices: {voices}',
 	panel_status_live: ' · GPT-Live: {state}',
 	panel_status_record: ' · Recording: {state}',
 	panel_status_events: ' · {count} events',

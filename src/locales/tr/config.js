@@ -21,6 +21,12 @@ export default {
 	warn_target_pair: '{key}: "{entry}" bir sunucuId:kanalId çifti değil, atlanıyor.',
 	warn_target_repeat: '{key}: {guild} sunucusu zaten {channel} kanalıyla listede; "{entry}" atlanıyor.',
 	warn_language: 'BOT_LANGUAGE={value} desteklenen dillerden biri değil ({supported}); {fallback} kullanılıyor.',
+	// Local speech engines (LOCAL_TTS_ENGINE, LOCAL_TTS_ENGINES).
+	warn_tts_engines: '{key}: "{value}" bir ses motoru değil ({choices}), listeden çıkarıldı.',
+	warn_tts_engine_not_listed:
+		'{key}={value}, LOCAL_TTS_ENGINES listesinde yok ({engines}); ses sunucusu onu başka türlü yükleyemeyeceği için listeye eklendi.',
+	warn_tts_engine_language:
+		'{key}={value} şu dilleri konuşmuyor: {languages}; LOCAL_TTS_LANG={lang} bunları isteyebilir, o cümleler seslendirilmez. LOCAL_TTS_ENGINE=auto her dili onu konuşan bir motora verir.',
 	// Printed once at start while BOT_LANGUAGE and at least one of the two keys are unset. {fix} is the
 	// line to add, e.g. "LOCAL_TTS_LANG=tr LOCAL_STT_LANG=tr".
 	note_language_defaults:

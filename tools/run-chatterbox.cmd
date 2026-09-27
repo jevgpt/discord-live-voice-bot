@@ -1,6 +1,8 @@
 @echo off
-rem Chatterbox local TTS server (uses the venv python). Device is auto-detected (cuda if available).
-rem Usage: tools\run-chatterbox.cmd [extra args]   (e.g. --device cpu, --port 8021, --stt medium)
+rem Local voice server: Chatterbox, FreyaTTS, Pocket TTS and whisper (uses the venv python). Device is
+rem auto-detected (cuda if available); each engine goes on the GPU only if its VRAM fits, else the CPU.
+rem Usage: tools\run-chatterbox.cmd [extra args]   (e.g. --device cpu, --port 8021, --stt medium,
+rem        --engines freya,pocket, --tts-engine freya, --preload tr)
 set PYTHONIOENCODING=utf-8
 set PYTHONUTF8=1
 if not exist "%~dp0..\.venv-chatterbox\Scripts\python.exe" (

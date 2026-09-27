@@ -4,6 +4,7 @@
 
 import { FALLBACK_LOCALE, SUPPORTED_LOCALES, resolveLocale, t, tList } from './i18n/index.js';
 import { normalize } from './text.js';
+import { DETECTED_LANGUAGES, TTS_ENGINES, TTS_ENGINE_CHOICES, unspokenLanguages } from './ttsengines.js';
 
 /** Fallback persona of the assistant: the lines are joined with spaces, exactly as they were written. */
 function DEFAULT_INSTRUCTIONS() {
@@ -136,6 +137,40 @@ function ids(value) {
 		if (!SNOWFLAKE.test(entry)) report(value, 'config.warn_snowflake', { value: entry });
 	}
 	return entries;
+}
+
+/**
+ * The speech engines the server the bot starts may load, in the order TTS_ENGINES lists them. Empty (or
+ * "all") means every one that is installed; an entry that is not an engine is reported and left out.
+ */
+function ttsEngines(value) {
+	const entries = list(value).map((entry) => entry.toLowerCase());
+	if (entries.length === 1 && entries[0] === 'all') return [];
+	for (const entry of entries) {
+		if (!TTS_ENGINES.includes(entry)) report(value, 'config.warn_tts_engines', { value: entry, choices: TTS_ENGINES.join(', ') });
+	}
+	return TTS_ENGINES.filter((engine) => entries.includes(engine));
+}
+
+/**
+ * A fixed LOCAL_TTS_ENGINE against the rest of the local speech settings. The server takes a named
+ * engine as named and refuses a line it cannot speak, so both mistakes are reported at start instead of
+ * as a voice that stays silent: an engine LOCAL_TTS_ENGINES keeps the server from loading (it is added),
+ * and an engine that does not speak what LOCAL_TTS_LANG asks for.
+ */
+function checkTtsEngine(env, config) {
+	const engine = config.localTtsEngine;
+	if (engine === 'auto') return;
+	if (config.localTtsEngines.length && !config.localTtsEngines.includes(engine)) {
+		// Read again right here, so that the warning names this variable and not LOCAL_TTS_ENGINES.
+		report(env.LOCAL_TTS_ENGINE, 'config.warn_tts_engine_not_listed', { engines: config.localTtsEngines.join(', ') });
+		config.localTtsEngines = TTS_ENGINES.filter((name) => name === engine || config.localTtsEngines.includes(name));
+	}
+	const language = config.localTtsLang.toLowerCase();
+	const missing = unspokenLanguages(engine, language === 'auto' ? DETECTED_LANGUAGES : [language.split(/[-_]/u)[0]]);
+	if (missing.length) {
+		report(env.LOCAL_TTS_ENGINE, 'config.warn_tts_engine_language', { languages: missing.join(', '), lang: config.localTtsLang });
+	}
 }
 
 /** BOT_LANGUAGE -> the bundled locale it picks (the same rule src/i18n applies at import time). */
@@ -320,7 +355,14 @@ function readConfig(env) {
 		// Let the bot start the Chatterbox server itself (when needed, from .venv-chatterbox). LOCAL_TTS_PYTHON can point at the interpreter.
 		localTtsAutostart: bool(env.LOCAL_TTS_AUTOSTART, true),
 		localTtsPython: str(env.LOCAL_TTS_PYTHON),
+		// The Chatterbox variant, whichever engine speaks: the server passes it on to Chatterbox alone.
 		localTtsModel: str(env.LOCAL_TTS_MODEL, 'multilingual'),
+		// Which engine speaks: auto lets the server route each line by its language (FreyaTTS for Turkish,
+		// Pocket for English and five more, Chatterbox for the rest and for a voice Pocket cannot clone);
+		// an engine's name sends every line to that engine.
+		localTtsEngine: oneOf(env.LOCAL_TTS_ENGINE, TTS_ENGINE_CHOICES, 'auto'),
+		// What the server the bot starts may load; empty = every engine that is installed.
+		localTtsEngines: ttsEngines(env.LOCAL_TTS_ENGINES),
 		localSttModel: str(env.LOCAL_STT_MODEL, 'small'),
 		// Local brain (voice chat without OpenAI): ears = whisper (/stt), brain = DeepSeek/OpenAI chat, mouth = Chatterbox.
 		// auto = switch to the local brain when GPT-Live reports a credit/key error and switch back once it recovers;
@@ -446,5 +488,6 @@ function readConfig(env) {
 		ytDlpAutoDownload: bool(env.YTDLP_AUTO_DOWNLOAD, true),
 		ffmpegPath: str(env.FFMPEG_PATH),
 	};
+	checkTtsEngine(env, config);
 	return config;
 }

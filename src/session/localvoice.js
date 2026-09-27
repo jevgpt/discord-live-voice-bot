@@ -17,11 +17,21 @@ import { FRAME_MS } from '../audio.js';
 import { parseVoiceCommand } from '../commands.js';
 import { t } from '../i18n/index.js';
 import { firstClause, splitSentences } from '../localtts.js';
+import { describeVoices, voicesByLanguage } from '../ttsengines.js';
 import { FIRST_CHUNK_CHARS, MIN_LOGGED_MS, SILENCE_GAP_MS, TTS_FLUSH_MS, TTS_SLOW_MS } from './constants.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export const localVoiceMethods = {
+	/**
+	 * Which local engine speaks each language: every one the speech server has answered, and the one the
+	 * bot speaks (LOCAL_TTS_LANG, or with auto the bot's own language) by what is planned for it.
+	 */
+	localVoices() {
+		const language = this.cfg.localTtsLang === 'auto' ? this.cfg.language : this.cfg.localTtsLang;
+		return voicesByLanguage(this.localTts, language);
+	},
+
 	/** Empties the local audio queue and cancels the generation in flight: the bot goes quiet when cut off. */
 	interruptLocalSpeech() {
 		this.ttsPending = '';
@@ -172,7 +182,14 @@ export const localVoiceMethods = {
 				const reason = t('runtime.local_tts_not_ready', { status: info.status ?? t('runtime.local_tts_status_loading') });
 				return { ok: false, value: this.localMode, reason };
 			}
-			this.log(t('runtime.local_tts_on_log', { model: info.model, device: info.device, rate: info.sr }));
+			this.log(
+				t('runtime.local_tts_on_log', {
+					voices: describeVoices(this.localVoices()) || '—',
+					model: info.model,
+					device: info.device,
+					rate: info.sr,
+				}),
+			);
 		} else if (this.localMode) {
 			this.log(t('runtime.local_tts_off_log'));
 		}
@@ -225,7 +242,7 @@ export const localVoiceMethods = {
 			reason,
 			stt: stt.stt,
 			brain: this.provider.describe().split(' —')[0],
-			tts: tts.model,
+			tts: describeVoices(this.localVoices()) || t('runtime.local_brain_mouth_default', { model: tts.model }),
 		});
 		this.log(text);
 		this.activity.push({ kind: 'session', text });

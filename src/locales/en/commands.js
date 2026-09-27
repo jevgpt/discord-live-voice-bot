@@ -204,6 +204,8 @@ export default {
 	status_closed: 'closed',
 	status_voice_engine: 'Voice: {engine}{server}',
 	status_voice_engine_local: 'local (Chatterbox)',
+	// Once the speech server has said which engine speaks each language, e.g. "tr freya, en pocket".
+	status_voice_engine_local_voices: 'local ({voices})',
 	status_chatterbox_server: ' · Chatterbox server: {url}',
 	status_character: 'Character: {character}',
 	status_character_default: 'default',

@@ -21,6 +21,12 @@ export default {
 	warn_target_pair: '{key}: "{entry}" is not a guildId:channelId pair and is skipped.',
 	warn_target_repeat: '{key}: server {guild} is already listed with channel {channel}; "{entry}" is skipped.',
 	warn_language: 'BOT_LANGUAGE={value} is not a supported language ({supported}); {fallback} is used.',
+	// Local speech engines (LOCAL_TTS_ENGINE, LOCAL_TTS_ENGINES).
+	warn_tts_engines: '{key}: "{value}" is not a speech engine ({choices}) and is left out.',
+	warn_tts_engine_not_listed:
+		'{key}={value} is not in LOCAL_TTS_ENGINES ({engines}); it is added, since the speech server could not load it otherwise.',
+	warn_tts_engine_language:
+		'{key}={value} does not speak {languages}, which LOCAL_TTS_LANG={lang} can ask for, so those lines will not be spoken. LOCAL_TTS_ENGINE=auto gives every language an engine that speaks it.',
 	// Printed once at start while BOT_LANGUAGE and at least one of the two keys are unset. {fix} is the
 	// line to add, e.g. "LOCAL_TTS_LANG=tr LOCAL_STT_LANG=tr".
 	note_language_defaults:

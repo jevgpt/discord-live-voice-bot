@@ -133,10 +133,18 @@ export class LocalTts {
 		timeoutMs = 60_000,
 		// Null: the token the process shares (LOCAL_TTS_TOKEN, or the one the server was launched with).
 		token = null,
+		// LOCAL_TTS_ENGINE: an engine every line is sent to, or auto, which names none and leaves the
+		// choice to the server's routing by language.
+		engine = 'auto',
 		log = () => {},
 	} = {}) {
 		this.url = String(url).replace(/\/$/, '');
 		this.token = token;
+		this.engine = engine;
+		// Which engine answered each language, as the server's x-engine header said: the panel shows it.
+		this.engines = new Map();
+		// The server's routing from its last /health (language -> engine), for a language not spoken yet.
+		this.routing = null;
 		this.voiceRef = voiceRef;
 		this.languageId = languageId;
 		this.exaggeration = exaggeration;
@@ -156,6 +164,7 @@ export class LocalTts {
 			if (!response.ok) return null;
 			const info = await response.json();
 			if (Number.isFinite(info?.sr) && info.sr > 0) this.sampleRate = info.sr;
+			if (info?.routing && typeof info.routing === 'object') this.routing = info.routing;
 			return info;
 		} catch (err) {
 			this.log(t('brain.tts_health_failed', { error: err?.message ?? err }));
@@ -186,6 +195,7 @@ export class LocalTts {
 			return { pcm: cached.pcm, language: cached.language, cached: true };
 		}
 		const payload = { text: trimmed, language_id: this.languageFor(trimmed) };
+		if (this.engine && this.engine !== 'auto') payload.engine = this.engine;
 		if (this.voiceRef) payload.voice_ref = this.voiceRef;
 		if (Number.isFinite(this.exaggeration)) payload.exaggeration = this.exaggeration;
 		if (Number.isFinite(this.cfgWeight)) payload.cfg_weight = this.cfgWeight;
@@ -207,6 +217,9 @@ export class LocalTts {
 		}
 		const sampleRate = Number(response.headers.get('x-sample-rate') ?? this.sampleRate) || this.sampleRate;
 		this.sampleRate = sampleRate;
+		// A server from before the engines sends no x-engine; then nothing is recorded.
+		const engine = response.headers.get('x-engine') || null;
+		if (engine) this.engines.set(payload.language_id, engine);
 		const buffer = Buffer.from(await response.arrayBuffer());
 		const usable = buffer.length & ~1;
 		const aligned = buffer.byteOffset % 2 === 0 ? buffer : Buffer.from(buffer.subarray(0, usable));
@@ -217,6 +230,6 @@ export class LocalTts {
 			// Oldest first in a Map, so the first key is the one to drop.
 			while (this.cache.size > CACHE_MAX_ENTRIES) this.cache.delete(this.cache.keys().next().value);
 		}
-		return { pcm: out, sampleRate, raw: pcm, language: payload.language_id };
+		return { pcm: out, sampleRate, raw: pcm, language: payload.language_id, engine };
 	}
 }
