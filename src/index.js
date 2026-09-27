@@ -75,7 +75,8 @@ const savedTracks = await new SavedTracks(path.join(dataDir, 'saved-tracks.json'
 const queueStore = cfg.musicEnabled ? await new QueueStore(path.join(dataDir, 'music-queues.json'), { log }).load() : null;
 const recentActions = new RecentActions();
 const reader = new ChannelReader({ defaultLimit: cfg.readLimit });
-const replyLimiter = new ReplyLimiter({ perMinute: 6 });
+// Written replies per author and in total per minute; 0 = no limit (the default).
+const replyLimiter = new ReplyLimiter({ perMinute: cfg.replyPerMinute, totalPerMinute: cfg.replyTotalPerMinute });
 // Replies to other bots, counted per channel so two bots cannot answer each other for ever.
 const botChain = new BotChain({ max: cfg.botChainMax });
 // The event stream the panel shows: voice transcripts, DM/channel messages, tool calls, gate decisions.

@@ -360,8 +360,11 @@ function readConfig(env) {
 		respondToBots: bool(env.RESPOND_BOTS, true),
 		// A written reply pings the person it answers (Discord's "mention author" on a reply).
 		replyMention: bool(env.REPLY_MENTION, true),
-		// How many bot messages in a row are answered in one channel before a person has to write there.
-		botChainMax: num(env.BOT_CHAIN_MAX, 3, { min: 1, max: 50 }),
+		// How many bot messages in a row are answered in one channel before a person has to write there; 0 = no cap.
+		botChainMax: num(env.BOT_CHAIN_MAX, 0, { min: 0, max: 50 }),
+		// Written replies per author per minute, and in total per minute; 0 = no limit.
+		replyPerMinute: num(env.REPLY_PER_MINUTE, 0, { min: 0, max: 1000 }),
+		replyTotalPerMinute: num(env.REPLY_TOTAL_PER_MINUTE, 0, { min: 0, max: 10_000 }),
 		// Written replies at a person's pace: read, "... is typing", then the reply when it could have been typed.
 		humanTyping: bool(env.HUMAN_TYPING, true),
 		// Typing speed for that pace, in characters per second, and the longest a reply is held back.

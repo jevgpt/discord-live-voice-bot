@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { BotChain, handleMessage, messageText, shouldReply } from '../../src/messages.js';
+import { BotChain, ReplyLimiter, handleMessage, messageText, shouldReply } from '../../src/messages.js';
 
 const target = { botId: 'me', guildId: 'g1' };
 const mention = (author, extra = {}) => ({ author, guild: { id: 'g1' }, mentions: { users: new Map([['me', {}]]) }, ...extra });
@@ -54,6 +54,12 @@ describe('the chain of replies to bots', () => {
 		assert.equal(chain.allow('c'), true);
 	});
 
+	it('has no cap at all when the cap is 0, which is the default', () => {
+		const chain = new BotChain({ max: 0 });
+		for (let i = 0; i < 100; i++) assert.equal(chain.allow('c'), true);
+		assert.equal(new BotChain().allow('c'), true);
+	});
+
 	it('opens again after the chain has been quiet, and a bot that keeps going keeps it shut', () => {
 		let now = 0;
 		const chain = new BotChain({ max: 1, idleMs: 1000, now: () => now });
@@ -64,6 +70,23 @@ describe('the chain of replies to bots', () => {
 		assert.equal(chain.allow('c'), false, 'the last attempt was 900 ms ago: still the same chain');
 		now = 2900;
 		assert.equal(chain.allow('c'), true, 'a second of nothing: a new chain');
+	});
+});
+
+describe('the reply rate limit', () => {
+	it('has no limit at 0, which is what the config gives by default', () => {
+		const limiter = new ReplyLimiter({ perMinute: 0, totalPerMinute: 0 });
+		for (let i = 0; i < 500; i++) assert.equal(limiter.allow('b1'), true);
+	});
+
+	it('still limits when it is set, per author and in total', () => {
+		let now = 0;
+		const perAuthor = new ReplyLimiter({ perMinute: 2, totalPerMinute: 0, now: () => now });
+		assert.deepEqual([perAuthor.allow('a'), perAuthor.allow('a'), perAuthor.allow('a'), perAuthor.allow('b')], [true, true, false, true]);
+		now = 60_000;
+		assert.equal(perAuthor.allow('a'), true, 'a minute later');
+		const total = new ReplyLimiter({ perMinute: 0, totalPerMinute: 2, now: () => now });
+		assert.deepEqual([total.allow('a'), total.allow('b'), total.allow('c')], [true, true, false]);
 	});
 });
 

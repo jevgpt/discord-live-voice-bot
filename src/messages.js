@@ -33,26 +33,28 @@ const VISION_RULES = () => t('messages.vision_rules');
 const REPLY_WINDOW_MS = 60_000;
 // What is read of another bot's message: its text and its embeds, which is where most bots put their answer.
 const MAX_BOT_TEXT = 2000;
-// Two bots that each answer whoever answers them talk to each other for ever, on the owner's key. Replies
-// to bots in one channel are counted; a person writing there, or no bot addressing us there for this long,
-// starts the count again.
+// Two bots that each answer whoever answers them can talk to each other for ever, on the owner's key. With
+// BOT_CHAIN_MAX set, replies to bots in one channel are counted; a person writing there, or no bot addressing
+// us there for this long, starts the count again. Off by default: the owner wants the bots to talk. Nothing
+// else bounds a runaway pair unless REPLY_PER_MINUTE is set (ReplyLimiter).
 const BOT_CHAIN_IDLE_MS = 10 * 60_000;
 
 /**
- * How many times in a row the bot has answered bots in a channel. `allow` is asked once per bot message
+ * How many times in a row the bot has answered bots in a channel (max 0 = no cap). `allow` is asked once per bot message
  * addressed to the bot and says whether this one may be answered; `noteHuman` is told about every message
  * a person writes, which ends the chain in that channel. A bot that keeps addressing the bot after the cap
  * keeps the chain alive: it goes quiet only after BOT_CHAIN_IDLE_MS of nothing.
  */
 export class BotChain {
-	constructor({ max = 3, idleMs = BOT_CHAIN_IDLE_MS, now = Date.now } = {}) {
-		this.max = Math.max(1, max | 0);
+	constructor({ max = 0, idleMs = BOT_CHAIN_IDLE_MS, now = Date.now } = {}) {
+		this.max = Math.max(0, max | 0);
 		this.idleMs = idleMs;
 		this.now = now;
 		this.chains = new Map(); // channel id -> { count, at }
 	}
 
 	allow(channelId) {
+		if (!this.max) return true;
 		const at = this.now();
 		const key = channelId ?? '-';
 		const last = this.chains.get(key);
@@ -180,21 +182,24 @@ export function messageText(message) {
  * gets their own quota of model calls per minute, and all of them are billed to the owner's key.
  */
 export class ReplyLimiter {
+	// 0 = no limit, for either number. Live both come from the config (REPLY_PER_MINUTE,
+	// REPLY_TOTAL_PER_MINUTE), where the owner has chosen none.
 	constructor({ perMinute = 6, totalPerMinute = 30, now = Date.now } = {}) {
-		this.perMinute = perMinute;
-		this.totalPerMinute = totalPerMinute;
+		this.perMinute = Math.max(0, Number(perMinute) || 0);
+		this.totalPerMinute = Math.max(0, Number(totalPerMinute) || 0);
 		this.now = now;
 		this.hits = new Map();
 		this.all = [];
 	}
 
 	allow(userId) {
+		if (!this.perMinute && !this.totalPerMinute) return true;
 		const at = this.now();
 		const fresh = (stamps) => stamps.filter((stamp) => at - stamp < REPLY_WINDOW_MS);
 		this.all = fresh(this.all);
-		if (this.all.length >= this.totalPerMinute) return false;
+		if (this.totalPerMinute && this.all.length >= this.totalPerMinute) return false;
 		const list = fresh(this.hits.get(userId) ?? []);
-		if (list.length >= this.perMinute) {
+		if (this.perMinute && list.length >= this.perMinute) {
 			// Keep the bucket only while it still holds something, so one entry per past sender does not
 			// accumulate for the lifetime of the process.
 			if (list.length) this.hits.set(userId, list);
