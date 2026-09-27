@@ -46,6 +46,7 @@ export class SessionHealth {
 		this.drift = { now: 0, max: 0, rate: 0 };
 		this.overlapFrames = 0; // frames on which somebody was speaking but was not sent (floor control)
 		this.reportedAt = 0; // how many fragments had been seen at the last report
+		this.spokenReportedAt = 0; // and how many local voice sentences had been checked
 	}
 
 	get fragmentCount() {
@@ -194,9 +195,11 @@ export class SessionHealth {
 
 	/**
 	 * The report, as lines of text in the active locale: the numbers, then the warnings that are worth
-	 * one line each. `latency` is the response latency summary the session already keeps.
+	 * one line each. `latency` is the response latency summary the session already keeps; `tts` is the
+	 * local voice's check counters per engine (TtsGuard.stats()), a line of their own once any sentence
+	 * was checked.
 	 */
-	report({ why = '', latency = '', takeovers = 0, audio = null } = {}) {
+	report({ why = '', latency = '', takeovers = 0, audio = null, tts = null } = {}) {
 		const s = this.snapshot();
 		const lines = [
 			t('runtime.health_summary', {
@@ -237,6 +240,24 @@ export class SessionHealth {
 			? s.slowTools.map((entry) => t('runtime.health_tool_item', { name: entry.name, count: entry.count, seconds: (entry.avgMs / 1000).toFixed(1) })).join(', ')
 			: t('runtime.health_none');
 		lines.push(t('runtime.health_latency', { latency: latency || t('runtime.health_none'), tools }));
+		// How often the local voice came out wrong: a voice that runs on or makes things up shows here as
+		// suspicious and failed checks, and as sentences made twice.
+		const voices = Object.entries(tts ?? {}).filter(([, counts]) => counts?.checked > 0);
+		if (voices.length) {
+			const engines = voices
+				.map(([engine, counts]) =>
+					t('runtime.health_tts_item', {
+						engine,
+						checked: counts.checked,
+						suspicious: counts.suspicious,
+						failed: counts.failedRoundTrip,
+						retried: counts.retried,
+						fellBack: counts.fellBack,
+					}),
+				)
+				.join(', ');
+			lines.push(t('runtime.health_tts', { engines }));
+		}
 		if (audio) {
 			// Each person's speech level and gain, and under the adaptive detector what it sees: the noise floor
 			// of their microphone and the bar a frame of theirs has to clear to count as speech. A floor of -40

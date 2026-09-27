@@ -115,6 +115,8 @@ export default {
 	health_gate_reasons: ' — {list}',
 	health_jev: '[health] jev: {calls} calls (median {ms} ms), banter {banter}, not for the bot {notForBot}, replies kept off {suppressed}, failed {failed}',
 	health_latency: '[health] {latency} · slow tools: {tools}',
+	health_tts: '[health] local voice: {engines}',
+	health_tts_item: '{engine} {checked} checked, {suspicious} suspicious, {failed} failed the round trip, {retried} retried, {fellBack} fell back',
 	health_tool_item: '{name} ×{count} (avg {seconds} s)',
 	health_none: 'none',
 	health_warn_drift: '[health] WARNING: the transcript clock is {drift} ms ahead of the audio; the correction is on, but this much means the send loop is being starved',

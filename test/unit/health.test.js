@@ -106,3 +106,23 @@ describe('the audio line of the report', () => {
 		assert.match(line, /Cem -24 dB \(-4 dB\)(,|$)/, 'the peak bar has no floor to show');
 	});
 });
+
+describe('the local voice line of the report', () => {
+	// How often the local voice came out wrong, per engine: the check counters of src/ttsguard.js.
+	it('counts the checks per engine once a sentence was checked, and says nothing before', () => {
+		const health = new SessionHealth();
+		const tts = {
+			default: { checked: 120, suspicious: 6, failedRoundTrip: 3, retried: 5, fellBack: 1 },
+			freya: { checked: 1, suspicious: 0, failedRoundTrip: 0, retried: 0, fellBack: 0 },
+			unused: { checked: 0, suspicious: 0, failedRoundTrip: 0, retried: 0, fellBack: 0 },
+		};
+		const lines = health.report({ tts });
+		assert.equal(lines.length, 3, lines.join('\n'));
+		assert.equal(
+			lines[2],
+			'[health] local voice: default 120 checked, 6 suspicious, 3 failed the round trip, 5 retried, 1 fell back, freya 1 checked, 0 suspicious, 0 failed the round trip, 0 retried, 0 fell back',
+		);
+		assert.equal(health.report({ tts: { default: tts.unused } }).length, 2);
+		assert.equal(health.report({ tts: null }).length, 2);
+	});
+});

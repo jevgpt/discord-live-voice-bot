@@ -116,7 +116,10 @@ async function withFakeSpeechServer(run) {
 		if (headers.get(SPEECH_TOKEN_HEADER) === 'stale') return new Response('{"ok":false,"error":"missing or wrong token"}', { status: 403 });
 		if (url.endsWith('/health')) return Response.json({ ok: true, model: 'multilingual', sr: 24_000, stt: 'small' });
 		if (url.includes('/stt')) return Response.json({ ok: true, text: 'merhaba', language: 'tr' });
-		return new Response(Buffer.alloc(4), { headers: { 'x-sample-rate': '24000' } });
+		// A second of sound, as a real server sends for a short line: the client checks the length of what
+		// comes back (src/ttsguard.js), and four bytes of silence would be made again.
+		const second = Int16Array.from({ length: 24_000 }, (_, i) => Math.round(8000 * Math.sin((2 * Math.PI * 220 * i) / 24_000)));
+		return new Response(Buffer.from(second.buffer), { headers: { 'x-sample-rate': '24000' } });
 	};
 	try {
 		await run(seen);
@@ -289,8 +292,10 @@ describe('LocalTts: the engine each line asks for and the one that answered', ()
 			bodies.push(body);
 			const engine = body.engine ?? (body.language_id === 'tr' ? 'freya' : 'pocket');
 			const rate = engine === 'freya' ? 48_000 : 24_000;
-			// Two seconds of silence, a plausible length for one of these lines.
-			return new Response(Buffer.alloc(rate * 2 * 2), { headers: { 'x-sample-rate': String(rate), ...(engineHeader ? { 'x-engine': engine } : {}) } });
+			// Two seconds of sound, a plausible length for one of these lines. Not silence: the guard trims
+			// silence before it judges the length, and two seconds of nothing would be a line that was never said.
+			const tone = new Int16Array(rate * 2).map((_, i) => (Math.floor(i / 60) % 2 ? 3000 : -3000));
+			return new Response(Buffer.from(tone.buffer), { headers: { 'x-sample-rate': String(rate), ...(engineHeader ? { 'x-engine': engine } : {}) } });
 		};
 		try {
 			await run(bodies);

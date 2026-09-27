@@ -223,6 +223,22 @@ function voiceTargets(value, primary) {
 	return targets;
 }
 
+/**
+ * An engine for every language ("chatterbox") or one per language ("tr:chatterbox, en:kokoro"), as a table
+ * by language code with '*' for the single name; null when unset. An entry that is neither is reported and
+ * skipped, and the rest still count.
+ */
+function engineTable(value) {
+	const table = {};
+	for (const entry of list(value)) {
+		const parts = entry.split(/[:=]/u).map((part) => part.trim());
+		if (parts.length === 1) table['*'] = parts[0];
+		else if (parts.length === 2 && parts[0] && parts[1]) table[parts[0].toLowerCase()] = parts[1];
+		else report(value, 'config.warn_engine_pair', { entry });
+	}
+	return Object.keys(table).length ? table : null;
+}
+
 // Empty/off/none -> the field is not sent at all; undefined -> the default.
 function effortValue(value, fallback) {
 	if (value === undefined || value === null) return fallback;
@@ -363,6 +379,16 @@ function readConfig(env) {
 		localTtsEngine: oneOf(env.LOCAL_TTS_ENGINE, TTS_ENGINE_CHOICES, 'auto'),
 		// What the server the bot starts may load; empty = every engine that is installed.
 		localTtsEngines: ttsEngines(env.LOCAL_TTS_ENGINES),
+		// The local voice is given the words to say, not the text as written: numbers, times, dates, money,
+		// units and abbreviations spelled out, markup, emoji and links taken away (src/speechtext.js).
+		localTtsNormalize: bool(env.LOCAL_TTS_NORMALIZE, true),
+		// What the local voice produced is checked before it is played (src/ttsguard.js): its length always,
+		// and what it says by transcribing it -- off: never, suspicious: when the length looks wrong,
+		// always: every sentence. A sentence that fails is made again.
+		localTtsVerify: oneOf(env.LOCAL_TTS_VERIFY, ['off', 'suspicious', 'always'], 'suspicious'),
+		// The engine a sentence is made with when the second attempt fails too: one name for every
+		// language or language:engine pairs. Unset: none, the closest attempt is played.
+		localTtsFallbackEngine: engineTable(env.LOCAL_TTS_FALLBACK_ENGINE),
 		localSttModel: str(env.LOCAL_STT_MODEL, 'small'),
 		// Local brain (voice chat without OpenAI): ears = whisper (/stt), brain = DeepSeek/OpenAI chat, mouth = Chatterbox.
 		// auto = switch to the local brain when GPT-Live reports a credit/key error and switch back once it recovers;

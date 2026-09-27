@@ -3,6 +3,8 @@
 
 import { t } from './i18n/index.js';
 import { speechHeaders } from './localserver.js';
+import { toSpeech } from './speechtext.js';
+import { TtsGuard } from './ttsguard.js';
 
 const SENTENCE_END = /^\s*(.*?[.!?…]+)(?=\s|$)/su;
 
@@ -136,7 +138,16 @@ export class LocalTts {
 		// LOCAL_TTS_ENGINE: an engine every line is sent to, or auto, which names none and leaves the
 		// choice to the server's routing by language.
 		engine = 'auto',
+		// The text is turned into the words to say before it is sent (src/speechtext.js).
+		normalize = true,
+		// What comes back is checked before it is played (src/ttsguard.js): when it is transcribed
+		// (off/suspicious/always), with what (a LocalStt), and which engine to fall back to.
+		verify = 'suspicious',
+		stt = null,
+		fallbackEngines = null,
 		log = () => {},
+		// Where the guard reports a sentence it had to make again; `log` when not given.
+		guardLog = null,
 	} = {}) {
 		this.url = String(url).replace(/\/$/, '');
 		this.token = token;
@@ -151,6 +162,8 @@ export class LocalTts {
 		this.cfgWeight = cfgWeight;
 		this.timeoutMs = timeoutMs;
 		this.log = log;
+		this.normalize = normalize;
+		this.guard = new TtsGuard({ stt, verify, fallbackEngines, log: guardLog ?? log });
 		// Short lines that have already been generated, newest last. See speak().
 		this.cache = new Map();
 		this.sampleRate = 24_000;
@@ -184,22 +197,49 @@ export class LocalTts {
 	async speak(text, { signal = null } = {}) {
 		const trimmed = String(text ?? '').trim();
 		if (!trimmed) throw new Error(t('brain.tts_empty_text'));
+		// The voice is given what should be SAID: "%20" as "yüzde yirmi", "14:45" as "on dört kırk beş", a
+		// link or an emoji as nothing. Left to guess at digits and markup an autoregressive voice improvises,
+		// and the Turkish one cuts a number off. The words are in the language the request names.
+		const language = this.languageFor(trimmed);
+		const spoken = this.normalize ? toSpeech(trimmed, language) : trimmed;
+		// Nothing in it that can be said (an emoji, a stray asterisk): no audio, and no request for none.
+		if (!spoken) return { pcm: new Int16Array(0), language, cached: false };
 		// This bot says the same handful of short things all evening: "here", "all right", "what is it?".
 		// Each one costs seconds on the GPU every single time, for audio that is identical. Short lines are
 		// kept, which is exactly the set that repeats; a long sentence is never said twice anyway.
-		const cached = this.cache?.get(trimmed);
+		const cached = this.cache?.get(spoken);
 		if (cached) {
 			// Most recently used goes to the end, so the oldest is the one dropped.
-			this.cache.delete(trimmed);
-			this.cache.set(trimmed, cached);
+			this.cache.delete(spoken);
+			this.cache.set(spoken, cached);
 			return { pcm: cached.pcm, language: cached.language, cached: true };
 		}
-		const payload = { text: trimmed, language_id: this.languageFor(trimmed) };
+		const payload = { text: spoken, language_id: language };
 		if (this.engine && this.engine !== 'auto') payload.engine = this.engine;
 		if (this.voiceRef) payload.voice_ref = this.voiceRef;
 		if (Number.isFinite(this.exaggeration)) payload.exaggeration = this.exaggeration;
 		if (Number.isFinite(this.cfgWeight)) payload.cfg_weight = this.cfgWeight;
 
+		// What comes back is checked before it is played, and made again when it ran on, stopped short or
+		// said something else (src/ttsguard.js); `extra` is what a new attempt changes in the request.
+		const result = await this.guard.run((extra) => this.requestAudio({ ...payload, ...extra }, signal), {
+			text: spoken,
+			language,
+			engine: payload.engine ?? null,
+			signal,
+		});
+		// Only audio that passed is kept: a short line that came out wrong would be replayed all evening.
+		if (result.ok && spoken.length <= CACHE_MAX_CHARS) {
+			this.cache.set(spoken, { pcm: result.pcm, language });
+			// Oldest first in a Map, so the first key is the one to drop.
+			while (this.cache.size > CACHE_MAX_ENTRIES) this.cache.delete(this.cache.keys().next().value);
+		}
+		// The engine that actually spoke, as the server named it; the guard's own `engine` is the one asked for.
+		return { pcm: result.pcm, sampleRate: result.sampleRate, raw: result.raw, language, engine: result.servedBy ?? null };
+	}
+
+	/** One request to the server: the payload out, the audio back as { pcm (24 kHz), sampleRate, raw }. */
+	async requestAudio(payload, signal = null) {
 		const timeout = AbortSignal.timeout(this.timeoutMs);
 		const response = await fetch(`${this.url}/tts`, {
 			method: 'POST',
@@ -224,12 +264,7 @@ export class LocalTts {
 		const usable = buffer.length & ~1;
 		const aligned = buffer.byteOffset % 2 === 0 ? buffer : Buffer.from(buffer.subarray(0, usable));
 		const pcm = new Int16Array(aligned.buffer, aligned.byteOffset, usable >> 1);
-		const out = resampleLinear(pcm, sampleRate, 24_000);
-		if (trimmed.length <= CACHE_MAX_CHARS) {
-			this.cache.set(trimmed, { pcm: out, language: payload.language_id });
-			// Oldest first in a Map, so the first key is the one to drop.
-			while (this.cache.size > CACHE_MAX_ENTRIES) this.cache.delete(this.cache.keys().next().value);
-		}
-		return { pcm: out, sampleRate, raw: pcm, language: payload.language_id, engine };
+		// Caching is speak()'s business: only audio the guard passed is kept.
+		return { pcm: resampleLinear(pcm, sampleRate, 24_000), sampleRate, raw: pcm, servedBy: engine };
 	}
 }

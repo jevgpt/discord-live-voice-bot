@@ -115,6 +115,8 @@ export default {
 	health_gate_reasons: ' — {list}',
 	health_jev: '[sağlık] jev: {calls} çağrı (ortanca {ms} ms), şaka {banter}, bota değil {notForBot}, bastırılan cevap {suppressed}, hata {failed}',
 	health_latency: '[sağlık] {latency} · yavaş araçlar: {tools}',
+	health_tts: '[sağlık] yerel ses: {engines}',
+	health_tts_item: '{engine} {checked} denetlendi, {suspicious} şüpheli, {failed} geri dinlemede tutmadı, {retried} yeniden denendi, {fellBack} yedek motora geçti',
 	health_tool_item: '{name} ×{count} (ort {seconds} sn)',
 	health_none: 'yok',
 	health_warn_drift: '[sağlık] UYARI: deşifre saati sesten {drift} ms ileride; düzeltme devrede, ama bu kadar kayma ses gönderiminin takıldığını gösterir',

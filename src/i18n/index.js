@@ -113,8 +113,12 @@ export function tList(key, params = null, code = null) {
 	return [];
 }
 
-/** Raw locale value (objects: alias tables, grammars). Falls back to English, then null. */
-export function tRaw(key) {
-	const value = resolve(key);
+/**
+ * Raw locale value (objects: alias tables, grammars). Falls back to English, then null. `code` reads a
+ * specific locale, as tList does: the words a sentence is spoken with follow the language of that
+ * sentence, which need not be the language the bot runs in.
+ */
+export function tRaw(key, code = null) {
+	const value = code ? (lookup(BUNDLES[code] ?? {}, key) ?? lookup(BUNDLES[FALLBACK], key)) : resolve(key);
 	return value === undefined ? null : value;
 }

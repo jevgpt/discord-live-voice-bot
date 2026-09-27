@@ -242,3 +242,29 @@ describe('several servers at once: the session cap', () => {
 		assert.equal(b.voice.connected, false, 'the other server was not touched');
 	});
 });
+
+describe('the local voice in a session', () => {
+	it('is built with the settings for what it is given and how it is checked', () => {
+		const { a, b } = twoSessions({ env: { LOCAL_TTS_NORMALIZE: '0', LOCAL_TTS_VERIFY: 'always', LOCAL_TTS_FALLBACK_ENGINE: 'tr:chatterbox' } });
+		assert.equal(a.localTts.normalize, false);
+		assert.equal(a.localTts.guard.verify, 'always');
+		assert.equal(a.localTts.guard.fallbackFor('tr'), 'chatterbox');
+		assert.notEqual(a.localTts.guard, b.localTts.guard, 'each server counts its own');
+	});
+
+	// The local brain has no transcript fragments, which is what the report used to wait for: a session that
+	// only ever spoke through the local voice never reported on it.
+	it('reports on its checks even when there were no transcript fragments', () => {
+		const { a, aLines } = twoSessions();
+		for (let i = 0; i < 19; i++) a.localTts.guard.count('default', 'checked');
+		a.reportHealth('test');
+		assert.equal(aLines.filter((line) => line.startsWith('[health')).length, 0, 'not yet: 19 checks');
+		a.localTts.guard.count('default', 'checked');
+		a.localTts.guard.count('default', 'retried');
+		a.reportHealth('test');
+		assert.ok(aLines.includes('[health] local voice: default 20 checked, 0 suspicious, 0 failed the round trip, 1 retried, 0 fell back'), aLines.join('\n'));
+		const reports = aLines.filter((line) => line.startsWith('[health: test]')).length;
+		a.reportHealth('test');
+		assert.equal(aLines.filter((line) => line.startsWith('[health: test]')).length, reports, 'nothing new, no second report');
+	});
+});

@@ -221,12 +221,21 @@ export class GuildSession {
 		// ---------------------------------------------------------------- local TTS
 		// Local TTS (Chatterbox): while it is on the GPT-Live audio is not pushed to Discord; the text is
 		// turned into speech locally instead.
+		// What it is given is what should be said (numbers, dates and money in words: src/speechtext.js), and
+		// what comes back is checked before it is played (src/ttsguard.js), by ear with the local brain's own
+		// transcriber. A sentence that had to be made again, or could not be made right, is logged whatever
+		// DEBUG says.
 		this.localTts = new LocalTts({
 			url: cfg.localTtsUrl,
 			voiceRef: cfg.localTtsVoice,
 			languageId: cfg.localTtsLang,
 			engine: cfg.localTtsEngine,
+			normalize: cfg.localTtsNormalize ?? true,
+			verify: cfg.localTtsVerify ?? 'suspicious',
+			fallbackEngines: cfg.localTtsFallbackEngine ?? null,
+			stt: localStt ?? null,
 			log: (message) => cfg.debug && log(message),
+			guardLog: log,
 		});
 		this.localMode = cfg.localTtsOn;
 		this.ttsPending = '';
@@ -656,9 +665,20 @@ export class GuildSession {
 	}
 
 	reportHealth(why) {
-		if (this.health.fragmentCount - this.health.reportedAt < HEALTH_MIN_FRAGMENTS) return;
+		// Sentences the local voice checked count as news too: the local brain has no transcript fragments,
+		// and what its voice did would otherwise never be reported.
+		const spoken = this.localTts?.guard?.checkedTotal ?? 0;
+		const fresh = this.health.fragmentCount - this.health.reportedAt + (spoken - this.health.spokenReportedAt);
+		if (fresh < HEALTH_MIN_FRAGMENTS) return;
 		this.health.reportedAt = this.health.fragmentCount;
-		const lines = this.health.report({ why, latency: this.latency.summary().text, takeovers: this.mixer?.floorTakeovers ?? 0, audio: this.audioStats() });
+		this.health.spokenReportedAt = spoken;
+		const lines = this.health.report({
+			why,
+			latency: this.latency.summary().text,
+			takeovers: this.mixer?.floorTakeovers ?? 0,
+			audio: this.audioStats(),
+			tts: this.localTts?.guard?.stats() ?? null,
+		});
 		for (const line of lines) this.log(line);
 		this.activity.push({ kind: 'health', whoName: this.persona().name ?? 'bot', text: lines.join('\n'), meta: this.health.snapshot() });
 	}

@@ -20,6 +20,7 @@ export default {
 	warn_snowflake: '{key}: "{value}" bir Discord kimliği değil (17-20 haneli bir sayı olmalı), bu yüzden hiçbir şeyle eşleşmez.',
 	warn_target_pair: '{key}: "{entry}" bir sunucuId:kanalId çifti değil, atlanıyor.',
 	warn_target_repeat: '{key}: {guild} sunucusu zaten {channel} kanalıyla listede; "{entry}" atlanıyor.',
+	warn_engine_pair: '{key}: "{entry}" ne bir motor adı ne de dil:motor çifti; atlanıyor.',
 	warn_language: 'BOT_LANGUAGE={value} desteklenen dillerden biri değil ({supported}); {fallback} kullanılıyor.',
 	// Local speech engines (LOCAL_TTS_ENGINE, LOCAL_TTS_ENGINES).
 	warn_tts_engines: '{key}: "{value}" bir ses motoru değil ({choices}), listeden çıkarıldı.',

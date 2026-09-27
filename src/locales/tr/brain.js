@@ -41,6 +41,15 @@ export default {
 	tts_empty_text: 'boş metin',
 	tts_error: 'yerel TTS hatası ({status})',
 	tts_error_detail: 'yerel TTS hatası ({status}): {detail}',
+	// --- yerel sesin ürettiğinin denetimi (src/ttsguard.js)
+	tts_guard_suspicious: 'yerel ses ({engine}): "{text}" yanlış çıktı ({why}); yeniden üretiliyor',
+	tts_guard_long: 'fazla uzun: yaklaşık {expected} sn beklenirken {seconds} sn',
+	tts_guard_short: 'fazla kısa: yaklaşık {expected} sn beklenirken {seconds} sn',
+	tts_guard_heard: 'geri dinlenince "{heard}" duyuldu, karakter hata oranı {cer}',
+	tts_guard_gave_up: 'yerel ses ({engine}): "{text}" için {attempts} denemenin hiçbiri denetimden geçmedi; en yakını çalınıyor',
+	tts_guard_retry_failed: 'yerel ses ({engine}): "{text}" için yeni deneme başarısız: {error}',
+	tts_guard_stt_skipped: 'yerel ses: yazıya döküm yanıt vermedi ({error}); geri dinleme denetimi bir dakikalığına bırakıldı',
+	tts_guard_timeout: 'süre doldu',
 	// --- latency metrics (src/latency.js)
 	latency_seconds: '{value} sn',
 	latency_summary: 'Yanıt gecikmesi: P50 {p50}, P90 {p90} ({count} yanıt)',

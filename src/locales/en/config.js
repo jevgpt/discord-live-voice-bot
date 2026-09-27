@@ -20,6 +20,7 @@ export default {
 	warn_snowflake: '{key}: "{value}" is not a Discord ID (a number of 17 to 20 digits), so it will not match anything.',
 	warn_target_pair: '{key}: "{entry}" is not a guildId:channelId pair and is skipped.',
 	warn_target_repeat: '{key}: server {guild} is already listed with channel {channel}; "{entry}" is skipped.',
+	warn_engine_pair: '{key}: "{entry}" is neither an engine name nor a language:engine pair and is skipped.',
 	warn_language: 'BOT_LANGUAGE={value} is not a supported language ({supported}); {fallback} is used.',
 	// Local speech engines (LOCAL_TTS_ENGINE, LOCAL_TTS_ENGINES).
 	warn_tts_engines: '{key}: "{value}" is not a speech engine ({choices}) and is left out.',

@@ -129,6 +129,36 @@ describe('config.js: fixed choices', () => {
 		assert.match(warningFor(wrong, 'ATTRIBUTION'), /hmm, vote/);
 	});
 
+	it('the local voice: the words to say and a check on what comes back, both on unless turned off', () => {
+		const cfg = loadConfig(baseEnv);
+		assert.equal(cfg.localTtsNormalize, true);
+		assert.equal(cfg.localTtsVerify, 'suspicious');
+		assert.equal(cfg.localTtsFallbackEngine, null, 'no fallback engine unless one is named');
+
+		const set = loadConfig({ ...baseEnv, LOCAL_TTS_NORMALIZE: '0', LOCAL_TTS_VERIFY: 'Always', LOCAL_TTS_FALLBACK_ENGINE: 'chatterbox' });
+		assert.equal(set.localTtsNormalize, false);
+		assert.equal(set.localTtsVerify, 'always');
+		assert.deepEqual(set.localTtsFallbackEngine, { '*': 'chatterbox' });
+		assert.deepEqual(set.warnings, []);
+		assert.equal(loadConfig({ ...baseEnv, LOCAL_TTS_VERIFY: 'off' }).localTtsVerify, 'off');
+
+		const wrong = loadConfig({ ...baseEnv, LOCAL_TTS_VERIFY: 'sometimes' });
+		assert.equal(wrong.localTtsVerify, 'suspicious');
+		assert.match(warningFor(wrong, 'LOCAL_TTS_VERIFY'), /off, suspicious, always/);
+	});
+
+	it('LOCAL_TTS_FALLBACK_ENGINE: one engine, or one per language, and an entry that is neither is reported', () => {
+		const pairs = loadConfig({ ...baseEnv, LOCAL_TTS_FALLBACK_ENGINE: 'TR:chatterbox, en=kokoro' });
+		assert.deepEqual(pairs.localTtsFallbackEngine, { tr: 'chatterbox', en: 'kokoro' });
+		assert.deepEqual(pairs.warnings, []);
+		const mixed = loadConfig({ ...baseEnv, LOCAL_TTS_FALLBACK_ENGINE: 'tr:, chatterbox, a:b:c' });
+		assert.deepEqual(mixed.localTtsFallbackEngine, { '*': 'chatterbox' }, 'the good entry still counts');
+		const lines = mixed.warnings.filter((line) => line.startsWith('LOCAL_TTS_FALLBACK_ENGINE'));
+		assert.equal(lines.length, 2, lines.join(' | '));
+		assert.ok(lines.some((line) => line.includes('"tr:"')));
+		assert.ok(lines.some((line) => line.includes('"a:b:c"')));
+	});
+
 	it('VAD: the per-person detector unless the old peak bar is asked for', () => {
 		assert.equal(loadConfig(baseEnv).vad, 'adaptive');
 		const peak = loadConfig({ ...baseEnv, VAD: 'Peak' });

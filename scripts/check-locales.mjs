@@ -531,8 +531,9 @@ for (const [label, { regex, where }] of patterns) {
 // Vocabulary and grammar tables are genuinely different per language: English has "red", Turkish has
 // "kirmizi", and each locale needs its own regular expressions, so their words and patterns are not
 // compared. Their shape is: a keyword list, a grammar rule or a word table that one locale has and
-// another lacks is a feature that silently stops working in that language.
-const VOCABULARY = /^(?:keywords|grammar)\.|(?:_aliases|_words|_names|_variants)(?:\.|$)/;
+// another lacks is a feature that silently stops working in that language. The speech namespace is the
+// same kind of data: how a language says "$3.99" puts its words, and its {placeholders}, in its own order.
+const VOCABULARY = /^(?:keywords|grammar|speech)\.|(?:_aliases|_words|_names|_variants)(?:\.|$)/;
 const symmetric = (key) => !VOCABULARY.test(key);
 // Tables whose KEYS are words or letters of the language (colour names, permission groups, spoken
 // setting names, the letters that carry accents): only the table itself has to exist everywhere.
