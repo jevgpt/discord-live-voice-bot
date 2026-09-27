@@ -42,7 +42,43 @@ import { VOICES } from './voices.js';
 export { VOICES, findCharacter, findChannelByName, normalize, stripDictationTail };
 
 const MAX_SELECT_OPTIONS = 25;
-const MODAL_PROMPT_MAX = 4000; // Discord modal field limit; the store allows 8000
+// Discord takes at most 4000 characters in one modal field, and five rows in a modal. The character modal
+// spends one row on the name, one on the voice and the other three on the prompt: 12,000 characters, which
+// the owner types (or pastes) into the fields one after the other. The store keeps up to 32,000.
+const MODAL_FIELD_MAX = 4000;
+const MODAL_PROMPT_FIELDS = ['prompt', 'prompt2', 'prompt3'];
+
+/**
+ * A prompt cut into the modal's fields: at a line break where there is one in the second half of a field,
+ * else at a space, else where the field is full. The separator the cut is made at is dropped, and
+ * joinPrompt puts a line break back, so a prompt that goes out and comes back untouched is recognised.
+ * Whatever does not fit in the three fields is not in the modal (see handleModal).
+ */
+export function splitPrompt(prompt, { size = MODAL_FIELD_MAX, fields = MODAL_PROMPT_FIELDS.length } = {}) {
+	const parts = [];
+	let rest = String(prompt ?? '');
+	while (rest && parts.length < fields) {
+		if (rest.length <= size) {
+			parts.push(rest);
+			break;
+		}
+		let cut = rest.lastIndexOf('\n', size);
+		if (cut < size / 2) cut = rest.lastIndexOf(' ', size);
+		if (cut < size / 2) cut = size;
+		parts.push(rest.slice(0, cut));
+		rest = rest.slice(cut + (rest[cut] === '\n' || rest[cut] === ' ' ? 1 : 0));
+	}
+	return parts;
+}
+
+/** The modal's prompt fields as one prompt: the filled ones, in order, a line break between them. */
+export function joinPrompt(parts) {
+	return parts
+		.map((part) => String(part ?? ''))
+		.filter((part) => part.trim())
+		.join('\n')
+		.trim();
+}
 
 // ---------------------------------------------------------------- slash commands
 
@@ -201,12 +237,18 @@ export function characterModal({ mode = 'new', character = null } = {}) {
 		.setStyle(TextInputStyle.Short)
 		.setRequired(true)
 		.setMaxLength(80);
-	const prompt = new TextInputBuilder()
-		.setCustomId('prompt')
-		.setLabel(t('commands.modal_prompt_label'))
-		.setStyle(TextInputStyle.Paragraph)
-		.setRequired(false)
-		.setMaxLength(MODAL_PROMPT_MAX);
+	const parts = character?.prompt ? splitPrompt(character.prompt) : [];
+	const prompts = MODAL_PROMPT_FIELDS.map((id, index) => {
+		const field = new TextInputBuilder()
+			.setCustomId(id)
+			.setLabel(index === 0 ? t('commands.modal_prompt_label') : t('commands.modal_prompt_more_label', { part: index + 1, total: MODAL_PROMPT_FIELDS.length }))
+			.setStyle(TextInputStyle.Paragraph)
+			.setRequired(false)
+			.setMaxLength(MODAL_FIELD_MAX);
+		if (index > 0) field.setPlaceholder(t('commands.modal_prompt_more_placeholder'));
+		if (parts[index]) field.setValue(parts[index]);
+		return field;
+	});
 	const voice = new TextInputBuilder()
 		.setCustomId('voice')
 		.setLabel(t('commands.modal_voice_label'))
@@ -215,12 +257,11 @@ export function characterModal({ mode = 'new', character = null } = {}) {
 		.setMaxLength(40);
 	if (character) {
 		name.setValue(character.name ?? '');
-		if (character.prompt) prompt.setValue(String(character.prompt).slice(0, MODAL_PROMPT_MAX));
 		if (character.voice) voice.setValue(character.voice);
 	}
 	modal.addComponents(
 		new ActionRowBuilder().addComponents(name),
-		new ActionRowBuilder().addComponents(prompt),
+		...prompts.map((field) => new ActionRowBuilder().addComponents(field)),
 		new ActionRowBuilder().addComponents(voice),
 	);
 	return modal;
@@ -728,9 +769,17 @@ async function handleButton(interaction, ctx) {
 
 async function handleModal(interaction, ctx) {
 	if (await denyUnlessPrivileged(interaction, ctx)) return;
-	const name = interaction.fields.getTextInputValue('name').trim();
-	let prompt = interaction.fields.getTextInputValue('prompt').trim();
-	const voice = interaction.fields.getTextInputValue('voice').trim().toLowerCase();
+	// A field the modal did not have (one opened before an update, answered after it) reads as empty.
+	const field = (id) => {
+		try {
+			return interaction.fields.getTextInputValue(id) ?? '';
+		} catch {
+			return '';
+		}
+	};
+	const name = field('name').trim();
+	let prompt = joinPrompt(MODAL_PROMPT_FIELDS.map(field));
+	const voice = field('voice').trim().toLowerCase();
 
 	if (voice && !VOICES.includes(voice)) {
 		await interaction.reply({
@@ -754,8 +803,9 @@ async function handleModal(interaction, ctx) {
 			await interaction.reply({ content: t('commands.character_missing'), flags: MessageFlags.Ephemeral });
 			return;
 		}
-		// The modal had cut the prompt at 4000; if the user did not touch that part, keep the long original.
-		if (active.prompt.length > MODAL_PROMPT_MAX && prompt === active.prompt.slice(0, MODAL_PROMPT_MAX).trim()) prompt = active.prompt;
+		// The prompt came back exactly as the modal was filled: keep the original, which may be longer than
+		// the modal's 12,000 characters and keeps the separators the fields were cut at.
+		if (active.prompt && prompt === joinPrompt(splitPrompt(active.prompt))) prompt = active.prompt;
 		await ctx.store.update(active.id, { name, prompt, voice: voice || null });
 		await ctx.refreshPersona(t('commands.persona_reason_character_updated', { character: name }));
 		await updatePanelMessage(interaction, ctx, t('commands.character_updated', { name }));

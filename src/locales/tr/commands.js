@@ -143,7 +143,9 @@ export default {
 	modal_new_title: 'Yeni karakter',
 	modal_edit_title: 'Düzenle: {name}',
 	modal_name_label: 'Karakter adı',
-	modal_prompt_label: 'Kişilik / talimat (prompt)',
+	modal_prompt_label: 'Kişilik / talimat (prompt) 1/3',
+	modal_prompt_more_label: 'Prompt devamı {part}/{total}',
+	modal_prompt_more_placeholder: 'Prompt 4000 karakteri geçiyorsa kalanını buraya yapıştır',
 	modal_voice_label: 'Ses (boş = varsayılan; liste panelde)',
 
 	panel_title: 'Karakter paneli',

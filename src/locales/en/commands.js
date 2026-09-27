@@ -145,7 +145,9 @@ export default {
 	modal_new_title: 'New character',
 	modal_edit_title: 'Edit: {name}',
 	modal_name_label: 'Character name',
-	modal_prompt_label: 'Personality / instructions (prompt)',
+	modal_prompt_label: 'Personality / instructions (prompt) 1/3',
+	modal_prompt_more_label: 'Prompt, continued {part}/{total}',
+	modal_prompt_more_placeholder: 'If the prompt is longer than 4000 characters, paste the rest here',
 	modal_voice_label: 'Voice (blank = default; list on panel)',
 
 	panel_title: 'Character panel',
