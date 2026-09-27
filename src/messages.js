@@ -66,6 +66,98 @@ export class BotChain {
 	}
 }
 
+// Written replies at a person's pace. The reply used to land the instant the model returned, with nothing
+// in between: no "... is typing", and a paragraph a second after the question, which nobody types. Now
+// the message is read for a moment (longer for a longer message), "... is typing" shows while the reply
+// is being written, and the reply goes out when a person could have typed it -- never later than that
+// just to look human: a slow model is already typing time. Discord shows the indicator for about ten
+// seconds per call, so it is renewed while it lasts.
+const TYPING_REFRESH_MS = 8000;
+const READ_BASE_MS = 250;
+const READ_MS_PER_CHAR = 20;
+const READ_MIN_MS = 500;
+const READ_MAX_MS = 2500;
+const TYPE_MIN_MS = 1500;
+const PACE_JITTER = 0.15;
+
+const realClock = {
+	now: () => Date.now(),
+	sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+	after: (ms, fn) => {
+		const timer = setTimeout(fn, ms);
+		timer.unref?.();
+		return () => clearTimeout(timer);
+	},
+	every: (ms, fn) => {
+		const timer = setInterval(fn, ms);
+		timer.unref?.();
+		return () => clearInterval(timer);
+	},
+};
+
+const clamp = (value, low, high) => Math.min(high, Math.max(low, value));
+
+/**
+ * One reply's pacing. Built when the bot has decided to answer: it starts the "typing" indicator after
+ * the reading delay, on its own, while the reply is still being written. `done(reply)` waits until the
+ * reply could have been typed; `stop()` ends the indicator (always call it, on every way out).
+ */
+export class HumanPace {
+	constructor(channel, { enabled = true, incoming = '', cps = 10, maxMs = 8000, clock = null, random = null } = {}) {
+		this.channel = channel;
+		this.clock = clock ?? realClock;
+		this.random = random ?? Math.random;
+		this.cps = cps > 0 ? cps : 10;
+		this.maxMs = Math.max(0, Number.isFinite(maxMs) ? maxMs : 8000);
+		this.enabled = Boolean(enabled) && typeof channel?.sendTyping === 'function';
+		this.stopped = !this.enabled;
+		this.startedAt = this.clock.now();
+		this.typingAt = null;
+		this.cancels = [];
+		this.readMs = this.enabled ? this.jitter(clamp(READ_BASE_MS + String(incoming ?? '').length * READ_MS_PER_CHAR, READ_MIN_MS, READ_MAX_MS)) : 0;
+		if (this.enabled) this.cancels.push(this.clock.after(this.readMs, () => this.type()));
+	}
+
+	jitter(ms) {
+		return Math.round(ms * (1 + (this.random() - 0.5) * 2 * PACE_JITTER));
+	}
+
+	/** How long a person would take to type this reply. */
+	typingMs(reply) {
+		return Math.min(this.maxMs, Math.max(TYPE_MIN_MS, this.jitter((String(reply ?? '').length / this.cps) * 1000)));
+	}
+
+	type() {
+		if (this.stopped || this.typingAt !== null) return;
+		this.typingAt = this.clock.now();
+		const send = () => {
+			try {
+				this.channel.sendTyping()?.catch?.(() => {});
+			} catch {
+				/* no permission, a closed DM: the reply still goes out */
+			}
+		};
+		send();
+		this.cancels.push(this.clock.every(TYPING_REFRESH_MS, send));
+	}
+
+	/** Waits until the reply could have been read and typed; returns at once when it already could. */
+	async done(reply) {
+		if (this.stopped) return;
+		const reading = this.startedAt + this.readMs - this.clock.now();
+		if (reading > 0) await this.clock.sleep(reading);
+		this.type();
+		if (this.stopped || this.typingAt === null) return;
+		const left = this.typingAt + this.typingMs(reply) - this.clock.now();
+		if (left > 0) await this.clock.sleep(left);
+	}
+
+	stop() {
+		this.stopped = true;
+		for (const cancel of this.cancels.splice(0)) cancel();
+	}
+}
+
 /**
  * The text of a message as it is answered. A person's is what they wrote. A bot's is its text and its
  * embeds (author, title, description, fields, footer), because most bots answer in an embed and leave the
@@ -298,94 +390,110 @@ export async function handleMessage(message, deps) {
 	const speaker = fromBot ? t('reader.bot_label', { who: authorName }) : authorName;
 	const where = isDm ? 'DM' : `#${message.channel?.name ?? t('messages.channel_fallback')}`;
 
-	// We download the images ourselves and turn them into data URLs; moderation runs after that.
-	let prepared = images;
-	if (images.length) {
+	// From here the bot is answering: it reads, it shows "... is typing", it answers at a person's pace.
+	const pace = new HumanPace(message.channel, {
+		enabled: deps.cfg?.humanTyping === true,
+		incoming: text,
+		cps: deps.cfg?.typingCps,
+		maxMs: deps.cfg?.typingMaxMs,
+		clock: deps.clock,
+		random: deps.random,
+	});
+	try {
+		// We download the images ourselves and turn them into data URLs; moderation runs after that.
+		let prepared = images;
+		if (images.length) {
+			try {
+				prepared = await Promise.all(
+					images.map(async (image) => ({ ...image, dataUrl: await fetchImageAsDataUrl(image.url, { contentType: image.contentType }) })),
+				);
+			} catch (err) {
+				log?.(t('messages.log_image_download_failed', { where, user: authorId, error: err.message }));
+				// A bot is not asked to try again: an apology is one more message for it to answer.
+				if (!fromBot) {
+					await message
+						.reply({ content: t('messages.image_download_failed_reply'), allowedMentions: { repliedUser: false } })
+						.catch(() => {});
+				}
+				return null;
+			}
+			const visionClient = deps.visionClient ?? providerFromDeps(deps).visionClient;
+			if (await containsBlockedImage(visionClient, prepared, log)) {
+				log?.(t('messages.log_image_blocked', { where, user: authorId }));
+				await message
+					.reply({ content: t('messages.image_blocked_reply'), allowedMentions: { repliedUser: false } })
+					.catch(() => {});
+				reportBlockedImage(deps, { authorName, where });
+				return null;
+			}
+		}
+
+		const prompt = buildReplyPrompt({
+			personaName: persona.name,
+			personaPrompt: persona.prompt,
+			authorName: speaker,
+			channelName: message.channel?.name ?? t('messages.channel_fallback'),
+			isDm,
+			text,
+			memory: deps.memory?.summaryFor?.(authorId) ?? null,
+		});
+
+		let reply = null;
 		try {
-			prepared = await Promise.all(
-				images.map(async (image) => ({ ...image, dataUrl: await fetchImageAsDataUrl(image.url, { contentType: image.contentType }) })),
-			);
+			const withImages = prepared.length > 0;
+			const input = withImages
+				? [
+						{
+							role: 'user',
+							content: [
+								{ type: 'input_text', text: `${speaker}: ${text || t('messages.sent_image')}` },
+								...prepared.map((image) => ({ type: 'input_image', image_url: image.dataUrl ?? image.url })),
+							],
+						},
+					]
+				: prompt.input;
+			const instructions = withImages ? `${prompt.instructions} ${VISION_RULES()}` : prompt.instructions;
+			const raw = await createReplyText(deps, { instructions, input, withImages });
+			// Line breaks are kept when there is a code block; plain text is squashed onto a single line.
+			const trimmed = String(raw ?? '').trim();
+			const normalized = trimmed.includes('```') ? trimmed : squash(trimmed);
+			reply = balanceCodeFences(normalized, { maxLength: MAX_REPLY }) || null;
 		} catch (err) {
-			log?.(t('messages.log_image_download_failed', { where, user: authorId, error: err.message }));
-			// A bot is not asked to try again: an apology is one more message for it to answer.
+			log?.(t('messages.log_reply_failed', { error: err.message }));
+		}
+
+		if (!reply) {
 			if (!fromBot) {
 				await message
-					.reply({ content: t('messages.image_download_failed_reply'), allowedMentions: { repliedUser: false } })
+					.reply({ content: t('messages.unavailable_reply'), allowedMentions: { repliedUser: false } })
 					.catch(() => {});
 			}
 			return null;
 		}
-		const visionClient = deps.visionClient ?? providerFromDeps(deps).visionClient;
-		if (await containsBlockedImage(visionClient, prepared, log)) {
-			log?.(t('messages.log_image_blocked', { where, user: authorId }));
-			await message
-				.reply({ content: t('messages.image_blocked_reply'), allowedMentions: { repliedUser: false } })
-				.catch(() => {});
-			reportBlockedImage(deps, { authorName, where });
+
+		// The reply goes out when a person could have read the message and typed it (see HumanPace).
+		await pace.done(reply);
+
+		try {
+			// parse: [] -> expressions like "@everyone" inside the text mention nobody (no accidental pings).
+			await message.reply({ content: reply, allowedMentions: { repliedUser: false, parse: [] } });
+			log?.(t('messages.log_replied', { where, who: authorName }));
+		} catch (err) {
+			log?.(t('messages.log_send_failed', { error: err.message }));
 			return null;
 		}
-	}
 
-	const prompt = buildReplyPrompt({
-		personaName: persona.name,
-		personaPrompt: persona.prompt,
-		authorName: speaker,
-		channelName: message.channel?.name ?? t('messages.channel_fallback'),
-		isDm,
-		text,
-		memory: deps.memory?.summaryFor?.(authorId) ?? null,
-	});
-
-	let reply = null;
-	try {
-		const withImages = prepared.length > 0;
-		const input = withImages
-			? [
-					{
-						role: 'user',
-						content: [
-							{ type: 'input_text', text: `${speaker}: ${text || t('messages.sent_image')}` },
-							...prepared.map((image) => ({ type: 'input_image', image_url: image.dataUrl ?? image.url })),
-						],
-					},
-				]
-			: prompt.input;
-		const instructions = withImages ? `${prompt.instructions} ${VISION_RULES()}` : prompt.instructions;
-		const raw = await createReplyText(deps, { instructions, input, withImages });
-		// Line breaks are kept when there is a code block; plain text is squashed onto a single line.
-		const trimmed = String(raw ?? '').trim();
-		const normalized = trimmed.includes('```') ? trimmed : squash(trimmed);
-		reply = balanceCodeFences(normalized, { maxLength: MAX_REPLY }) || null;
-	} catch (err) {
-		log?.(t('messages.log_reply_failed', { error: err.message }));
-	}
-
-	if (!reply) {
-		if (!fromBot) {
-			await message
-				.reply({ content: t('messages.unavailable_reply'), allowedMentions: { repliedUser: false } })
-				.catch(() => {});
+		// A written reply is only spoken in the voice channel when VOICE_ECHO_TEXT_REPLIES is on and it is a
+		// channel message (off by default: writing stays writing, the voice conversation is not interrupted);
+		// DM replies are never read out. Reading a reply that contains a code block out loud makes no sense:
+		// a short summary is spoken instead.
+		const live = deps.getLive?.();
+		if (!isDm && deps.cfg?.voiceEchoTextReplies === true && live?.ready) {
+			live.appendContext('commentary', reply.includes('```') ? t('messages.code_spoken') : reply);
 		}
-		return null;
-	}
 
-	try {
-		// parse: [] -> expressions like "@everyone" inside the text mention nobody (no accidental pings).
-		await message.reply({ content: reply, allowedMentions: { repliedUser: false, parse: [] } });
-		log?.(t('messages.log_replied', { where, who: authorName }));
-	} catch (err) {
-		log?.(t('messages.log_send_failed', { error: err.message }));
-		return null;
+		return reply;
+	} finally {
+		pace.stop();
 	}
-
-	// A written reply is only spoken in the voice channel when VOICE_ECHO_TEXT_REPLIES is on and it is a
-	// channel message (off by default: writing stays writing, the voice conversation is not interrupted);
-	// DM replies are never read out. Reading a reply that contains a code block out loud makes no sense:
-	// a short summary is spoken instead.
-	const live = deps.getLive?.();
-	if (!isDm && deps.cfg?.voiceEchoTextReplies === true && live?.ready) {
-		live.appendContext('commentary', reply.includes('```') ? t('messages.code_spoken') : reply);
-	}
-
-	return reply;
 }

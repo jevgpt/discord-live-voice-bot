@@ -360,6 +360,11 @@ function readConfig(env) {
 		respondToBots: bool(env.RESPOND_BOTS, true),
 		// How many bot messages in a row are answered in one channel before a person has to write there.
 		botChainMax: num(env.BOT_CHAIN_MAX, 3, { min: 1, max: 50 }),
+		// Written replies at a person's pace: read, "... is typing", then the reply when it could have been typed.
+		humanTyping: bool(env.HUMAN_TYPING, true),
+		// Typing speed for that pace, in characters per second, and the longest a reply is held back.
+		typingCps: num(env.TYPING_CPS, 10, { min: 1, max: 200 }),
+		typingMaxMs: num(env.TYPING_MAX_MS, 8000, { min: 0, max: 60_000 }),
 		// Should a written reply given in a text channel also be spoken in the voice channel (off: text stays text).
 		voiceEchoTextReplies: bool(env.VOICE_ECHO_TEXT_REPLIES, false),
 		greetText: str(env.GREET_TEXT),
