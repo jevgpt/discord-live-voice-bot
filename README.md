@@ -492,6 +492,7 @@ Every option lives in `.env` and is documented in [`.env.example`](.env.example)
 | `MUSIC_VOLUME` / `MUSIC_DUCK_VOLUME` | `35` / `12` | Music level, and its level while the bot speaks |
 | `YTDLP_VERSION` | `latest` | The yt-dlp release to fetch (checked against its SHA-256 sums) |
 | `RESPOND_BOTS` | `1` | Answer other bots that mention the bot or reply to it (never itself) |
+| `REPLY_MENTION` | `1` | A written reply pings the person it answers; `0` replies without a ping |
 | `BOT_CHAIN_MAX` | `3` | Bot messages answered in a row in a channel before a person has to write there |
 | `HUMAN_TYPING` | `1` | Written replies at a person's pace: read, "… is typing", then the reply |
 | `TYPING_CPS` / `TYPING_MAX_MS` | `10` / `8000` | Typing speed for that pace, and the longest a reply is held back |

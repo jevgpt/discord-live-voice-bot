@@ -358,6 +358,8 @@ function readConfig(env) {
 		respondToMentions: bool(env.RESPOND_MENTIONS, true),
 		// Answer other bots that mention the bot or reply to it (never the bot itself).
 		respondToBots: bool(env.RESPOND_BOTS, true),
+		// A written reply pings the person it answers (Discord's "mention author" on a reply).
+		replyMention: bool(env.REPLY_MENTION, true),
 		// How many bot messages in a row are answered in one channel before a person has to write there.
 		botChainMax: num(env.BOT_CHAIN_MAX, 3, { min: 1, max: 50 }),
 		// Written replies at a person's pace: read, "... is typing", then the reply when it could have been typed.

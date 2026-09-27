@@ -389,6 +389,8 @@ export async function handleMessage(message, deps) {
 	// The model is told when it is answering a bot, so it answers a bot and not a person by that name.
 	const speaker = fromBot ? t('reader.bot_label', { who: authorName }) : authorName;
 	const where = isDm ? 'DM' : `#${message.channel?.name ?? t('messages.channel_fallback')}`;
+	// A reply pings the person it answers, the way a person replying on Discord does (REPLY_MENTION).
+	const pingAuthor = deps.cfg?.replyMention !== false;
 
 	// From here the bot is answering: it reads, it shows "... is typing", it answers at a person's pace.
 	const pace = new HumanPace(message.channel, {
@@ -412,7 +414,7 @@ export async function handleMessage(message, deps) {
 				// A bot is not asked to try again: an apology is one more message for it to answer.
 				if (!fromBot) {
 					await message
-						.reply({ content: t('messages.image_download_failed_reply'), allowedMentions: { repliedUser: false } })
+						.reply({ content: t('messages.image_download_failed_reply'), allowedMentions: { repliedUser: pingAuthor } })
 						.catch(() => {});
 				}
 				return null;
@@ -421,7 +423,7 @@ export async function handleMessage(message, deps) {
 			if (await containsBlockedImage(visionClient, prepared, log)) {
 				log?.(t('messages.log_image_blocked', { where, user: authorId }));
 				await message
-					.reply({ content: t('messages.image_blocked_reply'), allowedMentions: { repliedUser: false } })
+					.reply({ content: t('messages.image_blocked_reply'), allowedMentions: { repliedUser: pingAuthor } })
 					.catch(() => {});
 				reportBlockedImage(deps, { authorName, where });
 				return null;
@@ -465,7 +467,7 @@ export async function handleMessage(message, deps) {
 		if (!reply) {
 			if (!fromBot) {
 				await message
-					.reply({ content: t('messages.unavailable_reply'), allowedMentions: { repliedUser: false } })
+					.reply({ content: t('messages.unavailable_reply'), allowedMentions: { repliedUser: pingAuthor } })
 					.catch(() => {});
 			}
 			return null;
@@ -476,7 +478,7 @@ export async function handleMessage(message, deps) {
 
 		try {
 			// parse: [] -> expressions like "@everyone" inside the text mention nobody (no accidental pings).
-			await message.reply({ content: reply, allowedMentions: { repliedUser: false, parse: [] } });
+			await message.reply({ content: reply, allowedMentions: { repliedUser: pingAuthor, parse: [] } });
 			log?.(t('messages.log_replied', { where, who: authorName }));
 		} catch (err) {
 			log?.(t('messages.log_send_failed', { error: err.message }));
