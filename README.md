@@ -521,6 +521,8 @@ Every option lives in `.env` and is documented in [`.env.example`](.env.example)
 | `MUSIC_VOLUME` / `MUSIC_DUCK_VOLUME` | `35` / `12` | Music level, and its level while the bot speaks |
 | `YTDLP_VERSION` | `latest` | The yt-dlp release to fetch (checked against its SHA-256 sums) |
 | `RESPOND_BOTS` | `1` | Answer other bots that mention the bot or reply to it (never itself) |
+| `REPLY_MODEL` / `REPLY_BASE_URL` / `REPLY_API_KEY` | *(empty)* | Written replies on a model of their own, on any OpenAI-compatible endpoint (NanoGPT, OpenRouter…) |
+| `REPLY_TIMEOUT_MS` | `120000` | How long a written reply may take (a thinking model can take a minute) |
 | `REPLY_MENTION` | `1` | A written reply pings the person it answers; `0` replies without a ping |
 | `BOT_CHAIN_MAX` | `0` | Bot messages answered in a row in a channel before a person has to write there; `0` = no cap |
 | `REPLY_PER_MINUTE` / `REPLY_TOTAL_PER_MINUTE` | `0` / `0` | Written replies per author and in total per minute; `0` = no limit |

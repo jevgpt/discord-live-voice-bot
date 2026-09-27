@@ -17,6 +17,7 @@ export default {
 	off: 'kapalı',
 
 	text_generation: 'Metin üretimi: {provider}.',
+	reply_generation: 'Yazılı cevaplar (kanal/DM): {model} — {host}, en çok {seconds} sn.',
 	tools_backend: 'Araçlar: Responses backend ({model}) — {count} araç + web araması.',
 	tools_client: 'Araçlar: istemci delegasyonu — yalnızca regex sesli komutlar; RESEARCH_MODEL ayarlarsan tüm araçlar açılır.',
 

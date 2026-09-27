@@ -17,6 +17,7 @@ export default {
 	off: 'off',
 
 	text_generation: 'Text generation: {provider}.',
+	reply_generation: 'Written replies (channel/DM): {model} — {host}, {seconds} s at most.',
 	tools_backend: 'Tools: Responses backend ({model}) — {count} tools + web search.',
 	tools_client: 'Tools: client delegation — regex voice commands only; set RESEARCH_MODEL and every tool is enabled.',
 

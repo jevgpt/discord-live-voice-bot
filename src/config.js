@@ -409,6 +409,13 @@ function readConfig(env) {
 		deepseekApiKey,
 		deepseekBaseUrl: str(env.DEEPSEEK_BASE_URL, 'https://api.deepseek.com'),
 		deepseekModel: str(env.DEEPSEEK_MODEL, 'deepseek-chat'),
+		// Written replies (DM / channel) on a model of their own: REPLY_MODEL, and REPLY_BASE_URL + REPLY_API_KEY
+		// for an OpenAI-compatible endpoint other than DeepSeek and OpenAI (NanoGPT, OpenRouter, ...).
+		replyModel: str(env.REPLY_MODEL),
+		replyBaseUrl: str(env.REPLY_BASE_URL),
+		replyApiKey: str(env.REPLY_API_KEY),
+		// How long a written reply may take; a thinking model can take a minute (the typing indicator stays up).
+		replyTimeoutMs: num(env.REPLY_TIMEOUT_MS, 120_000, { min: 5000, max: 600_000 }),
 		// Jev (TypeSafe System One): typed judgments about each finished line. Off without a key.
 		jev: bool(env.JEV, true),
 		jevApiKey: str(env.JEV_API_KEY),

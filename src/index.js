@@ -30,7 +30,7 @@ import { MemoryStore } from './memory.js';
 import { BotChain, ReplyLimiter, handleMessage, messageText, shouldReply } from './messages.js';
 import { LIVE_STATE, MetricsHistory } from './metrics.js';
 import { ActivityLog, startPanel } from './panel.js';
-import { createTextProvider } from './provider.js';
+import { createReplyProvider, createTextProvider } from './provider.js';
 import { QueueStore } from './queuestore.js';
 import { DailyQuota } from './quota.js';
 import { ChannelReader } from './reader.js';
@@ -104,6 +104,8 @@ const provider = createTextProvider({
 		: null,
 	log,
 });
+// Written replies on a model of their own (REPLY_MODEL); without one, the provider above.
+const replyProvider = createReplyProvider({ cfg, openai, fallback: provider, makeClient: ({ apiKey, baseURL }) => new OpenAI({ apiKey, baseURL }), log });
 
 // ---------------------------------------------------------------- local speech server (ears + mouth)
 
@@ -735,7 +737,7 @@ client.on(Events.MessageCreate, (message) => {
 	handleMessage(message, {
 		client,
 		store,
-		provider,
+		provider: replyProvider,
 		visionClient: openai,
 		cfg,
 		// Which server this message may be answered in: the one it came from (it has a session), not the
@@ -806,6 +808,16 @@ client.once(Events.ClientReady, async () => {
 			}),
 		);
 		log(t('boot.text_generation', { provider: provider.describe() }));
+		if (replyProvider !== provider) {
+			let host = 'OpenAI';
+			try {
+				if (cfg.replyBaseUrl) host = new URL(cfg.replyBaseUrl).host;
+				else if (cfg.deepseekApiKey) host = new URL(cfg.deepseekBaseUrl).host;
+			} catch {
+				/* a malformed URL: the reply itself will say so */
+			}
+			log(t('boot.reply_generation', { model: cfg.replyModel, host, seconds: Math.round(cfg.replyTimeoutMs / 1000) }));
+		}
 		log(cfg.useResponsesDelegation ? t('boot.tools_backend', { model: cfg.researchModel, count: toolDefinitions().length }) : t('boot.tools_client'));
 		if (cfg.ownerPriority && cfg.ownerId) log(t('boot.owner_priority', { owner: cfg.ownerId }));
 		log(t(cfg.attribution === 'vote' ? 'boot.attribution_vote' : 'boot.attribution_path'));
