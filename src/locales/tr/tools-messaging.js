@@ -4,6 +4,8 @@ export default {
 	no_send_channel: 'Hangi kanala göndereceğimi bilemedim.',
 	everyone_warning: 'herkesi etiketleme yalnızca sahip isteyince yapılır; mesaj etiketsiz gönderildi',
 	everyone_denied_activity: 'send_message: @everyone reddedildi (sahip değil)',
+	role_ping_warning: '{role} rolünü etiketleme yalnızca sahip isteyince yapılır; mesaj etiketsiz gönderildi',
+	role_ping_denied_activity: 'send_message: @{role} etiketi reddedildi (sahip değil)',
 	empty_message: 'Mesaj boş görünüyor, ne yazacağımı anlayamadım.',
 	sent: 'Mesajı #{channel} kanalına gönderdim.',
 	send_failed: 'Mesajı gönderemedim',
@@ -22,6 +24,11 @@ export default {
 	log_read: '[araç] {channel} okundu: {count} mesaj{fresh}',
 	log_read_new: ' (yeni)',
 	read_failed: '{channel} okunamadı',
+	read_not_allowed: '#{channel} kanalını kendin okuyamıyorsun, o yüzden senin için okumayacağım.',
+	read_not_allowed_unknown: 'Kimin sorduğunu anlayamadım; #{channel} herkese açık bir kanal değil, o yüzden okumayacağım.',
+	dm_read_owner_only: 'Özel sohbetleri bana yalnızca bot sahibi okutabilir.',
+	log_read_refused: '[araç] okuma reddedildi: {who} #{channel} kanalını okuyamıyor',
+	log_dm_read_refused: '[araç] okuma reddedildi: özel sohbetler yalnızca bot sahibine açık ({who} istedi)',
 
 	member_not_found: '"{name}" diye birini bulamadım.',
 	no_dm_text: 'Ne yazacağımı anlayamadım.',
@@ -31,6 +38,9 @@ export default {
 	dm_sent: '{who} kişisine özelden yazdım.',
 	dm_failed: '{who} özelden yazamadım',
 	dm_failed_fallback_name: 'O kişiye',
+	// Owner-gate words for a DM to somebody other than the person asking. Three letters or more match as
+	// a prefix ("ozel" also matches "ozelden"); "=word" matches the word and its inflections only.
+	dm_words: ['dm', 'pm', 'ozel', 'mesaj', 'yaz', 'ilet', 'gonder', 'yolla', '=soyle'],
 
 	no_delete_channel: 'Hangi kanaldan sileceğimi bilemedim.',
 	log_deleted_one: '[araç] mesaj silindi -> #{channel}',
@@ -41,6 +51,8 @@ export default {
 	delete_none: 'Mesajları silemedim (izin ya da süre sınırı).',
 	deleted_many: '{count} mesajı sildim.',
 	delete_failed: 'Mesajları silemedim',
+	delete_many_question: '{channel} içindeki son {count} mesajı sileceğim; bu geri alınamaz.',
+	delete_many_from_question: '{channel} içinde {who} kişisinin son {count} mesajını sileceğim; bu geri alınamaz.',
 
 	no_edit_channel: 'Hangi kanaldaki mesajı düzenleyeceğimi bilemedim.',
 	no_edit_text: 'Yeni mesaj metnini anlayamadım.',
@@ -49,6 +61,8 @@ export default {
 	log_edited: '[araç] mesaj düzenlendi -> #{channel}',
 	edited: 'Mesajı düzenledim: "{text}"',
 	edit_failed: 'Mesajı düzenleyemedim',
+	// Owner-gate words for editing a message the bot already posted.
+	edit_words: ['duzenle', 'duzelt', 'degistir', 'guncelle', 'edit'],
 
 	no_bots: 'Sunucuda bildiğim başka bot yok.',
 	bots_authorized: 'yetkili: {names}',

@@ -33,12 +33,23 @@ export default {
 	local_server_starting: 'Starting the Chatterbox server: {python} {script} {args}',
 	local_server_spawn_failed: 'Could not run the Chatterbox server: {error}',
 	local_server_exit_log: 'The Chatterbox server stopped (exit {code}); attempt {count}/{max}.',
+	local_server_token_not_kept: 'The Chatterbox token could not be kept in {file} ({error}); a server left running after the bot is killed will refuse the next start.',
 	// --- local speech synthesis (src/localtts.js)
 	tts_fallback_language: 'en',
 	tts_health_failed: 'local TTS health check failed: {error}',
+	speech_refused: 'the speech server at {url} refused the request ({status}): check LOCAL_TTS_TOKEN and LOCAL_TTS_URL, or stop a server left running by an earlier start of the bot (end the python process that holds that port)',
 	tts_empty_text: 'empty text',
 	tts_error: 'local TTS error ({status})',
 	tts_error_detail: 'local TTS error ({status}): {detail}',
+	// --- the check on what the local voice produced (src/ttsguard.js)
+	tts_guard_suspicious: 'local voice ({engine}): "{text}" came out wrong ({why}); making it again',
+	tts_guard_long: 'too long: {seconds} s where about {expected} s was expected',
+	tts_guard_short: 'too short: {seconds} s where about {expected} s was expected',
+	tts_guard_heard: 'it was heard as "{heard}", a character error rate of {cer}',
+	tts_guard_gave_up: 'local voice ({engine}): none of {attempts} attempts at "{text}" passed the check; playing the closest one',
+	tts_guard_retry_failed: 'local voice ({engine}): another attempt at "{text}" failed: {error}',
+	tts_guard_stt_skipped: 'local voice: the transcriber did not answer ({error}); the round-trip check is left out for a minute',
+	tts_guard_timeout: 'timed out',
 	// --- latency metrics (src/latency.js)
 	latency_seconds: '{value}s',
 	latency_summary: 'Response latency: P50 {p50}, P90 {p90} (n={count})',

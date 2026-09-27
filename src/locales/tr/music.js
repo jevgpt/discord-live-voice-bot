@@ -2,6 +2,9 @@
 export default {
 	// --- console log lines (src/music.js)
 	log_ytdlp_download: 'yt-dlp bulunamadı; indiriliyor: {target}',
+	log_ytdlp_verified: 'yt-dlp {tag} ({asset}) indirildi ve SHA-256 değeri sürümdekiyle eşleşti: {target}',
+	log_ytdlp_replacing: '{target} konumundaki yt-dlp bu makinedeki her hesap tarafından değiştirilebiliyordu; doğrulanmış bir indirmeyle değiştiriliyor',
+	log_ytdlp_tightened: '{target} konumundaki yt-dlp bu makinedeki her hesap tarafından değiştirilebiliyordu; izinleri artık 0755. Doğrulanmış bir kopya için dosyayı sil.',
 	log_ytdlp: 'yt-dlp: {message}',
 	log_ffmpeg: 'ffmpeg: {message}',
 	log_playing: 'müzik: çalıyor -> {title}{duration}',
@@ -9,6 +12,13 @@ export default {
 	log_skipped: 'müzik: atlandı -> {title}',
 	log_stopped: 'müzik: durduruldu ({title})',
 	log_track_failed: 'müzik: "{title}" çalınamadı: {message}',
+	log_seek: 'müzik: {title}: {from} -> {to}',
+	log_resumed_at: 'müzik: devam -> {title}, {position} noktasından',
+	// --- the saved queue (src/queuestore.js), read back when a server's session starts
+	log_queue_save_failed: 'müzik: sıra kaydedilemedi: {error}',
+	log_queue_restored: 'müzik: kayıtlı sıra geri yüklendi ({count} parça), "{title}" {position} noktasında duraklatılmış bekliyor; {dropped} parça çıkarıldı. "Devam" denince sürer.',
+	log_queue_restore_empty: 'müzik: kayıtlı sıradaki {dropped} parçanın hiçbiri artık çalınamıyor; hiçbir şey geri yüklenmedi',
+	log_queue_restore_failed: 'müzik: kayıtlı sıra geri okunamadı ({error}); boş bir sırayla başlanıyor, kayıtlı olan yeniden müzik çalınana kadar diskte kalıyor',
 	// --- failure reasons; they are read out through the music tools
 	error_empty_query: 'ne çalacağımı anlayamadım',
 	error_no_results: 'sonuç bulunamadı',
@@ -19,12 +29,25 @@ export default {
 	error_spawn_failed: '{binary} çalıştırılamadı: {message}',
 	error_exit_code: 'çıkış kodu {code}',
 	error_ffmpeg_spawn: 'ffmpeg çalıştırılamadı: {message}',
+	error_spawn_refused: 'çalar bunu başlatmayı reddetti: {message}',
 	error_no_audio: 'ses verisi gelmedi',
 	error_decode: 'çözme hatası ({code})',
+	// --- downloading yt-dlp (src/ytdlp.js); these reach the log, not the voice channel
+	error_ytdlp_version: 'YTDLP_VERSION bir sürüm etiketi değil: {version}',
+	error_ytdlp_release: 'indirilecek yt-dlp sürümü bulunamadı ({detail})',
+	error_ytdlp_http: 'yt-dlp indirilemedi: {file} için HTTP {status}',
+	error_ytdlp_no_checksum: 'yt-dlp {tag} sürümünde {asset} için bir sağlama değeri yok',
+	error_ytdlp_checksum: 'indirilen yt-dlp ({asset}, {tag}) sürümde yayımlanan SHA-256 ile eşleşmiyor; silindi',
+	error_ytdlp_too_large: 'yt-dlp indirmesi bir yt-dlp dosyasından çok daha büyüktü; silindi',
 	// --- spoken status line
 	nothing_playing: 'Şu an müzik çalmıyor.',
 	state_playing: 'Çalıyor',
 	state_paused: 'Duraklatıldı',
 	now_playing: '{state}: {title}{extra}.',
+	// How far into the track: with its length when it is known (links), without it when not (local files).
+	progress: '{elapsed} / {duration}',
+	progress_open: '{elapsed} geçti',
+	loop_suffix_track: ' Bu parça tekrarda.',
+	loop_suffix_queue: ' Sıra döngüde.',
 	queue_suffix: ' Sırada {count} parça var.',
 };

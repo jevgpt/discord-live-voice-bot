@@ -8,7 +8,7 @@ import { t } from './i18n/index.js';
 
 const squash = (text) => String(text ?? '').replace(/\s+/g, ' ').trim();
 
-export function createTextProvider({ openai, textModel, deepseek = null, log = () => {} }) {
+export function createTextProvider({ openai, textModel, deepseek = null, timeoutMs = 30_000, log = () => {} }) {
 	const useDeepseek = Boolean(deepseek?.client && deepseek?.model);
 	const textClient = useDeepseek ? deepseek.client : openai;
 	const model = useDeepseek ? deepseek.model : textModel;
@@ -19,6 +19,7 @@ export function createTextProvider({ openai, textModel, deepseek = null, log = (
 		textModel: model,
 		visionClient: openai,
 		visionModel: textModel,
+		timeoutMs,
 		log,
 	});
 }
@@ -37,7 +38,47 @@ export function providerFromDeps(deps) {
 	});
 }
 
-function buildProvider({ kind, textApi, textClient, textModel, visionClient, visionModel, log }) {
+/**
+ * A reasoning model's answer without its reasoning. Some OpenAI-compatible endpoints (NanoGPT's ":thinking"
+ * models among them) put the thinking in the text itself, between <think> tags, and a written reply must
+ * not post it to the channel. A closing tag with no opening one means everything before it was thinking;
+ * an opening tag with no closing one (a cut-off answer) means nothing after it is the answer.
+ */
+export function stripThinking(text) {
+	let out = String(text ?? '').replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/giu, '');
+	const close = out.search(/<\/think(?:ing)?>/iu);
+	if (close >= 0) out = out.slice(close).replace(/^<\/think(?:ing)?>/iu, '');
+	const open = out.search(/<think(?:ing)?>/iu);
+	if (open >= 0) out = out.slice(0, open);
+	return out.trim();
+}
+
+/**
+ * The provider for written replies (DM and channel). With REPLY_MODEL it is a model of their own; without
+ * it, the text provider everything else uses. REPLY_BASE_URL and REPLY_API_KEY point it at any
+ * OpenAI-compatible endpoint (NanoGPT, OpenRouter, ...); without a URL it goes through the DeepSeek
+ * connection when there is one, and OpenAI otherwise. A URL without a key would fail every reply, so it
+ * is not used and the log says so: replies carry on with the text provider until the key is there.
+ * `makeClient({ apiKey, baseURL })` builds the OpenAI-compatible client.
+ */
+export function createReplyProvider({ cfg, openai, fallback, makeClient, log = () => {} }) {
+	const model = cfg?.replyModel;
+	if (!model) return fallback;
+	const timeoutMs = cfg.replyTimeoutMs ?? 120_000;
+	const chat = (apiKey, baseURL) =>
+		createTextProvider({ openai, textModel: cfg.textModel, deepseek: { client: makeClient({ apiKey, baseURL }), model }, timeoutMs, log });
+	if (cfg.replyBaseUrl) {
+		if (!cfg.replyApiKey) {
+			log(t('provider.reply_key_missing', { model, fallback: fallback?.describe?.() ?? '?' }));
+			return fallback;
+		}
+		return chat(cfg.replyApiKey, cfg.replyBaseUrl);
+	}
+	if (cfg.deepseekApiKey) return chat(cfg.replyApiKey ?? cfg.deepseekApiKey, cfg.deepseekBaseUrl);
+	return createTextProvider({ openai, textModel: model, timeoutMs, log });
+}
+
+function buildProvider({ kind, textApi, textClient, textModel, visionClient, visionModel, timeoutMs: defaultTimeoutMs = 30_000, log }) {
 	const provider = {
 		kind,
 		textApi,
@@ -50,7 +91,7 @@ function buildProvider({ kind, textApi, textClient, textModel, visionClient, vis
 		},
 
 		/** Plain text answer (system instruction + user input). */
-		async complete({ instructions, input, timeoutMs = 30_000, maxTokens = null }) {
+		async complete({ instructions, input, timeoutMs = defaultTimeoutMs, maxTokens = null }) {
 			if (!textClient || !textModel) throw new Error(t('provider.text_provider_missing'));
 			if (textApi === 'chat') {
 				const response = await textClient.chat.completions.create(
@@ -64,7 +105,7 @@ function buildProvider({ kind, textApi, textClient, textModel, visionClient, vis
 					},
 					{ timeout: timeoutMs },
 				);
-				return response.choices?.[0]?.message?.content ?? '';
+				return stripThinking(response.choices?.[0]?.message?.content ?? '');
 			}
 			const response = await textClient.responses.create(
 				{ model: textModel, instructions, input, ...(maxTokens ? { max_output_tokens: maxTokens } : {}) },
@@ -74,7 +115,7 @@ function buildProvider({ kind, textApi, textClient, textModel, visionClient, vis
 		},
 
 		/** Input with images: always the vision-capable OpenAI Responses path. */
-		async completeWithImages({ instructions, input, timeoutMs = 30_000 }) {
+		async completeWithImages({ instructions, input, timeoutMs = defaultTimeoutMs }) {
 			const client = visionClient?.responses ? visionClient : textApi === 'responses' ? textClient : null;
 			const model = visionClient?.responses ? (visionModel ?? textModel) : textModel;
 			if (!client || !model) throw new Error(t('provider.vision_client_missing'));
@@ -90,7 +131,7 @@ function buildProvider({ kind, textApi, textClient, textModel, visionClient, vis
 					{ model: textModel, messages: [{ role: 'user', content: prompt }] },
 					{ timeout: timeoutMs },
 				);
-				return squash(response.choices?.[0]?.message?.content ?? '');
+				return squash(stripThinking(response.choices?.[0]?.message?.content ?? ''));
 			}
 			const response = await textClient.responses.create(
 				{ model: textModel, tools: [{ type: 'web_search' }], tool_choice: 'auto', input: prompt },

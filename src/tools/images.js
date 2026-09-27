@@ -4,7 +4,7 @@
 
 import { AttachmentBuilder } from 'discord.js';
 import { t } from '../i18n/index.js';
-import { SlidingLimiter, resolveTextChannel } from './helpers.js';
+import { SlidingLimiter, askAfterUntrustedRead, resolveTextChannel } from './helpers.js';
 import { P, defineTool } from './registry.js';
 
 // A picture costs money every time it is drawn, so one person cannot turn a conversation into a bill.
@@ -40,11 +40,17 @@ export const tools = [
 			},
 			['prompt'],
 		),
-		async handler(args, deps) {
+		// It posts in the bot's name, caption and all: after other people's words were read in the same
+		// turn it waits for the owner's yes, as send_message does (askAfterUntrustedRead).
+		asks: true,
+		async handler(args, deps, { name }) {
 			const prompt = String(args.prompt ?? '').trim().slice(0, MAX_PROMPT);
 			if (!prompt) return { ok: false, spoken: t('tools.images.empty') };
 			const images = deps.openai?.images ?? null;
 			if (!images?.generate) return { ok: false, spoken: t('tools.images.disabled') };
+			// Asked before the picture is drawn: drawing it costs money whether or not it is posted.
+			const asked = askAfterUntrustedRead(deps, name);
+			if (asked) return asked;
 			const speaker = deps.currentSpeakerId?.() ?? null;
 			if (!limiter.take(`image:${speaker ?? 'anyone'}`, PER_MINUTE)) {
 				return { ok: false, spoken: t('tools.images.too_many') };

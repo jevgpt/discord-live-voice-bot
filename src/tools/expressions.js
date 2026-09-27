@@ -379,7 +379,7 @@ export const tools = [
 			'Deletes a custom server emoji. Every message that used it loses the picture. ' +
 			'Owner only; two-step (asks first, deletes with confirm:true).',
 		parameters: P.obj({ emoji: P.str('The emoji (name, :name: or its id)'), confirm: P.confirm() }, ['emoji']),
-		gate: { keywords: WORDS.emoji },
+		gate: { keywords: WORDS.delete },
 		async handler(args, deps, { name }) {
 			const emoji = resolveGuildEmoji(deps, args.emoji);
 			if (!emoji) return { ok: false, spoken: t('tools.expressions.emoji_not_found', { name: String(args.emoji ?? '').slice(0, 40) }) };
@@ -549,7 +549,7 @@ export const tools = [
 		name: 'delete_sticker',
 		description: 'Deletes a server sticker. Owner only; two-step (asks first, deletes with confirm:true).',
 		parameters: P.obj({ sticker: P.str('The sticker (name or id)'), confirm: P.confirm() }, ['sticker']),
-		gate: { keywords: WORDS.emoji },
+		gate: { keywords: WORDS.delete },
 		async handler(args, deps, { name }) {
 			let sticker;
 			try {

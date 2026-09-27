@@ -7,6 +7,7 @@ import {
 	PermissionFlagsBits,
 } from 'discord.js';
 import { callTool, toolMeta } from '../../src/tools.js';
+import { ownerVoice } from '../owner-voice.js';
 
 const HOUR = 3_600_000;
 let guildCounter = 0;
@@ -287,11 +288,13 @@ describe('edit_event', () => {
 describe('cancel_event', () => {
 	it('asks first and only cancels on the second call', async () => {
 		const { deps, store, calls } = makeDeps({ owner: true });
+		const owner = ownerVoice(deps);
 		const asked = await callTool('cancel_event', { event: 'Movie night' }, deps);
 		assert.equal(asked.needs_confirmation, true, asked.spoken);
 		assert.deepEqual(calls, [], 'nothing is cancelled before the answer');
 		assert.equal(store.get('e1').status, GuildScheduledEventStatus.Scheduled);
 
+		owner.says('yes, cancel it');
 		const done = await callTool('cancel_event', { event: 'Movie night', confirm: true }, deps);
 		assert.equal(done.ok, true, done.spoken);
 		assert.equal(store.get('e1').status, GuildScheduledEventStatus.Canceled);
@@ -300,7 +303,9 @@ describe('cancel_event', () => {
 	it('ends an event that has already started, because Discord cannot cancel one', async () => {
 		const { deps, store } = makeDeps({ owner: true });
 		store.get('e1').status = GuildScheduledEventStatus.Active;
+		const owner = ownerVoice(deps);
 		await callTool('cancel_event', { event: 'Movie night' }, deps);
+		owner.says('go ahead');
 		const done = await callTool('cancel_event', { event: 'Movie night', confirm: true }, deps);
 		assert.equal(done.ok, true, done.spoken);
 		assert.match(done.spoken, /already started/i);

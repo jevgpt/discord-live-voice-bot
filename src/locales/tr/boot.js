@@ -4,6 +4,8 @@
 // and the start-up summary written once the Discord client is ready.
 export default {
 	config_failed: 'Ayarlar okunamadı: {error}',
+	// One line per setting that was not read as written (config.warn_*); the bot starts regardless.
+	config_warning: 'Ayarlar: {warning}',
 
 	panel_history: 'Panel geçmişi yüklendi: {count} olay (data/activity.jsonl).',
 	joined_channel: '"{channel}" kanalına katıldım. Konuşulanlar dinleniyor.',
@@ -15,10 +17,14 @@ export default {
 	off: 'kapalı',
 
 	text_generation: 'Metin üretimi: {provider}.',
+	reply_generation: 'Yazılı cevaplar (kanal/DM): {model} — {host}, en çok {seconds} sn.',
 	tools_backend: 'Araçlar: Responses backend ({model}) — {count} araç + web araması.',
 	tools_client: 'Araçlar: istemci delegasyonu — yalnızca regex sesli komutlar; RESEARCH_MODEL ayarlarsan tüm araçlar açılır.',
 
 	owner_priority: 'Sahip önceliği açık: {owner} konuşurken yalnızca onun sesi işleniyor.',
+	attribution_path:
+		'Konuşmacı ataması: her satırda tek bir konuşmacı yolu (ATTRIBUTION=hmm); sıranın kenarındaki bir parça, kendi sesi aksini söylemedikçe komşularıyla gider.',
+	attribution_vote: 'Konuşmacı ataması: her parça kendi sesine göre (ATTRIBUTION=vote).',
 	no_owner_id: 'OWNER_ID ayarlı değil: sesli yönetici araçları (ban/rol/kanal/ayar) kapalı; slash yetkisi ManageGuild ile.',
 
 	music_on: 'Müzik açık: ses %{volume}, konuşurken %{duck}{folder}.',
@@ -28,8 +34,12 @@ export default {
 	brain_auto: 'Beyin: GPT-Live; kredi/anahtar hatasında yerel beyne (whisper + DeepSeek + Chatterbox) düşer.',
 	brain_live: 'Beyin: yalnızca GPT-Live.',
 
-	chatterbox_autostart: 'Chatterbox sunucusu gerekince bot tarafından başlatılacak ({model}, whisper {stt}).',
-	chatterbox_missing_venv: 'Chatterbox sanal ortamı bulunamadı (.venv-chatterbox); yerel ses için tools/setup-chatterbox.ps1.',
+	chatterbox_autostart:
+		'Ses sunucusu gerekince bot tarafından başlatılacak (motor {engine}, seçilebilenler: {engines}; Chatterbox {model}, whisper {stt}).',
+	// {engines} above while LOCAL_TTS_ENGINES is empty.
+	tts_engines_installed: 'kurulu olanların hepsi',
+	chatterbox_missing_venv:
+		'Yerel ses sanal ortamı bulunamadı (.venv-chatterbox); yerel ses için tools/setup-chatterbox.ps1 (Windows) ya da tools/setup-voice.sh (Linux, macOS) çalıştır.',
 
 	daily_quota: 'Günlük GPT-Live kotası: {limit} dk (bugün {used} dk kullanıldı).',
 	record_off: 'Kayıt KAPALI: ses dökümleri ve mesaj metinleri panel günlüğüne yazılmıyor.',

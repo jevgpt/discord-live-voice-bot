@@ -297,7 +297,7 @@ export const tools = [
 			},
 			['webhook'],
 		),
-		gate: { keywords: WORDS.webhook },
+		gate: { keywords: WORDS.delete },
 		async handler(args, deps, { name }) {
 			const found = await resolveWebhook(deps, args.webhook, args.channel);
 			if (found.spoken) return { ok: false, spoken: found.spoken };

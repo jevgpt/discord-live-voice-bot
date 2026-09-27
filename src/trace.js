@@ -18,10 +18,11 @@ const FLUSH_MS = 1000;
 
 export class SessionTrace {
 	/**
-	 * @param {{ dir: string, name?: string, text?: boolean, owner?: string|null, log?: Function, now?: Function }} options
-	 *   text = whether transcript text may be written (RECORD_TRANSCRIPTS)
+	 * @param {{ dir: string, name?: string, text?: boolean, owner?: string|null, attribution?: string|null, log?: Function, now?: Function }} options
+	 *   text = whether transcript text may be written (RECORD_TRANSCRIPTS); attribution = the ATTRIBUTION the
+	 *   lines were named under, so that a replay can say which of its modes the live lines came from
 	 */
-	constructor({ dir, name = null, text = true, owner = null, log = () => {}, now = Date.now } = {}) {
+	constructor({ dir, name = null, text = true, owner = null, attribution = null, log = () => {}, now = Date.now } = {}) {
 		this.dir = dir;
 		this.text = text;
 		this.log = log;
@@ -34,7 +35,7 @@ export class SessionTrace {
 		this.timer = null;
 		this.chain = Promise.resolve();
 		this.ready = mkdir(dir, { recursive: true }).catch(() => {});
-		this.write({ t: 'm', owner: owner ? String(owner) : null, started: now(), text });
+		this.write({ t: 'm', owner: owner ? String(owner) : null, started: now(), text, attribution });
 	}
 
 	/** One mixer frame; written only when the set of voices (or the priority flag) changes. */
@@ -222,10 +223,11 @@ export class AudioTrace {
 }
 
 /**
- * Runs the attribution over a trace's records/**
  * Runs the attribution over a trace's records and compares what it decides now with what was decided
  * then. The straddle handling of onTranscript (a fragment judged on the audio new since the last one)
- * is not replayed: the recorded positions are the ones actually looked up.
+ * is not replayed: the recorded positions are the ones actually looked up. replaySession (src/replay.js)
+ * replays the whole transcript pipeline instead, windows and lines included, in either ATTRIBUTION mode;
+ * scripts/replay-trace.mjs uses that.
  * @param {object[]} records parsed lines of a trace file
  * @returns {{ total: number, matched: number, decisions: Array<{ text?: string, recorded: string|null, replayed: string|null, same: boolean, rs: number, re: number, drift: number }> }}
  */

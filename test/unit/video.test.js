@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, it } from 'node:test';
+import { UNSUPPORTED_LINK } from '../../src/music.js';
 import { callTool } from '../../src/tools/index.js';
 import { fetchVideo, forgetVideos, recallVideo, rememberVideo, srtToText } from '../../src/video.js';
 
@@ -79,6 +80,47 @@ describe('fetchVideo', () => {
 		assert.match(video.transcript, /ilk satır ikinci satır/);
 		assert.equal(recallVideo().id, 'abc123', 'the newest read is what a follow-up question means');
 		assert.equal(recallVideo('bir video').id, 'abc123');
+	});
+
+	it('reads no yt-dlp config, keeps the target positional and takes the subtitles from the page it settled on', async () => {
+		forgetVideos();
+		const calls = [];
+		const spawn = fakeSpawn({ info: INFO });
+		const video = await fetchVideo('--exec touch bir video', {
+			ytDlpPath: BINARY,
+			autoDownload: false,
+			spawnImpl: (binary, args) => {
+				calls.push(args);
+				return spawn(binary, args);
+			},
+			log: () => {},
+		});
+		assert.equal(calls.length, 2);
+		for (const args of calls) assert.equal(args[0], '--ignore-config');
+		assert.deepEqual(calls[0].slice(-2), ['--', 'ytsearch1:--exec touch bir video']);
+		assert.deepEqual(calls[1].slice(-2), ['--', INFO.webpage_url], 'the second call fetches the page the search found, not the search again');
+		assert.equal(video.url, INFO.webpage_url);
+	});
+
+	it('refuses a page yt-dlp answered with on a host a link could not name', async () => {
+		forgetVideos();
+		const calls = [];
+		const spawn = fakeSpawn({ info: { ...INFO, webpage_url: 'http://169.254.169.254/latest/meta-data' } });
+		await assert.rejects(
+			() =>
+				fetchVideo('https://youtu.be/abc123', {
+					ytDlpPath: BINARY,
+					autoDownload: false,
+					spawnImpl: (binary, args) => {
+						calls.push(args);
+						return spawn(binary, args);
+					},
+					log: () => {},
+				}),
+			new RegExp(UNSUPPORTED_LINK),
+		);
+		assert.equal(calls.length, 1, 'the subtitles were never fetched');
+		assert.equal(recallVideo(), null);
 	});
 
 	it('says there are no subtitles rather than inventing a transcript', async () => {

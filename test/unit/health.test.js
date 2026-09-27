@@ -90,4 +90,39 @@ describe('the audio line of the report', () => {
 		const young = health.report({ audio: { ...audio, sentRatio: 0.9, sent: 100 } });
 		assert.equal(young.length, 3, 'the rate means nothing before 30 s of audio');
 	});
+
+	// VAD=adaptive: what the detector sees of each microphone is on the same line, so that a live session
+	// says whose floor is a fan (-40) and whose voice only just clears their bar.
+	it('shows each person s noise floor and speech bar under the adaptive detector', () => {
+		const health = new SessionHealth();
+		const levels = [
+			{ id: 'a', name: 'Ada', levelDb: -31, gainDb: 11, floorDb: -58, thresholdDb: -52 },
+			{ id: 'b', name: 'Bo', levelDb: null, gainDb: 0, floorDb: -41, thresholdDb: -35 },
+			{ id: 'c', name: 'Cem', levelDb: -24, gainDb: -4, floorDb: null, thresholdDb: null },
+		];
+		const line = health.report({ audio: { holes: 0, sent: 10, levels } })[2];
+		assert.match(line, /Ada -31 dB \(\+11 dB; floor -58 dB, speech from -52 dB\)/);
+		assert.match(line, /Bo \? dB \(\+0 dB; floor -41 dB, speech from -35 dB\)/, 'no AGC level measured yet: a question mark, not a number');
+		assert.match(line, /Cem -24 dB \(-4 dB\)(,|$)/, 'the peak bar has no floor to show');
+	});
+});
+
+describe('the local voice line of the report', () => {
+	// How often the local voice came out wrong, per engine: the check counters of src/ttsguard.js.
+	it('counts the checks per engine once a sentence was checked, and says nothing before', () => {
+		const health = new SessionHealth();
+		const tts = {
+			default: { checked: 120, suspicious: 6, failedRoundTrip: 3, retried: 5, fellBack: 1 },
+			freya: { checked: 1, suspicious: 0, failedRoundTrip: 0, retried: 0, fellBack: 0 },
+			unused: { checked: 0, suspicious: 0, failedRoundTrip: 0, retried: 0, fellBack: 0 },
+		};
+		const lines = health.report({ tts });
+		assert.equal(lines.length, 3, lines.join('\n'));
+		assert.equal(
+			lines[2],
+			'[health] local voice: default 120 checked, 6 suspicious, 3 failed the round trip, 5 retried, 1 fell back, freya 1 checked, 0 suspicious, 0 failed the round trip, 0 retried, 0 fell back',
+		);
+		assert.equal(health.report({ tts: { default: tts.unused } }).length, 2);
+		assert.equal(health.report({ tts: null }).length, 2);
+	});
 });

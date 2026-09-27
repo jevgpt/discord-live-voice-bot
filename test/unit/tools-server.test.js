@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { ChannelType, GuildDefaultMessageNotifications, GuildFeature, PermissionFlagsBits } from 'discord.js';
 import { callTool, toolMeta } from '../../src/tools.js';
+import { ownerVoice } from '../owner-voice.js';
 
 // Every tool in src/tools/server.js, so the gate test cannot silently miss a newly added one.
 const SERVER_TOOLS = [
@@ -269,12 +270,14 @@ describe('prune', () => {
 
 	it('says the number and asks first, then removes the members once confirmed', async () => {
 		const { deps, calls } = makeDeps({ owner: true, pruneCount: 12 });
+		const owner = ownerVoice(deps);
 		const asked = await callTool('prune_members', { days: 30 }, deps);
 		assert.equal(asked.ok, false);
 		assert.equal(asked.needs_confirmation, true);
 		assert.match(asked.spoken, /12/, 'the dry-run count has to be said before anything happens');
 		assert.deepEqual(calls.map((call) => call.prune.dry), [true], 'the question must not prune');
 
+		owner.says('yes, do it');
 		const done = await callTool('prune_members', { days: 30, confirm: true }, deps);
 		assert.equal(done.ok, true, done.spoken);
 		assert.match(done.spoken, /12/);
@@ -285,9 +288,11 @@ describe('prune', () => {
 
 	it('refuses a confirmation once the number has moved, and prunes nobody', async () => {
 		const { deps, guild, calls } = makeDeps({ owner: true, pruneCount: 5 });
+		const owner = ownerVoice(deps);
 		const asked = await callTool('prune_members', { days: 30 }, deps);
 		assert.equal(asked.needs_confirmation, true);
 		guild.__pruneCount = 40; // forty people would go now, not five
+		owner.says('yes');
 		const result = await callTool('prune_members', { days: 30, confirm: true }, deps);
 		assert.equal(result.ok, false, 'a confirmation for five must not remove forty');
 		assert.ok(!calls.some((call) => call.prune.dry === undefined), 'nothing was actually pruned');

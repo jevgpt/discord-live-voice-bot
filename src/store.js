@@ -7,7 +7,9 @@ import { dirname } from 'node:path';
 import { t } from './i18n/index.js';
 
 const MAX_NAME = 80;
-const MAX_PROMPT = 8000;
+// A persona can be long; this is a guard against a runaway paste, not a style limit. The /panel modal
+// takes 12,000 of it (three fields), data/characters.json the rest.
+const MAX_PROMPT = 32_000;
 const MAX_VOICE = 40;
 
 export class CharacterStore {

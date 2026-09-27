@@ -3,6 +3,7 @@ export default {
 	ring_capacity: 'Ring kapasitesi pozitif tamsayı olmalı: {capacity}',
 	speaking: 'konuşan: {ids}',
 	output_blocked: 'ses çıkışı tıkandı; {count} kare ({ms} ms) konuşma düştü',
+	music_read_failed: 'ses döngüsü müzik çalardan okurken çalar hata verdi; düzelene kadar müzik sessiz: {error}',
 	connection_destroyed: 'ses bağlantısı yok edildi',
 	state_timeout: 'ses bağlantısı {status} durumuna geçmedi (şu an: {current})',
 	join_cancelled: 'katılma iptal edildi (yeni istek geldi)',

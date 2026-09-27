@@ -21,3 +21,6 @@ jobs:
       - run: npm run check:locales
       - run: npm run test:unit
       - run: npm run selftest
+      # The speech server's engines, routing and HTTP checks, with fakes only: no torch, no model downloads.
+      # (test:unit runs it too when a python3 is found; this step fails outright if it is missing.)
+      - run: python3 -m unittest -v tools/test_voice_server.py

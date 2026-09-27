@@ -19,6 +19,7 @@ import config from './config.js';
 import reader from './reader.js';
 import keywords from './keywords.js';
 import grammar from './grammar.js';
+import speech from './speech.js';
 import toolsHelpers from './tools-helpers.js';
 import toolsMessaging from './tools-messaging.js';
 import toolsMembers from './tools-members.js';
@@ -62,6 +63,7 @@ export default {
 	reader,
 	keywords,
 	grammar,
+	speech,
 	tools: {
 		helpers: toolsHelpers,
 		messaging: toolsMessaging,

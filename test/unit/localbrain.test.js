@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { LocalBrain, toChatTools } from '../../src/localbrain.js';
-import { LocalStt, SpeechSegmenter } from '../../src/localstt.js';
+import { LocalStt, SpeechSegmenter, downsampleForStt } from '../../src/localstt.js';
+import { rmsOf } from '../../src/audio.js';
 import { describeLiveError } from '../../src/live.js';
 
 // The brain streams, so the double has to as well: one chunk per word for the content, and tool calls
@@ -236,6 +237,39 @@ describe('LocalStt', () => {
 		} finally {
 			globalThis.fetch = original;
 		}
+	});
+});
+
+describe('the 16 kHz the transcriber is sent', () => {
+	const tone = (hz, amplitude = 10_000) => Int16Array.from({ length: 24_000 }, (_, i) => Math.round(amplitude * Math.sin((2 * Math.PI * hz * i) / 24_000)));
+	// The middle of the output, away from where the held ends meet the filter.
+	const middle = (pcm) => pcm.subarray(1000, pcm.length - 1000);
+
+	// A review finding: plain linear interpolation from 24 kHz folded 8-12 kHz back into the speech band,
+	// a 10 kHz tone arriving at 6 kHz only 4 dB down.
+	it('keeps what lies above 8 kHz from folding back into speech', () => {
+		for (const hz of [9000, 10_000, 11_000]) {
+			const out = downsampleForStt(tone(hz));
+			const level = rmsOf(middle(out));
+			assert.ok(level < 10, `${hz} Hz in, at least 60 dB down out: rms ${level.toFixed(1)} of ${(10_000 / Math.SQRT2).toFixed(0)}`);
+		}
+		const edge = rmsOf(middle(downsampleForStt(tone(8500))));
+		assert.ok(edge < 100, `just above 8 kHz, at least 37 dB down: ${edge.toFixed(1)}`);
+	});
+
+	it('leaves speech alone', () => {
+		for (const hz of [300, 1000, 3000, 6000]) {
+			const ratio = rmsOf(middle(downsampleForStt(tone(hz)))) / (10_000 / Math.SQRT2);
+			assert.ok(Math.abs(ratio - 1) < 0.02, `${hz} Hz passes at its level: ${ratio.toFixed(3)}`);
+		}
+	});
+
+	it('is two samples for every three, and a level held to the very ends', () => {
+		const out = downsampleForStt(new Int16Array(24_000).fill(100));
+		assert.equal(out.length, 16_000);
+		assert.ok(out.every((v) => v === 100), 'no fade in or out at the edges');
+		assert.equal(downsampleForStt(new Int16Array(0)).length, 0);
+		assert.equal(downsampleForStt(new Int16Array(3).fill(-32768)).every((v) => v === -32768), true, 'full scale stays in range');
 	});
 });
 

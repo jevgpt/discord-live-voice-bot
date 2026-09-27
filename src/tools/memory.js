@@ -1,7 +1,8 @@
 // Memory tools: take a note about a person / recall it / forget it (src/memory.js).
 
 import { t, tList } from '../i18n/index.js';
-import { WORDS, displayName, findMember, ownerGate } from './helpers.js';
+import { requesterId, requesterIsOwner } from './access.js';
+import { WORDS, askAfterUntrustedRead, displayName, findMember, ownerGate } from './helpers.js';
 import { P, defineTool } from './registry.js';
 
 /** Memory is not wired up (.env: MEMORY=0); every memory tool answers the same way. */
@@ -9,14 +10,14 @@ function noMemory() {
 	return { ok: false, spoken: t('tools.memory.disabled') };
 }
 
-/** Target member: look them up when a name is given, otherwise the person speaking right now. */
+/** Target member: look them up when a name is given, otherwise the person whose line asked. */
 async function targetOf(deps, name) {
 	const wanted = String(name ?? '').trim();
 	if (wanted) {
 		const member = await findMember(deps, wanted);
-		return member ? { id: member.id, name: displayName(member) } : null;
+		return member ? { id: String(member.id), name: displayName(member) } : null;
 	}
-	const id = deps.currentSpeakerId?.() ?? null;
+	const id = requesterId(deps);
 	if (!id) return null;
 	return { id, name: deps.currentSpeakerName?.() ?? null };
 }
@@ -27,15 +28,18 @@ export const tools = [
 		description:
 			'Saves a short note to keep in mind about a person (e.g. "their cat is called Smokey", "exam on Friday"). If member is empty, the current speaker.',
 		parameters: P.obj({ member: P.str('Person name (empty = the current speaker)'), note: P.str('Short note') }, ['note']),
+		// A note about somebody else goes through the owner gate, which can ask the owner first.
+		asks: true,
 		async handler(args, deps, { name }) {
 			if (!deps.memory) return noMemory();
 			const target = await targetOf(deps, args.member);
 			if (!target) return { ok: false, spoken: t('tools.memory.no_target_remember') };
 			// Anyone may leave a note about THEMSELVES. A note about somebody else is replayed to the model
 			// whenever that person speaks, so writing one on their behalf needs the owner -- the same
-			// asymmetry forget_note already applies.
-			const speakerId = deps.currentSpeakerId?.() ?? null;
-			if (!speakerId || String(speakerId) !== String(target.id)) {
+			// asymmetry forget_note already applies. "Themselves" is the person whose line produced this
+			// call (see currentSpeakerId), not whoever happened to make a sound while the model worked.
+			const speakerId = requesterId(deps);
+			if (!speakerId || speakerId !== target.id) {
 				const denied = await ownerGate(deps, WORDS.forget, name);
 				if (denied) return denied;
 			}
@@ -55,17 +59,32 @@ export const tools = [
 	defineTool({
 		name: 'recall_notes',
 		description:
-			'Reads your saved notes. With `search` it looks through the notes of EVERYONE for a word or phrase -- use that ' +
+			'Reads your saved notes. With `search` it looks through the saved notes for a word or phrase -- use that ' +
 			'whenever you are asked what you remember about something ("what is my favourite song", "check your memory"), ' +
-			'before saying you do not know. With `member` (or neither) it returns the notes about that person.',
+			'before saying you do not know. With `member` (or neither) it returns the notes about that person. Anyone may ' +
+			"recall what is kept about themselves; only the owner may recall or search other people's notes.",
 		parameters: P.obj({
 			member: P.str('Person name (empty = the current speaker)'),
-			search: P.str('Word or phrase to look for across every saved note; an empty string returns the most recent notes'),
+			search: P.str('Word or phrase to look for across the saved notes; an empty string returns the most recent notes'),
 		}),
-		async handler(args, deps) {
+		// Other people's notes, after other people's words were read in the same turn, wait for a yes.
+		asks: true,
+		async handler(args, deps, { name }) {
 			if (!deps.memory) return noMemory();
+			// Notes are written about people who never hear them read back ("exam on Friday", "does not get
+			// on with Ali"). The owner may look through all of them; anybody else only through their own,
+			// or an empty search would hand a guest the twelve newest notes about everyone on the server.
+			const speakerId = requesterId(deps);
+			const owner = requesterIsOwner(deps);
 			if (args.search !== undefined && args.search !== null) {
-				const hits = deps.memory.search(String(args.search));
+				if (!owner && !speakerId) return { ok: false, spoken: t('tools.memory.recall_unknown_speaker') };
+				// The owner's search runs through everybody's notes. After other people's words were read in
+				// this turn, that is not done on the strength of a message asking for it (askAfterUntrustedRead).
+				if (owner) {
+					const asked = askAfterUntrustedRead(deps, name);
+					if (asked) return asked;
+				}
+				const hits = deps.memory.search(String(args.search), owner ? {} : { userId: speakerId });
 				if (!hits.length) {
 					return { ok: true, spoken: t('tools.memory.search_empty', { query: String(args.search) }), data: { notes: [] } };
 				}
@@ -74,6 +93,14 @@ export const tools = [
 			}
 			const target = await targetOf(deps, args.member);
 			if (!target) return { ok: false, spoken: t('tools.memory.no_target_recall') };
+			if (!owner && target.id !== speakerId) {
+				deps.log?.(t('tools.memory.log_recall_refused', { who: target.name ?? target.id }));
+				return { ok: false, denied: true, spoken: t('tools.memory.recall_own_only') };
+			}
+			if (target.id !== speakerId) {
+				const asked = askAfterUntrustedRead(deps, name);
+				if (asked) return asked;
+			}
 			const notes = deps.memory.notesFor(target.id);
 			if (!notes.length) {
 				return {
@@ -101,11 +128,13 @@ export const tools = [
 			{ member: P.str('Person name (empty = the current speaker)'), note: P.str('Part of the note to delete; "all" = every note') },
 			['note'],
 		),
+		// Somebody else's notes go through the owner gate, which can ask the owner first.
+		asks: true,
 		async handler(args, deps, { name }) {
 			if (!deps.memory) return noMemory();
 			const target = await targetOf(deps, args.member);
 			if (!target) return { ok: false, spoken: t('tools.memory.no_target_forget') };
-			const speakerId = deps.currentSpeakerId?.() ?? null;
+			const speakerId = requesterId(deps);
 			if (!speakerId || speakerId !== target.id) {
 				const denied = await ownerGate(deps, WORDS.forget, name);
 				if (denied) return denied;

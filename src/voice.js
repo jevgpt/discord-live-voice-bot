@@ -20,6 +20,7 @@ import { t } from './i18n/index.js';
 
 const READY_TIMEOUT_MS = 15_000;
 const MAX_ATTEMPTS = 3;
+const RENEW_INTERVAL_MS = 1000;
 
 /**
  * Resolves once the connection reaches `status`; if it goes Destroyed instead (and that is not the
@@ -50,6 +51,45 @@ function waitForState(connection, status, timeoutMs) {
 }
 
 const EMPTY_PACKET = Buffer.alloc(0);
+
+/**
+ * A speaker's missing frames, made up by their decoder (Opus packet loss concealment) and handed out
+ * 20 ms at a time. Decoding an empty packet does not give one frame: it fills the whole output buffer,
+ * 5760 samples with @discordjs/opus (240 ms at 24 kHz) and 2880 with opusscript (120 ms), fading as it
+ * goes. Asking afresh for every missing frame threw all but the first 20 ms of each decode away, so the
+ * second and third frames of a gap came from 240 and 480 ms into the fade -- measured on a 300 Hz tone,
+ * the second at a tenth of the level of the first -- and the decoder had run up to 720 ms past the packet
+ * that came next. Decoded once per gap and served in order, the frames are the continuation the codec meant, and
+ * the decoder runs ahead by one decode instead of three (neither library lets decode be asked for less).
+ */
+export class Concealment {
+	/** @param {(packet: Buffer) => Buffer | null | undefined} decode the decoder's own decode */
+	constructor(decode, frameSamples = SAMPLES_PER_FRAME_24K) {
+		this.decode = decode;
+		this.frameSamples = frameSamples;
+		this.pcm = null;
+		this.at = 0;
+	}
+
+	/** A real packet was decoded: the gap is over, and the next one starts from a fresh decode. */
+	reset() {
+		this.pcm = null;
+		this.at = 0;
+	}
+
+	/** The next frame of the gap, or null when the decoder has nothing to give. */
+	next() {
+		if (!this.pcm || this.at >= this.pcm.length) {
+			const raw = this.decode(EMPTY_PACKET);
+			if (!raw?.length) return null;
+			this.pcm = int16From(raw);
+			this.at = 0;
+		}
+		const frame = this.pcm.subarray(this.at, this.at + this.frameSamples);
+		this.at += frame.length;
+		return frame;
+	}
+}
 
 export class VoiceSession {
 	constructor({
@@ -87,6 +127,8 @@ export class VoiceSession {
 		this.player = null;
 		this.pcmStream = null;
 		this.bridge = null;
+		this.lastRenewAt = 0;
+		this.renewTimer = null; // a renewal put off to the end of the throttle's second (see renewOutput)
 		this.subscriptions = new Map(); // userId -> { opusStream, decoder }
 		this._joining = null;
 		this._joiningChannel = null;
@@ -241,6 +283,7 @@ export class VoiceSession {
 			debug: this.debug,
 			log: this.log,
 			onFrame: this.onFrame,
+			onOutputDead: () => this.renewOutput(),
 		});
 		this.bridge.start();
 	}
@@ -266,11 +309,31 @@ export class VoiceSession {
 		return stream;
 	}
 
-	/** Replace a dead output with a live one, at most once a second so a storm cannot spin. */
+	/**
+	 * Replace a dead output with a live one, at most once a second so a storm cannot spin. A renewal asked
+	 * for inside that second is put off to its end, not dropped. The player tears its input down after
+	 * 100 ms without a packet, so a second death can follow the first well inside the second; its renewal
+	 * used to be thrown away, the dead stream raises its one 'error' and is silent from then on, and the
+	 * bot said nothing until the next voice reconnect. The bridge also asks on every tick it finds the
+	 * output dead, which is what the timer here answers.
+	 */
 	renewOutput() {
 		if (!this.connection || !this.player) return;
+		// While the connection is down the bridge is stopped and nothing is written, so a new output would
+		// starve and be torn down 100 ms later, once a second for as long as the outage lasted. Coming back
+		// to Ready renews a dead output (see setupRuntime), and the bridge asks again once it runs.
+		if (!this.connected) return;
 		const now = Date.now();
-		if (now - (this.lastRenewAt ?? 0) < 1000) return;
+		const wait = RENEW_INTERVAL_MS - (now - this.lastRenewAt);
+		if (wait > 0) {
+			this.renewTimer ??= setTimeout(() => {
+				this.renewTimer = null;
+				this.renewOutput();
+			}, wait);
+			return;
+		}
+		if (this.renewTimer) clearTimeout(this.renewTimer);
+		this.renewTimer = null;
 		this.lastRenewAt = now;
 		const old = this.pcmStream;
 		this.buildOutput();
@@ -296,17 +359,17 @@ export class VoiceSession {
 		// new Nyquist, so there is nothing to alias and no resampler to get wrong, and a stereo stream is
 		// folded to one channel inside the decoder. Half the work of decoding at 48 kHz and filtering.
 		const decoder = new prism.opus.Decoder({ rate: 24000, channels: 1, frameSize: SAMPLES_PER_FRAME_24K });
+		// A frame that never arrived: the decoder's own packet loss concealment, from what it heard last.
+		// `encoder` is prism's name for the codec object it decodes with too (private, but the only way to
+		// reach it); it is null once the stream is destroyed, and then there is nothing to conceal with.
+		const concealment = new Concealment((packet) => decoder.encoder?.decode(packet));
 		decoder.on('data', (pcm) => {
+			concealment.reset();
 			const mono = int16From(pcm);
 			this.mixer.push(userId, mono);
 			this.onUserPcm?.(userId, mono);
 		});
-		// A frame that never arrived: the decoder's own packet loss concealment, from what it heard last.
-		// Decoding nothing yields the decoder's maximum frame; the first 20 ms of it is the frame.
-		this.mixer.setConcealer?.(userId, () => {
-			const raw = decoder.encoder?.decode(EMPTY_PACKET);
-			return raw?.length ? int16From(raw).subarray(0, SAMPLES_PER_FRAME_24K) : null;
-		});
+		this.mixer.setConcealer?.(userId, () => concealment.next());
 		let failed = false;
 		const fail = (label, err) => {
 			if (failed) return;
@@ -356,6 +419,8 @@ export class VoiceSession {
 	leave() {
 		this.bridge?.stop();
 		this.bridge = null;
+		if (this.renewTimer) clearTimeout(this.renewTimer);
+		this.renewTimer = null;
 		for (const [userId, sub] of this.subscriptions) {
 			try {
 				sub.opusStream.destroy();

@@ -250,6 +250,32 @@ describe('who the model is told said a line', () => {
 		);
 	});
 
+	// A mixed "read the staff channel" is harmless only as far as the person asking may read it, and on a
+	// line two voices share, whose request it was is the one thing not known. The owner's authority goes
+	// only on a line that was the owner's alone.
+	it('runs a mixed line s harmless command for nobody in particular', async (t) => {
+		t.mock.timers.enable({ apis: ['setTimeout'] });
+		const room = makeRoomSession({ OWNER_PRIORITY: '0' });
+		room.voices('owner', 30);
+		room.voices(['owner', 'guest'], 40);
+		room.delta('read the general channel', 0, 1400);
+		t.mock.timers.tick(1300);
+		const item = room.commanded.at(-1);
+		assert.equal(item.id, 'owner');
+		assert.equal(item.mixed, true);
+		assert.equal(item.owner, false, 'the owner was not alone in it');
+
+		// The read is remembered per person asking; what it was remembered under says who that was.
+		const asked = [];
+		room.session.taskDeps = { ...room.session.taskDeps, recentActions: { recall: (signature) => (asked.push(signature), { speak: false, text: '', ok: true }), remember() {} } };
+		GuildSession.prototype.runVoiceCommand.call(room.session, item);
+		GuildSession.prototype.runVoiceCommand.call(room.session, { ...item, mixed: false, owner: true });
+		GuildSession.prototype.runVoiceCommand.call(room.session, { ...item, mixed: false, owner: false });
+		t.mock.timers.reset();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.deepEqual(asked, ['read:general:-', 'read:general:owner', 'read:general:-']);
+	});
+
 	it('runs nothing at all off a line nobody owns', (t) => {
 		t.mock.timers.enable({ apis: ['setTimeout'] });
 		const room = makeRoomSession({ OWNER_PRIORITY: '0' });
@@ -473,6 +499,34 @@ describe('who the model is told said a line', () => {
 			perFragment.logged.some((line) => /parça başına|per fragment/.test(line)),
 			`the per-fragment shape is reported: ${perFragment.logged.join(' | ')}`,
 		);
+	});
+
+	// ATTRIBUTION reaches the line: the same fragments, cut by each fragment's own audio or along one path.
+	// The guest's sentence has the owner's cough in the middle of it, and the window of "yeni" runs into it.
+	it('cuts the lines along the speaker path, or by every fragment s own audio with ATTRIBUTION=vote', (t) => {
+		t.mock.timers.enable({ apis: ['setTimeout'] });
+		const play = (env) => {
+			const room = makeRoomSession(env);
+			const frames = (active, count, priority = false) => {
+				for (let i = 0; i < count; i++) room.session.attribution.onFrame({ active, present: active, priority, sent: true });
+			};
+			frames(['guest'], 60); // 0 - 1200 ms
+			frames(['owner'], 10, true); // 1200 - 1400 ms
+			frames(['guest'], 80); // 1400 - 3000 ms
+			room.delta(' bu', 0, 600);
+			room.delta(' oyunun', 0, 1150);
+			room.delta(' yeni', 0, 1500);
+			room.delta(' sezonu', 0, 2200);
+			room.delta(' geliyor', 0, 3000);
+			t.mock.timers.tick(1300);
+			return room.spoken();
+		};
+		assert.deepEqual(play({ ATTRIBUTION: 'vote' }), [
+			{ who: 'guest', text: 'bu oyunun' },
+			{ who: 'owner', text: 'yeni' },
+			{ who: 'guest', text: 'sezonu geliyor' },
+		]);
+		assert.deepEqual(play({}), [{ who: 'guest', text: 'bu oyunun yeni sezonu geliyor' }], 'hmm, the default');
 	});
 
 	it('keeps the owner as the owner while somebody else has a microphone open', (t) => {

@@ -1,11 +1,22 @@
 // Local TTS benchmark/test: turns text into speech, measures how long it takes, writes a WAV you can listen to.
 //   node --env-file=.env scripts/tts-check.mjs "text to try"
+// It asks for what .env sets (LOCAL_TTS_ENGINE, LOCAL_TTS_LANG, LOCAL_TTS_VOICE); a variable set in the
+// shell wins over .env, so one engine can be tried at a time:
+//   LOCAL_TTS_ENGINE=freya LOCAL_TTS_LANG=tr node --env-file=.env scripts/tts-check.mjs "Merhaba, nasılsın?"
 import { writeFileSync } from 'node:fs';
 import { loadConfig } from '../src/config.js';
 import { LocalTts } from '../src/localtts.js';
 
 const cfg = loadConfig();
-const tts = new LocalTts({ url: cfg.localTtsUrl, languageId: cfg.localTtsLang, timeoutMs: 300_000 });
+const tts = new LocalTts({
+	url: cfg.localTtsUrl,
+	languageId: cfg.localTtsLang,
+	engine: cfg.localTtsEngine,
+	voiceRef: cfg.localTtsVoice,
+	// Long enough for an engine that loads on its first line (a first run downloads the model too).
+	timeoutMs: 300_000,
+	token: cfg.localTtsToken,
+});
 
 const health = await tts.health();
 console.log('health:', JSON.stringify(health));
@@ -16,7 +27,7 @@ if (!health?.ok) {
 
 const text = process.argv[2] ?? 'Hello there, this is Aria. I generate my voice on my own computer now, how does it sound?';
 const started = Date.now();
-const { pcm } = await tts.speak(text);
+const { pcm, engine, sampleRate } = await tts.speak(text);
 const elapsed = (Date.now() - started) / 1000;
 const seconds = pcm.length / 24_000;
 
@@ -39,6 +50,7 @@ const out = 'data/tts-test.wav';
 writeFileSync(out, Buffer.concat([header, Buffer.from(pcm.buffer, pcm.byteOffset, pcm.length * 2)]));
 
 console.log(
-	`text: ${text.length} characters | audio: ${seconds.toFixed(2)} s | synthesis: ${elapsed.toFixed(2)} s | ` +
+	`engine: ${engine ?? '?'} (${sampleRate ?? '?'} Hz, played at 24000) | text: ${text.length} characters | ` +
+		`audio: ${seconds.toFixed(2)} s | synthesis: ${elapsed.toFixed(2)} s | ` +
 		`speed: ${(seconds / elapsed).toFixed(2)}x real time | file: ${out}`,
 );

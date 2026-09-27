@@ -1,6 +1,12 @@
 // Daily GPT-Live quota (in seconds). Session time is fed in from the 'usage' event; once the quota is
-// used up index.js closes the session and does not reopen it until the day rolls over. It is written to
+// used up the guild's session is closed and not reopened until the day rolls over. It is written to
 // data/quota.json so that a restart does not reset the quota.
+//
+// One quota is shared by every server, while each realtime session reports its OWN running total. The
+// running total therefore belongs to the session that reports it (GuildSession keeps a SessionUsage, below,
+// per LiveSession) and only the difference reaches this class, through add(). A base kept here, for all
+// sessions at once, was reset by every server's new session and read against every other server's
+// totals: two servers taking turns counted 1,500 s of use as 18,600.
 
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
@@ -14,7 +20,6 @@ export class DailyQuota {
 		this.now = now;
 		this.day = dayKey(now());
 		this.usedSeconds = 0;
-		this.sessionBase = 0; // the part of the active session already added to the quota
 		this.pending = Promise.resolve();
 		this.warnedAt = null;
 	}
@@ -34,31 +39,26 @@ export class DailyQuota {
 		return this.limitSeconds > 0;
 	}
 
+	/**
+	 * A new day starts from zero. Only the count is reset: what a session used before midnight stays on
+	 * yesterday, because the next add() carries only the seconds since its previous report.
+	 */
 	_rollover() {
 		const today = dayKey(this.now());
 		if (today !== this.day) {
 			this.day = today;
 			this.usedSeconds = 0;
-			this.sessionBase = 0;
 			this.warnedAt = null;
 		}
 	}
 
-	/** A new session was opened: the session counter starts from zero. */
-	sessionStarted() {
-		this._rollover();
-		this.sessionBase = 0;
-	}
-
 	/**
-	 * The session's total duration was reported (cumulative seconds). The difference is added to the quota.
+	 * Seconds of realtime session time that have not been counted yet (a difference, never a running total).
 	 * @returns {{ used: number, limit: number, exceeded: boolean, remaining: number }}
 	 */
-	report(sessionSeconds) {
+	add(seconds) {
 		this._rollover();
-		const total = Math.max(0, Number(sessionSeconds) || 0);
-		const delta = Math.max(0, total - this.sessionBase);
-		this.sessionBase = total;
+		const delta = Math.max(0, Number(seconds) || 0);
 		this.usedSeconds += delta;
 		if (delta > 0) void this.save();
 		return this.status();
@@ -96,5 +96,24 @@ export class DailyQuota {
 			})
 			.catch(() => {});
 		return this.pending;
+	}
+}
+
+/**
+ * One realtime session's running total, turned into the differences the shared quota takes. The server
+ * reports the seconds the session has used so far; a report that repeats or goes back adds nothing.
+ */
+export class SessionUsage {
+	constructor(quota) {
+		this.quota = quota;
+		this.seconds = 0;
+	}
+
+	/** @returns {{ delta: number, status: object }} what this report added and the quota after it */
+	report(totalSeconds) {
+		const total = Math.max(0, Number(totalSeconds) || 0);
+		const delta = Math.max(0, total - this.seconds);
+		this.seconds = Math.max(this.seconds, total);
+		return { delta, status: delta > 0 ? this.quota.add(delta) : this.quota.status() };
 	}
 }

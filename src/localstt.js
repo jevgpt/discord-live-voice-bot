@@ -5,9 +5,73 @@
 import { EventEmitter } from 'node:events';
 import { peakOf } from './audio.js';
 import { t } from './i18n/index.js';
-import { resampleLinear } from './localtts.js';
+import { speechHeaders } from './localserver.js';
 
 const STT_RATE = 16_000;
+
+// Whisper is sent 16 kHz, so whatever lies between its Nyquist and ours (8-12 kHz) has to be gone before
+// the rate drops: sampled as it is, it folds back into the speech band, 10 kHz landing on 6 kHz. The
+// linear interpolation this used to be let a 10 kHz tone through at -4 dB, which laid a sibilant's hiss
+// over the consonants the transcriber reads. A windowed-sinc low-pass (Kaiser window, 33 taps) is
+// evaluated only where the 16 kHz samples fall, one and a half input samples apart, so there are two sets
+// of taps. Measured on tones: flat (within 0.1 dB) to 6 kHz, -3 dB at 7 kHz, 39 dB down at 8.5 kHz and
+// more than 60 dB down from 9 kHz on, where the fold would land below 7 kHz. A 15 s segment takes about
+// 25 ms.
+const LOWPASS_HALF = 16; // taps each side of the output sample
+const LOWPASS_BETA = 6;
+const LOWPASS_CUTOFF_HZ = 7300;
+
+/** Modified Bessel function of the first kind, order zero (the Kaiser window's shape). */
+function besselI0(x) {
+	let sum = 1;
+	let term = 1;
+	for (let k = 1; k < 50 && term > 1e-12 * sum; k++) {
+		term *= (x / (2 * k)) ** 2;
+		sum += term;
+	}
+	return sum;
+}
+
+/** The taps for an output sample that falls `frac` of an input sample after input sample `base`. */
+function lowpassTaps(frac) {
+	const fc = LOWPASS_CUTOFF_HZ / 24_000; // cycles per input sample
+	const first = Math.ceil(frac - LOWPASS_HALF); // relative to `base`
+	const taps = [];
+	for (let k = first; k - frac <= LOWPASS_HALF; k++) {
+		const d = k - frac;
+		const x = 2 * Math.PI * fc * d;
+		const r = d / LOWPASS_HALF;
+		const window = besselI0(LOWPASS_BETA * Math.sqrt(Math.max(0, 1 - r * r))) / besselI0(LOWPASS_BETA);
+		taps.push((d === 0 ? 1 : Math.sin(x) / x) * window);
+	}
+	const sum = taps.reduce((a, b) => a + b, 0); // unity at DC: a level in is the same level out
+	return { first, taps: Float64Array.from(taps, (tap) => tap / sum) };
+}
+
+const LOWPASS_PHASES = [lowpassTaps(0), lowpassTaps(0.5)];
+
+/**
+ * 24 kHz mono int16 -> 16 kHz, low-passed on the way (see LOWPASS_CUTOFF_HZ). A segment is resampled
+ * whole, so there is no filter state to carry from one call to the next; at its two ends the first and
+ * last samples are held rather than taken as zeros, which would fade the ends in and out.
+ */
+export function downsampleForStt(pcm) {
+	if (!pcm?.length) return pcm;
+	const out = new Int16Array(Math.max(1, Math.round((pcm.length * 2) / 3))); // two for every three
+	const last = pcm.length - 1;
+	for (let j = 0; j < out.length; j++) {
+		const base = (j * 3) >> 1; // output j sits at input 1.5 j
+		const { first, taps } = LOWPASS_PHASES[j & 1];
+		let acc = 0;
+		for (let k = 0; k < taps.length; k++) {
+			const n = base + first + k;
+			acc += pcm[n < 0 ? 0 : n > last ? last : n] * taps[k];
+		}
+		const v = Math.round(acc);
+		out[j] = v > 32767 ? 32767 : v < -32768 ? -32768 : v;
+	}
+	return out;
+}
 
 /**
  * Per-user, energy based speech segmenter.
@@ -118,8 +182,10 @@ export class SpeechSegmenter extends EventEmitter {
 
 /** HTTP client for the /stt (faster-whisper) endpoint on the Chatterbox server. */
 export class LocalStt {
-	constructor({ url = 'http://127.0.0.1:8020', language = 'auto', timeoutMs = 30_000, log = () => {} } = {}) {
+	constructor({ url = 'http://127.0.0.1:8020', language = 'auto', timeoutMs = 30_000, token = null, log = () => {} } = {}) {
 		this.url = String(url).replace(/\/$/, '');
+		// Null: the token the process shares (LOCAL_TTS_TOKEN, or the one the server was launched with).
+		this.token = token;
 		this.language = language;
 		this.timeoutMs = timeoutMs;
 		this.log = log;
@@ -129,7 +195,8 @@ export class LocalStt {
 	/** Is the server up and the STT model loaded? */
 	async health() {
 		try {
-			const response = await fetch(`${this.url}/health`, { signal: AbortSignal.timeout(5000) });
+			const response = await fetch(`${this.url}/health`, { headers: speechHeaders({}, this.token), signal: AbortSignal.timeout(5000) });
+			if (response.status === 401 || response.status === 403) this.log(t('brain.speech_refused', { url: this.url, status: response.status }));
 			if (!response.ok) return null;
 			const info = await response.json();
 			return { ...info, sttReady: Boolean(info?.stt) };
@@ -144,7 +211,7 @@ export class LocalStt {
 	 * @returns {Promise<{ text: string, language: string|null, durationMs: number }>}
 	 */
 	async transcribe(pcm24k, { language = this.language, prompt = null, signal = null } = {}) {
-		const pcm = resampleLinear(pcm24k, 24_000, STT_RATE);
+		const pcm = downsampleForStt(pcm24k);
 		const body = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
 		const params = new URLSearchParams();
 		if (language && language !== 'auto') params.set('language', language);
@@ -154,7 +221,7 @@ export class LocalStt {
 		try {
 			const response = await fetch(`${this.url}/stt${params.size ? `?${params}` : ''}`, {
 				method: 'POST',
-				headers: { 'content-type': 'application/octet-stream', 'x-sample-rate': String(STT_RATE) },
+				headers: speechHeaders({ 'content-type': 'application/octet-stream', 'x-sample-rate': String(STT_RATE) }, this.token),
 				body,
 				signal: signal ? AbortSignal.any([timeout, signal]) : timeout,
 			});

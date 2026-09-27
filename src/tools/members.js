@@ -313,7 +313,7 @@ export const tools = [
 			'not a kick. For removing somebody from the server use kick_member, and to silence them without moving them use ' +
 			'voice_mute. Owner only.',
 		parameters: P.obj({ member: P.str('Person name'), reason: P.str('Reason (optional)') }, ['member']),
-		gate: { keywords: WORDS.voice },
+		gate: { keywords: WORDS.kick },
 		async handler(args, deps) {
 			const member = await findMember(deps, String(args.member ?? ''));
 			if (!member) return { ok: false, spoken: t('tools.members.member_not_found', { name: args.member }) };

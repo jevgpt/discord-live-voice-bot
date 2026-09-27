@@ -5,4 +5,5 @@ export default {
 	research_provider_missing: 'the research provider is not configured',
 	describe_deepseek: 'DeepSeek ({textModel}) — DM/channel replies and research; images go to OpenAI ({visionModel})',
 	describe_openai: 'OpenAI ({textModel})',
+	reply_key_missing: '[text] REPLY_BASE_URL is set for REPLY_MODEL={model} but REPLY_API_KEY is empty; written replies stay on {fallback} for now',
 };

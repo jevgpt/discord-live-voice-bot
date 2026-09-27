@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { AutoModerationActionType, AutoModerationRuleTriggerType, ChannelType, PermissionFlagsBits } from 'discord.js';
 import { callTool, toolMeta } from '../../src/tools.js';
+import { ownerVoice } from '../owner-voice.js';
 
 const AUTOMOD_TOOLS = [
 	'list_automod_rules',
@@ -269,12 +270,14 @@ describe('update_automod_keywords', () => {
 describe('delete_automod_rule', () => {
 	it('asks first and only deletes on the second, confirmed call', async () => {
 		const { deps, calls } = makeDeps();
+		const owner = ownerVoice(deps);
 		const question = await callTool('delete_automod_rule', { rule: 'Swearing' }, deps);
 		assert.equal(question.ok, false);
 		assert.equal(question.needs_confirmation, true);
 		assert.match(question.spoken, /Swearing/);
 		assert.ok(!calls.some((call) => call.delete), 'the question alone must not delete anything');
 
+		owner.says('yes');
 		const done = await callTool('delete_automod_rule', { rule: 'Swearing', confirm: true }, deps);
 		assert.equal(done.ok, true, done.spoken);
 		assert.equal(calls.find((call) => call.delete)?.delete, 'rule-keyword');
@@ -283,7 +286,9 @@ describe('delete_automod_rule', () => {
 
 	it('refuses a confirmation that names a different rule than the question did', async () => {
 		const { deps, calls } = makeDeps();
+		const owner = ownerVoice(deps);
 		await callTool('delete_automod_rule', { rule: 'Swearing' }, deps);
+		owner.says('yes');
 		const result = await callTool('delete_automod_rule', { rule: 'Spam guard', confirm: true }, deps);
 		assert.equal(result.ok, false);
 		assert.ok(!calls.some((call) => call.delete));

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { ChannelType, PermissionFlagsBits } from 'discord.js';
 import { callTool, toolMeta } from '../../src/tools.js';
+import { ownerVoice } from '../owner-voice.js';
 
 const SELF = 'bot-1';
 
@@ -108,7 +109,7 @@ function makeDeps({ owner = false, held = ['ManageThreads', 'CreatePublicThreads
 }
 
 // The realtime path builds a fresh deps object for every call, so two-step confirmation has to survive that.
-const perCall = (base) => ({ ...base, currentTurn: () => null });
+const perCall = (base) => ({ ...base });
 
 const THREAD_TOOLS = [
 	'list_threads',
@@ -131,7 +132,9 @@ describe('thread tools: registration and the owner gate', () => {
 		assert.equal(meta.get('list_threads').gated, false, 'listing threads is read-only');
 		for (const name of THREAD_TOOLS.filter((tool) => tool !== 'list_threads')) {
 			assert.equal(meta.get(name).gated, true, `${name} must be gated`);
-			assert.ok(meta.get(name).keywords?.includes('thread'), `${name} must be gated on the thread keywords`);
+			// Deleting gates on the verb: saying "thread" is not asking for one to go.
+			const verb = name === 'delete_thread' ? 'delete' : 'thread';
+			assert.ok(meta.get(name).keywords?.includes(verb), `${name} must be gated on the ${verb} keywords`);
 		}
 	});
 
@@ -349,9 +352,11 @@ describe('thread membership', () => {
 describe('delete_thread', () => {
 	it('asks first and deletes on the second call', async () => {
 		const { deps, calls } = makeDeps({ owner: true });
+		const owner = ownerVoice(deps);
 		const asked = await callTool('delete_thread', { thread: 'lunch plans' }, perCall(deps));
 		assert.equal(asked.needs_confirmation, true, asked.spoken);
 		assert.deepEqual(calls, [], 'nothing is deleted before the answer');
+		owner.says('yes');
 		const done = await callTool('delete_thread', { thread: 'lunch plans', confirm: true }, perCall(deps));
 		assert.equal(done.ok, true, done.spoken);
 		assert.deepEqual(calls, [{ deleted: 't1' }]);
@@ -359,7 +364,9 @@ describe('delete_thread', () => {
 
 	it('refuses a confirmation that names another thread, and a delete without Manage Threads', async () => {
 		const { deps, calls } = makeDeps({ owner: true });
+		const owner = ownerVoice(deps);
 		await callTool('delete_thread', { thread: 'lunch plans' }, perCall(deps));
+		owner.says('yes');
 		const other = await callTool('delete_thread', { thread: 'bug reports', confirm: true }, perCall(deps));
 		assert.equal(other.ok, false, 'the answer belongs to the other thread');
 		assert.deepEqual(calls, []);
