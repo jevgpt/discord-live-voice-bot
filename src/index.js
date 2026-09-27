@@ -27,7 +27,7 @@ import { liveSlotsTaken, offerLiveSlots } from './liveslots.js';
 import { LocalServerManager, detectVenvPython, setSpeechToken } from './localserver.js';
 import { LocalStt } from './localstt.js';
 import { MemoryStore } from './memory.js';
-import { ReplyLimiter, handleMessage } from './messages.js';
+import { BotChain, ReplyLimiter, handleMessage, messageText, shouldReply } from './messages.js';
 import { LIVE_STATE, MetricsHistory } from './metrics.js';
 import { ActivityLog, startPanel } from './panel.js';
 import { createTextProvider } from './provider.js';
@@ -76,6 +76,8 @@ const queueStore = cfg.musicEnabled ? await new QueueStore(path.join(dataDir, 'm
 const recentActions = new RecentActions();
 const reader = new ChannelReader({ defaultLimit: cfg.readLimit });
 const replyLimiter = new ReplyLimiter({ perMinute: 6 });
+// Replies to other bots, counted per channel so two bots cannot answer each other for ever.
+const botChain = new BotChain({ max: cfg.botChainMax });
 // The event stream the panel shows: voice transcripts, DM/channel messages, tool calls, gate decisions.
 const activity = new ActivityLog({ file: path.join(dataDir, 'activity.jsonl'), log, redact: () => !cfg.recordTranscripts });
 
@@ -697,14 +699,23 @@ client.on(Events.MessageCreate, (message) => {
 	const where = isDm
 		? null
 		: { channel: `#${message.channel?.name ?? '?'}`, channelId: message.channelId ?? message.channel?.id ?? null, guildId: message.guild.id };
-	if (!message.author?.bot) {
-		const text = String(message.content ?? '').trim() || (message.attachments?.size ? t('runtime.image_placeholder') : '');
+	// Another bot's message is recorded only when it is addressed to this bot: a reply in the log then has
+	// what it answered, and a music bot's "now playing" stays out of it.
+	const fromBot = Boolean(message.author?.bot);
+	const addressedBot =
+		fromBot &&
+		cfg.respondToBots &&
+		shouldReply(message, { botId: client.user?.id ?? null, guildId: session?.guild?.id ?? cfg.guildId, respondToBots: true });
+	if (!fromBot || addressedBot) {
+		const body = fromBot ? messageText(message) : String(message.content ?? '').trim();
+		const text = body || (message.attachments?.size ? t('runtime.image_placeholder') : '');
 		if (text) {
+			const name = message.member?.displayName ?? message.author?.displayName ?? message.author?.username ?? null;
 			push({
 				kind: isDm ? 'dm' : 'channel',
 				direction: 'in',
 				who: message.author?.id ?? null,
-				whoName: message.member?.displayName ?? message.author?.displayName ?? message.author?.username ?? null,
+				whoName: fromBot && name ? t('reader.bot_label', { who: name }) : name,
 				text,
 				meta: where,
 			});
@@ -723,6 +734,7 @@ client.on(Events.MessageCreate, (message) => {
 		log,
 		memory,
 		replyLimiter,
+		botChain,
 		activity: (event) => (session ? session.activity.push(event) : activity.push(event)),
 		persona: () => {
 			const active = store.getActive();

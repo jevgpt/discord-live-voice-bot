@@ -356,6 +356,10 @@ function readConfig(env) {
 		leaveDelayMs: num(env.LEAVE_DELAY_MS, 2500, { min: 0 }),
 		respondToDms: bool(env.RESPOND_DMS, true),
 		respondToMentions: bool(env.RESPOND_MENTIONS, true),
+		// Answer other bots that mention the bot or reply to it (never the bot itself).
+		respondToBots: bool(env.RESPOND_BOTS, true),
+		// How many bot messages in a row are answered in one channel before a person has to write there.
+		botChainMax: num(env.BOT_CHAIN_MAX, 3, { min: 1, max: 50 }),
 		// Should a written reply given in a text channel also be spoken in the voice channel (off: text stays text).
 		voiceEchoTextReplies: bool(env.VOICE_ECHO_TEXT_REPLIES, false),
 		greetText: str(env.GREET_TEXT),

@@ -28,6 +28,7 @@ export default {
 	channel_fallback: 'channel',
 	scope_channel: 'channel',
 	log_rate_limited: '[message] rate limit: {user} ({where})',
+	log_bot_chain: '[message] bot chain stopped: {user} ({max} bot replies in a row in this channel; a person writing, or 10 quiet minutes, opens it again)',
 	log_image_download_failed: '[message] image could not be downloaded ({where}, {user}): {error}',
 	image_download_failed_reply: 'I could not open that image, hon, could you send it again?',
 	image_blocked_reply: 'I am not commenting on this, hon, ask me something else if you like 🙂',

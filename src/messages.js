@@ -31,6 +31,56 @@ const VISION_RULES = () => t('messages.vision_rules');
 
 // Per-user rate limit for written replies (DM/mention): at most N per minute.
 const REPLY_WINDOW_MS = 60_000;
+// What is read of another bot's message: its text and its embeds, which is where most bots put their answer.
+const MAX_BOT_TEXT = 2000;
+// Two bots that each answer whoever answers them talk to each other for ever, on the owner's key. Replies
+// to bots in one channel are counted; a person writing there, or no bot addressing us there for this long,
+// starts the count again.
+const BOT_CHAIN_IDLE_MS = 10 * 60_000;
+
+/**
+ * How many times in a row the bot has answered bots in a channel. `allow` is asked once per bot message
+ * addressed to the bot and says whether this one may be answered; `noteHuman` is told about every message
+ * a person writes, which ends the chain in that channel. A bot that keeps addressing the bot after the cap
+ * keeps the chain alive: it goes quiet only after BOT_CHAIN_IDLE_MS of nothing.
+ */
+export class BotChain {
+	constructor({ max = 3, idleMs = BOT_CHAIN_IDLE_MS, now = Date.now } = {}) {
+		this.max = Math.max(1, max | 0);
+		this.idleMs = idleMs;
+		this.now = now;
+		this.chains = new Map(); // channel id -> { count, at }
+	}
+
+	allow(channelId) {
+		const at = this.now();
+		const key = channelId ?? '-';
+		const last = this.chains.get(key);
+		const count = last && at - last.at < this.idleMs ? last.count : 0;
+		this.chains.set(key, { count: Math.min(count + 1, this.max), at });
+		return count < this.max;
+	}
+
+	noteHuman(channelId) {
+		this.chains.delete(channelId ?? '-');
+	}
+}
+
+/**
+ * The text of a message as it is answered. A person's is what they wrote. A bot's is its text and its
+ * embeds (author, title, description, fields, footer), because most bots answer in an embed and leave the
+ * text empty.
+ */
+export function messageText(message) {
+	if (!message?.author?.bot) return squash(message?.content);
+	const parts = [message.content];
+	for (const embed of message.embeds ?? []) {
+		parts.push(embed?.author?.name, embed?.title, embed?.description);
+		for (const field of embed?.fields ?? []) parts.push([field?.name, field?.value].filter(Boolean).join(': '));
+		parts.push(embed?.footer?.text);
+	}
+	return squash(parts.filter(Boolean).join(' \n ')).slice(0, MAX_BOT_TEXT);
+}
 
 /** Simple sliding-window counter (per user). */
 /**
@@ -155,10 +205,15 @@ function reportBlockedImage(deps, { authorName, where }) {
 	});
 }
 
-/** Should this message be answered? (a DM, a mention, or a reply to one of the bot's messages) */
-export function shouldReply(message, { botId, guildId }) {
-	if (!message?.author || message.author.bot) return false;
+/**
+ * Should this message be answered? (a DM, a mention, or a reply to one of the bot's messages.) Another
+ * bot's message only with `respondToBots`, and never the bot's own, nor a system message.
+ */
+export function shouldReply(message, { botId, guildId, respondToBots = false }) {
+	if (!message?.author) return false;
 	if (message.author.id === botId) return false;
+	if (message.system) return false;
+	if (message.author.bot && !respondToBots) return false;
 	const isDm = !message.guild;
 	if (isDm) return true;
 	if (message.guild.id !== guildId) return false;
@@ -207,19 +262,28 @@ export async function createReplyText(deps, { instructions, input, withImages = 
  */
 export async function handleMessage(message, deps) {
 	const { log } = deps;
+	const channelId = message?.channel?.id ?? message?.channelId ?? null;
+	// A person writing in a channel ends any bot-to-bot chain there, addressed to the bot or not.
+	if (message?.author && !message.author.bot) deps.botChain?.noteHuman(channelId);
 	// deps.guildId is the server this message may be answered in: with several servers it is the one the
 	// message came from, so a mention outside the primary target is not dropped.
-	if (!shouldReply(message, { botId: deps.client?.user?.id ?? null, guildId: deps.guildId ?? deps.cfg.guildId })) return null;
+	const botId = deps.client?.user?.id ?? null;
+	if (!shouldReply(message, { botId, guildId: deps.guildId ?? deps.cfg.guildId, respondToBots: deps.cfg?.respondToBots === true })) return null;
 
 	const isDm = !message.guild;
 	if (isDm && !deps.cfg.respondToDms) return null;
 	if (!isDm && !deps.cfg.respondToMentions) return null;
 
-	const text = squash(message.content);
+	const fromBot = Boolean(message.author.bot);
+	const text = messageText(message);
 	const images = imageAttachments(message);
 	if (!text && !images.length) return null;
 
 	const authorId = message.author.id;
+	if (fromBot && deps.botChain && !deps.botChain.allow(channelId)) {
+		log?.(t('messages.log_bot_chain', { user: authorId, max: deps.botChain.max }));
+		return null;
+	}
 	if (deps.replyLimiter && !deps.replyLimiter.allow(authorId)) {
 		log?.(t('messages.log_rate_limited', { user: authorId, where: isDm ? 'DM' : t('messages.scope_channel') }));
 		return null;
@@ -230,6 +294,8 @@ export async function handleMessage(message, deps) {
 	// goes here when no default channel is configured.
 	if (!isDm && message.channel?.id) deps.noteTextChannel?.(message.channel.id);
 	const authorName = message.member?.displayName ?? message.author.displayName ?? message.author.username ?? t('messages.someone');
+	// The model is told when it is answering a bot, so it answers a bot and not a person by that name.
+	const speaker = fromBot ? t('reader.bot_label', { who: authorName }) : authorName;
 	const where = isDm ? 'DM' : `#${message.channel?.name ?? t('messages.channel_fallback')}`;
 
 	// We download the images ourselves and turn them into data URLs; moderation runs after that.
@@ -241,9 +307,12 @@ export async function handleMessage(message, deps) {
 			);
 		} catch (err) {
 			log?.(t('messages.log_image_download_failed', { where, user: authorId, error: err.message }));
-			await message
-				.reply({ content: t('messages.image_download_failed_reply'), allowedMentions: { repliedUser: false } })
-				.catch(() => {});
+			// A bot is not asked to try again: an apology is one more message for it to answer.
+			if (!fromBot) {
+				await message
+					.reply({ content: t('messages.image_download_failed_reply'), allowedMentions: { repliedUser: false } })
+					.catch(() => {});
+			}
 			return null;
 		}
 		const visionClient = deps.visionClient ?? providerFromDeps(deps).visionClient;
@@ -260,7 +329,7 @@ export async function handleMessage(message, deps) {
 	const prompt = buildReplyPrompt({
 		personaName: persona.name,
 		personaPrompt: persona.prompt,
-		authorName,
+		authorName: speaker,
 		channelName: message.channel?.name ?? t('messages.channel_fallback'),
 		isDm,
 		text,
@@ -275,7 +344,7 @@ export async function handleMessage(message, deps) {
 					{
 						role: 'user',
 						content: [
-							{ type: 'input_text', text: `${authorName}: ${text || t('messages.sent_image')}` },
+							{ type: 'input_text', text: `${speaker}: ${text || t('messages.sent_image')}` },
 							...prepared.map((image) => ({ type: 'input_image', image_url: image.dataUrl ?? image.url })),
 						],
 					},
@@ -292,9 +361,11 @@ export async function handleMessage(message, deps) {
 	}
 
 	if (!reply) {
-		await message
-			.reply({ content: t('messages.unavailable_reply'), allowedMentions: { repliedUser: false } })
-			.catch(() => {});
+		if (!fromBot) {
+			await message
+				.reply({ content: t('messages.unavailable_reply'), allowedMentions: { repliedUser: false } })
+				.catch(() => {});
+		}
 		return null;
 	}
 

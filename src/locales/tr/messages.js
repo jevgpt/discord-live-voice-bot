@@ -28,6 +28,7 @@ export default {
 	channel_fallback: 'kanal',
 	scope_channel: 'kanal',
 	log_rate_limited: '[mesaj] hız sınırı: {user} ({where})',
+	log_bot_chain: '[mesaj] bot zinciri durdu: {user} (bu kanalda üst üste {max} bot cevabı; bir insan yazınca ya da 10 dk sessizlikte açılır)',
 	log_image_download_failed: '[mesaj] görsel indirilemedi ({where}, {user}): {error}',
 	image_download_failed_reply: 'Görseli açamadım canım, tekrar atar mısın?',
 	image_blocked_reply: 'Bunu yorumlamıyorum canım, başka bir şey sor istersen 🙂',

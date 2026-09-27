@@ -491,6 +491,8 @@ Every option lives in `.env` and is documented in [`.env.example`](.env.example)
 | `BRAIN_MODE` | `auto` | `auto` falls back to the local brain, `local` always, `live` never |
 | `MUSIC_VOLUME` / `MUSIC_DUCK_VOLUME` | `35` / `12` | Music level, and its level while the bot speaks |
 | `YTDLP_VERSION` | `latest` | The yt-dlp release to fetch (checked against its SHA-256 sums) |
+| `RESPOND_BOTS` | `1` | Answer other bots that mention the bot or reply to it (never itself) |
+| `BOT_CHAIN_MAX` | `3` | Bot messages answered in a row in a channel before a person has to write there |
 | `RECORD_TRANSCRIPTS` | `1` | Whether transcripts and message text are written to disk |
 | `PANEL_HOST` / `PANEL_TOKEN` | `127.0.0.1` / *(empty)* | Where the panel listens; a token is required beyond loopback |
 | `LOCAL_TTS_LANG` / `LOCAL_STT_LANG` | bot language / `auto` | Language of the local voice, and of the local ears |
