@@ -349,14 +349,43 @@ instead of leaving it silent, and it switches back once the realtime side recove
 | --- | --- |
 | Ears | faster-whisper, served by `tools/chatterbox_server.py --stt` |
 | Brain | any OpenAI-compatible chat model (DeepSeek by default), with the same tools |
-| Mouth | Chatterbox TTS, optionally cloning a reference voice |
+| Mouth | three local engines, one per kind of line (below) |
+
+**The mouth.** One voice server, three engines, and each line goes to the one that suits its language
+(`LOCAL_TTS_ENGINE=auto`):
+
+| Engine | Speaks | Runs on | Why it is there |
+| --- | --- | --- | --- |
+| [FreyaTTS](https://github.com/freyavoiceai/FreyaTTS) | Turkish | ~2 GB VRAM, or the CPU | Not autoregressive: it says exactly the text and nothing after it. 8.0% WER on its authors' Turkish set |
+| [Pocket TTS](https://github.com/kyutai-labs/pocket-tts) | English, French, German, Italian, Portuguese, Spanish, Dutch | the CPU, in real time on two cores | Small, fast, clones a voice; does not speak Turkish |
+| Chatterbox | everything else, and a cloned voice in Turkish | ~4 GB VRAM | The best of the three with a GPU that has room for it |
+
+An engine goes on the GPU only when its VRAM fits next to whatever is already loaded, and on the CPU
+otherwise; `/health`, the panel and `/status` say which engine speaks which language. `LOCAL_TTS_ENGINES`
+limits what may load, and naming one engine in `LOCAL_TTS_ENGINE` sends every line to it.
+
+Before a sentence reaches any of them it is rewritten as it should be said: "%65'i" becomes "yüzde altmış
+beşi", "₺1.250,50" "bin iki yüz elli lira elli kuruş", "14:45'te" "on dört kırk beşte", and markdown, emoji
+and links are dropped (`LOCAL_TTS_NORMALIZE`). What comes back is checked before it is played: audio far
+longer or shorter than the sentence should take is run through the local Whisper and compared with the text
+(`LOCAL_TTS_VERIFY`), and a sentence that said something else is made again with a new seed, then by
+`LOCAL_TTS_FALLBACK_ENGINE` if one is named. The health report counts these per engine.
 
 ```powershell
-# one-off install into .venv-chatterbox (Windows, CUDA)
-tools\setup-chatterbox.ps1
+# one-off install into .venv-chatterbox (Windows). The script reads nvidia-smi and says what your card
+# can carry; add ,chatterbox on a GPU with 8 GB or more.
+tools\setup-chatterbox.ps1 -Engines freya,pocket
+# Linux / macOS
+tools/setup-voice.sh --engines freya,pocket
 # the bot starts the server itself when it needs it; to run it by hand:
 tools\run-chatterbox.cmd
+# hear one line, with the engine and its real-time factor printed:
+node --env-file=.env scripts/tts-check.mjs "Saat 14:30'da buluşalım."
 ```
+
+Two things worth knowing: on Python below 3.13, Chatterbox wants numpy 1 and Pocket TTS numpy 2, so pick
+3.13 if you want both in one environment; and Pocket clones a voice only after you accept its terms on
+Hugging Face and run `hf auth login` once, otherwise it speaks in its own voices.
 
 Voice commands, tools and the owner gate all work in this mode; web search does not.
 
@@ -500,6 +529,8 @@ Every option lives in `.env` and is documented in [`.env.example`](.env.example)
 | `RECORD_TRANSCRIPTS` | `1` | Whether transcripts and message text are written to disk |
 | `PANEL_HOST` / `PANEL_TOKEN` | `127.0.0.1` / *(empty)* | Where the panel listens; a token is required beyond loopback |
 | `LOCAL_TTS_LANG` / `LOCAL_STT_LANG` | bot language / `auto` | Language of the local voice, and of the local ears |
+| `LOCAL_TTS_ENGINE` | `auto` | Which engine speaks: by language, or `freya`, `pocket`, `chatterbox` for every line |
+| `LOCAL_TTS_VERIFY` | `suspicious` | Transcribe the local voice's audio to check it: `off`, when its length looks wrong, `always` |
 | `JEV_API_KEY` | *(empty)* | Enables Jev line judgments |
 | `JEV_REPLY_GATE` | `1` | Keep a reply off the channel when its line was not for the bot |
 | `TRACE` / `TRACE_AUDIO` | `0` | The flight recorder / the audio that was sent, to `data/traces/` |
@@ -633,6 +664,9 @@ Every one of them is a test now.
   benchmark had cheerfully reported zero; it only reported zero because it had never tried whispering.
 - **In the detector's test rooms, a desk fan was the most talkative member of the server.** It held the
   floor 97.8% of the time. It has since been asked to wait its turn like everybody else.
+- **The local voice was reading "%65'i" as best it could.** It could not. Chatterbox on a small GPU would
+  improvise its way through digits and asterisks and, now and then, keep talking after the sentence had
+  ended. The words are spelled out before they are sent now, and a line that runs on is caught and made again.
 - **`/music stop` had never worked.** Every subcommand read the `query` option only `play` has, and Discord
   throws on a missing required option. Saying "stop the music" worked all along, which may be why nobody
   noticed.
@@ -655,6 +689,8 @@ was audible, and positions on a clock that is not ours. In the order they are pl
   instead of one absolute threshold for every microphone. A quiet speaker is a speaker; a fan is not.
 - **Fragment assignment as inference** (done): a sticky Viterbi path over a line's fragments instead of a
   per-fragment vote, measured on simulated rooms before it was made the default.
+- **Local voice** (done, first cut): an engine per language, the text spelled out, and a check on what comes
+  back. Next: streaming Pocket's first chunk (~200 ms) instead of waiting for the whole sentence.
 - **Owner cut-ins**: the benchmark shows about one owner command in ten refused when it is said right on a
   guest's last syllable, because the owner is not alone for 80% of the word. The gate is right to be
   strict; the floor handover can be quicker.
